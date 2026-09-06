@@ -11,7 +11,7 @@ use super::StageError;
 ///
 /// # Errors
 /// [`StageError`] classified per §10.
-pub(super) fn run(_config: &Config, _job: &ClaimedJob) -> Result<(), StageError> {
+pub(super) fn run(_config: &Config, _job: &ClaimedJob) -> Result<super::StageOutcome, StageError> {
     Err(StageError::Permanent {
         reason: "stage 3 (chunk & vectorize) is not implemented yet (§15 step 4)".to_string(),
     })

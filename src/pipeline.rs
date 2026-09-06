@@ -14,11 +14,24 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::Class;
 use crate::config::Config;
-use crate::control::{self, ClaimedJob, DbError, Stage};
+use crate::control::{self, ClaimedJob, Completion, DbError, Stage};
 
 pub use clean::{ExtractError, ExtractedArticle, Extractor};
 pub use embed::{EmbedError, Embedder};
 pub use retrieve::{Lang, QueryNormalizer, RerankError, Reranker, ScoredChunk};
+
+/// What a stage body reports on success (§10: domain outcomes are values, not
+/// errors — they never route through [`StageError`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// The stage advanced the pipeline: the milestone is set and the next stage's
+    /// job is chained in the completion transaction (§6).
+    Advance,
+    /// The stage completed with a terminal domain outcome it recorded itself —
+    /// a §8 Stage 2 quality rejection (`FAILED_QUALITY`) or a duplicate skip:
+    /// the job is `DONE`, nothing chains, the milestone is not advanced.
+    Stop,
+}
 
 /// Stage failures (§10): the only layer that decides what an error means for this
 /// job. Domain outcomes (duplicate, low quality) are *values* in stage signatures —
@@ -131,6 +144,21 @@ impl Worker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Runs the §7.3 boot reconciliation sweep before the loop claims anything:
+    /// interrupted §7.6 deletions re-execute, the §5 audit trail is pruned to
+    /// retention. Expired leases are deliberately not swept — the §6 claim
+    /// reclaims them with the correct accounting.
+    ///
+    /// # Errors
+    /// [`DbError`] on store failure.
+    pub fn reconcile(&self) -> Result<control::ReconcileReport, DbError> {
+        control::reconcile(
+            &self.conn(),
+            &control::now(),
+            self.config.stage_events_retention(),
+        )
+    }
+
     /// One scheduling tick: for each stage in pipeline order, claim → execute →
     /// record. Returns the number of jobs executed.
     ///
@@ -176,8 +204,19 @@ impl Worker {
         let now = control::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| dispatch(stage, &self.config, job)));
         match outcome {
-            Ok(Ok(())) => {
-                control::complete(conn, job.job_id(), &now)?;
+            Ok(Ok(outcome)) => {
+                // §6 stage chaining: milestone + successor job in one transaction,
+                // decided here (the worker owns config and the stage's outcome).
+                let completion = match (outcome, stage) {
+                    (StageOutcome::Stop, _) => Completion::Done,
+                    (StageOutcome::Advance, Stage::Vectorize)
+                        if !self.config.pipeline().graph_enabled() =>
+                    {
+                        Completion::Milestone
+                    }
+                    (StageOutcome::Advance, _) => Completion::Chain,
+                };
+                control::complete(conn, stage, job, completion, &now)?;
                 control::record_event(
                     conn,
                     Some(job.doc_id()),
@@ -186,8 +225,6 @@ impl Worker {
                     "DONE",
                     None,
                 )?;
-                // Stage chaining — the next stage's PENDING job in this transaction
-                // (§6) — arrives with the control-store build step (§15 step 2).
                 Ok(Flow::Continue)
             }
             Ok(Err(err)) => match &err {
@@ -279,7 +316,7 @@ impl Worker {
 /// Dispatches one claimed job to its stage. Stage bodies take their dependencies
 /// as traits (§1.3) — until a stage's build step lands, it rejects jobs honestly
 /// as `Permanent` rather than pretending success.
-fn dispatch(stage: Stage, config: &Config, job: &ClaimedJob) -> Result<(), StageError> {
+fn dispatch(stage: Stage, config: &Config, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
     match stage {
         Stage::Scrape => scrape::run(config, job),
         Stage::Clean => clean::run(config, job),
@@ -303,7 +340,8 @@ fn panic_detail(panic: &(dyn std::any::Any + Send)) -> String {
 /// Runs the worker loop until interrupted (§6: single worker by default).
 ///
 /// Boot: materializes the data directories, opens and migrates the control store,
-/// then loops claim → execute → record until `Ctrl-C`.
+/// runs the §7.3 reconciliation sweep, then loops claim → execute → record until
+/// `Ctrl-C`.
 ///
 /// # Errors
 /// [`crate::BootError`] if directories or the store cannot be created, or on a
@@ -315,6 +353,7 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let worker = Arc::new(Worker::new(Arc::clone(&config))?);
+    worker.reconcile()?;
 
     loop {
         let outcome = tokio::task::spawn_blocking({

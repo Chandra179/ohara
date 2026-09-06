@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite as the control plane, LadybugDB (vectors + graph) as the knowledge plane, and an external fetcher engine as the only moving part.
 
-> **Status:** build order §15 in progress — **Phase 1 (crate scaffold) landed**: module tree, config, migrations (full §5 schema incl. FTS5), and the §6 worker loop run; all stages are honest stubs. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** build order §15 in progress — **Phases 1–2 landed**: crate scaffold (module tree, config, migrations incl. FTS5) and the **control store**: documents registry with `ohara enqueue`-style registration + URL dedup, the §6 job queue with lease claiming, transactional stage chaining (DONE + milestone + successor job), requeue recovery, and the §7.3 boot reconciliation sweep (deletion intents, audit pruning). All pipeline stages remain honest stubs. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -58,12 +58,13 @@ ohara/
     ├── main.rs                # binary crate root — thin shell: parse args → ohara::run()
     ├── lib.rs                 # library crate root — declares the module tree
     ├── config.rs              # settings load + validation into an immutable struct
-    ├── control.rs             # CONTROL PLANE facade (SQLite)
+    ├── control.rs             # CONTROL PLANE facade (SQLite) + boot reconciliation sweep
     ├── control/
-    │   ├── db.rs              #   connections, WAL pragmas, migrations
-    │   ├── documents.rs       #   document registry, dedup-hash lookups
-    │   ├── jobs.rs            #   job queue: atomic lease-based claim
-    │   └── models.rs          #   row types that cross module boundaries
+    │   ├── db.rs              #   connections, WAL pragmas, migrations, the one now()
+    │   ├── documents.rs       #   document registry, enqueue + dedup, deletion intents
+    │   ├── jobs.rs            #   job queue: lease claim, stage chaining, requeue
+    │   ├── reconcile.rs       #   §7.3 sweep: interrupted deletions, audit retention
+    │   └── models.rs          #   row types + the §6 state machine's shape knowledge
     ├── engine.rs              # ENGINE PLANE facade — pub trait Fetcher (the port)
     ├── engine/
     │   ├── http.rs            #   ladder leg 1–2: plain HTTP / impersonation

@@ -1,7 +1,7 @@
 //! Integration (§14): boot the control store via the public library API — pragmas,
 //! migrations, schema presence, FTS5 trigger sync, and the §6 claim semantics.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)] // §10: tests unwrap freely
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
 use ohara::control::{self, Stage};
 
@@ -142,8 +142,11 @@ fn fts5_external_content_index_is_trigger_synced() {
 fn claim_orders_by_priority_and_reclaims_expired_leases() {
     let (_dir, conn) = boot();
     insert_doc(&conn, "d1");
+    insert_doc(&conn, "d2");
+    insert_doc(&conn, "d3");
 
-    // Two claimable SCRAPE jobs: j1 normal priority, j2 urgent (lower = sooner).
+    // Three claimable SCRAPE jobs: j2 urgent (lower = sooner), j1 normal, j3 gated.
+    // One job row per (doc_id, stage) — §6, enforced by the schema's UNIQUE.
     control::enqueue(
         &conn,
         "j1",
@@ -157,7 +160,7 @@ fn claim_orders_by_priority_and_reclaims_expired_leases() {
     control::enqueue(
         &conn,
         "j2",
-        "d1",
+        "d2",
         Stage::Scrape,
         1,
         None,
@@ -214,7 +217,7 @@ fn claim_orders_by_priority_and_reclaims_expired_leases() {
     control::enqueue(
         &conn,
         "j3",
-        "d1",
+        "d3",
         Stage::Scrape,
         1,
         None,

@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS documents (
     clean_file_path       TEXT,
     clean_content_hash    TEXT UNIQUE,               -- content-level dedup
     status                TEXT NOT NULL CHECK(status IN
-        ('SCRAPED','CLEANED','VECTORIZED','INDEXED',
+        ('NEW','SCRAPED','CLEANED','VECTORIZED','INDEXED',
          'FAILED_QUALITY','FAILED','ARCHIVED')),
     title                 TEXT,
     author                TEXT,
@@ -158,7 +158,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_error       TEXT,
     params           TEXT,                          -- JSON stage params, e.g. {"embedding_model": "..."}
     created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(doc_id, stage)                       -- enforces the §6 one-row invariant
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(stage, status);
 
@@ -270,6 +271,8 @@ CREATE INDEX IF NOT EXISTS idx_stage_events_doc ON stage_events(doc_id, ts);
 Notes:
 
 - Chunk and triplet writes use `ON CONFLICT(...) DO UPDATE`, **never** `INSERT OR REPLACE` — REPLACE deletes and re-inserts the row, churning the `chunks.id` surrogate and the FTS rowid mapping.
+- `documents.status` starts at `NEW` (enqueued, no milestone completed yet) — the CHECK needs a birth state because jobs, not the document, carry execution state.
+- `UNIQUE(doc_id, stage)` turns §6's "one job row per (doc_id, stage)" from a convention into an enforced invariant. Re-enqueueing a stage (chaining into a replayed document, re-crawl) therefore means `INSERT … ON CONFLICT DO UPDATE` — *resurrect* a terminal (`DEAD`/`DONE`) row to `PENDING` with `attempts = 0`; live `PENDING`/`RUNNING` rows are never disturbed.
 - `stage_events` deliberately has **no FK** — the audit trail outlives deleted rows; the maintenance tick prunes it at 90 days (config).
 - `triplets` rows are per-chunk evidence keyed by surface strings. Entity-level facts live in Ladybug (§8 Stage 4); the `triplets` table is the extraction checkpoint and cost cache, nothing more.
 - `documents` milestone note: the doc stays at its last *completed* milestone; execution state lives in `jobs` (v1's `VECTORIZING` is gone).
@@ -291,7 +294,7 @@ RUNNING with expired lease ──► reclaimable (attempts++, last_error = 'leas
 PENDING/RUNNING with attempts ≥ max_attempts, or permanent error ──► DEAD
 ```
 
-- **Stage chaining:** on `DONE`, the worker inserts the next stage's `PENDING` job *in the same transaction* as the milestone update (SCRAPE→CLEAN→VECTORIZE→EXTRACT). With `graph_enabled = false` the chain ends at VECTORIZE — documents stay `VECTORIZED` and remain retrievable via BM25 + vector. An EXTRACT `DONE` sets `INDEXED`; there is no next stage.
+- **Stage chaining:** on `DONE`, the worker inserts the next stage's `PENDING` job *in the same transaction* as the milestone update (SCRAPE→CLEAN→VECTORIZE→EXTRACT) — a crash between milestone and chaining is impossible. Chained jobs inherit the completing job's priority; if the successor row already exists (replayed document), the insert resurrects it per §5's `UNIQUE(doc_id, stage)` note. With `graph_enabled = false` the chain ends at VECTORIZE — documents stay `VECTORIZED` and remain retrievable via BM25 + vector. An EXTRACT `DONE` sets `INDEXED`; there is no next stage.
 - **Atomic claim** (SQLite ≥ 3.35, WAL, pragmas per §5):
 
 ```sql

@@ -112,14 +112,21 @@ pub(crate) fn now() -> String {
 /// # Errors
 /// [`DbError::Timestamp`] if `stamp` is not in the §5 format.
 pub(crate) fn now_plus(stamp: &str, secs: u64) -> Result<String, DbError> {
+    shift(stamp, i64::try_from(secs).unwrap_or(i64::MAX / 2))
+}
+
+/// `stamp` shifted by signed `secs` (negative = into the past — retention cutoffs).
+/// Saturates far beyond any sensible lease/backoff/retention horizon rather than
+/// overflowing: chrono panics on out-of-range deltas.
+///
+/// # Errors
+/// [`DbError::Timestamp`] if `stamp` is not in the §5 format.
+pub(crate) fn shift(stamp: &str, secs: i64) -> Result<String, DbError> {
     let t =
         chrono::NaiveDateTime::parse_from_str(stamp, TS_FMT).map_err(|_| DbError::Timestamp {
             value: stamp.to_string(),
             fmt: TS_FMT,
         })?;
-    // Saturate rather than overflow: any u64 lease/backoff is far beyond a sensible
-    // horizon, and chrono panics on out-of-range deltas.
-    let secs = i64::try_from(secs).unwrap_or(i64::MAX / 2);
     let t = t
         .checked_add_signed(chrono::Duration::seconds(secs))
         .ok_or(DbError::Timestamp {

@@ -58,7 +58,7 @@ pub trait Extractor: Send + Sync {
 ///
 /// # Errors
 /// [`StageError`] classified per §10.
-pub(super) fn run(_config: &Config, _job: &ClaimedJob) -> Result<(), StageError> {
+pub(super) fn run(_config: &Config, _job: &ClaimedJob) -> Result<super::StageOutcome, StageError> {
     Err(StageError::Permanent {
         reason: "stage 2 (clean) is not implemented yet (§15 step 3)".to_string(),
     })

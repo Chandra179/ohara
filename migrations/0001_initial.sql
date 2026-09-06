@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS documents (
     clean_file_path       TEXT,
     clean_content_hash    TEXT UNIQUE,               -- content-level dedup
     status                TEXT NOT NULL CHECK(status IN
-        ('SCRAPED','CLEANED','VECTORIZED','INDEXED',
+        ('NEW','SCRAPED','CLEANED','VECTORIZED','INDEXED',
          'FAILED_QUALITY','FAILED','ARCHIVED')),
     title                 TEXT,
     author                TEXT,
@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_error       TEXT,
     params           TEXT,                          -- JSON stage params, e.g. {"embedding_model": "..."}
     created_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(doc_id, stage)               -- §6: one job row per (doc_id, stage)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_claim ON jobs(stage, status);
 

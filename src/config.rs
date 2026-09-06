@@ -62,6 +62,7 @@ pub struct Config {
     stage_events_retention: Duration,
     rate_limit: Duration,
     target_languages: Vec<String>,
+    pipeline: PipelineConfig,
     embedder: EmbedderConfig,
     knowledge: KnowledgeConfig,
     llm: LlmConfig,
@@ -72,6 +73,13 @@ pub struct Config {
 pub struct EmbedderConfig {
     model_id: String,
     dim: usize,
+}
+
+/// Pipeline-level knobs (§6).
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// Whether the stage chain continues past VECTORIZE into EXTRACT (§6).
+    graph_enabled: bool,
 }
 
 /// Knowledge-plane namespace pointers (§4): the read switch is atomic, the write
@@ -103,9 +111,16 @@ struct RawConfig {
     stage_events_retention_days: Option<u64>,
     default_rate_limit_ms: Option<u64>,
     target_languages: Option<Vec<String>>,
+    pipeline: Option<RawPipeline>,
     embedder: Option<RawEmbedder>,
     knowledge: Option<RawKnowledge>,
     llm: Option<RawLlm>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPipeline {
+    graph_enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +196,14 @@ impl Config {
             .target_languages
             .unwrap_or_else(|| vec!["en".to_string()]);
 
+        let pipeline = PipelineConfig {
+            graph_enabled: raw
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.graph_enabled)
+                .unwrap_or(true),
+        };
+
         let embedder = raw.embedder.as_ref();
         let embedder = EmbedderConfig {
             model_id: embedder
@@ -236,6 +259,7 @@ impl Config {
             stage_events_retention,
             rate_limit,
             target_languages,
+            pipeline,
             embedder,
             knowledge,
             llm,
@@ -342,6 +366,12 @@ impl Config {
         &self.target_languages
     }
 
+    /// Pipeline-level knobs (§6).
+    #[must_use]
+    pub fn pipeline(&self) -> &PipelineConfig {
+        &self.pipeline
+    }
+
     /// Pinned embedder identity (§4).
     #[must_use]
     pub fn embedder(&self) -> &EmbedderConfig {
@@ -358,6 +388,15 @@ impl Config {
     #[must_use]
     pub fn llm(&self) -> &LlmConfig {
         &self.llm
+    }
+}
+
+impl PipelineConfig {
+    /// Whether the chain runs into EXTRACT (§6): `false` ends it at VECTORIZE —
+    /// documents stay `VECTORIZED` and remain retrievable via BM25 + vector.
+    #[must_use]
+    pub fn graph_enabled(&self) -> bool {
+        self.graph_enabled
     }
 }
 
@@ -438,6 +477,17 @@ mod tests {
         assert_eq!(config.llm().extraction_model(), "phi4-mini:latest");
         assert!(!config.llm().cloud_llm_enabled());
         assert_eq!(config.target_languages(), ["en"]);
+        assert!(
+            config.pipeline().graph_enabled(),
+            "graph on by default (§6)"
+        );
+    }
+
+    #[test]
+    fn graph_disable_stops_the_chain_knob() {
+        let config =
+            Config::load_from_str("[pipeline]\ngraph_enabled = false\n").expect("valid config");
+        assert!(!config.pipeline().graph_enabled());
     }
 
     #[test]
