@@ -28,7 +28,7 @@ const TRACKING_PARAMS: &[&str] = &[
 /// Normalization (§8 Stage 1, load-bearing for the `source_url_normalized` dedup
 /// key): lowercase scheme/host and punycode IDN (the [`url`] parser does both),
 /// default ports and fragments dropped, query parameters sorted, tracking
-/// parameters (`utm_*` and [`TRACKING_PARAMS`]) stripped. Idempotent — the
+/// parameters (`utm_*` and `TRACKING_PARAMS`) stripped. Idempotent — the
 /// normalized form parses to itself.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NormalizedUrl(url::Url);

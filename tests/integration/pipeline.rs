@@ -13,7 +13,8 @@ use ohara::control::{self, DocStatus};
 use ohara::engine::{
     FetchCapabilities, FetchError, FetchPolicy, FetchedDoc, Fetcher, NormalizedUrl,
 };
-use ohara::pipeline::{ExtractError, ExtractedArticle, Extractor, Worker};
+use ohara::knowledge::{ChunkFilter, KnowledgeError, KnowledgeStore, ScoredHit, VectorSpace};
+use ohara::pipeline::{EmbedError, Embedder, ExtractError, ExtractedArticle, Extractor, Worker};
 
 const NOW: &str = "2026-09-06 12:00:00";
 
@@ -68,6 +69,41 @@ impl Fetcher for FakeFetcher {
     }
 }
 
+/// The embedder port fake (§14): deterministic vectors, whitespace token
+/// counting +2 (specials). Same shape as the §9 contract requires of the real
+/// ONNX embedder: pinned model id, fixed dim, order-preserving batch.
+struct FixedEmbedder;
+
+impl Embedder for FixedEmbedder {
+    fn model_id(&self) -> &'static str {
+        "fake-embedder"
+    }
+
+    fn dim(&self) -> usize {
+        4
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count() + 2
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let seed = f32::from(t.as_bytes().first().copied().unwrap_or(b' '));
+                vec![seed % 8.0 + 1.0, seed % 5.0 + 1.0, 1.0, 0.5]
+            })
+            .collect())
+    }
+}
+
+/// The real `LadybugDB` engine, in-memory (§14 integration: real stores, canned
+/// content).
+fn memory_knowledge() -> Arc<dyn KnowledgeStore> {
+    Arc::new(ohara::knowledge::LadybugStore::in_memory(4).unwrap())
+}
+
 /// Config in a temp dir; graph off so the (stubbed) later stages stay inert.
 fn fixture(dir: &Path, toml_body: &str) -> Arc<Config> {
     let toml_path = dir.join("ohara.toml");
@@ -119,6 +155,8 @@ async fn worker_drives_a_document_from_new_to_cleaned() {
                 result: Fake::Html(ARTICLE_HTML),
             }),
             Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
         )
         .unwrap(),
     );
@@ -196,6 +234,8 @@ async fn quality_rejection_completes_without_chaining() {
                 result: Fake::Html("<html><body>hi</body></html>"),
             }),
             Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
         )
         .unwrap(),
     );
@@ -240,6 +280,8 @@ async fn not_found_dead_job_fails_its_document() {
                 result: Fake::NotFound,
             }),
             Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
         )
         .unwrap(),
     );
@@ -293,6 +335,8 @@ async fn extractor_failure_retries_via_backoff() {
                 result: Fake::Html(ARTICLE_HTML),
             }),
             Arc::new(FailingExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
         )
         .unwrap(),
     );
@@ -331,4 +375,161 @@ async fn extractor_failure_retries_via_backoff() {
         )
         .unwrap();
     assert_eq!(retries, 1);
+}
+
+/// The §15 step 4 milestone: the worker drives a document all the way to
+/// `VECTORIZED` — chunk rows in the registry, vectors in the (real, in-memory)
+/// Ladybug store, FTS index synced by trigger.
+#[tokio::test]
+async fn worker_drives_a_document_from_new_to_vectorized() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    // Graph off: §15 step 5 precedes Stage 4, so the chain must end at VECTORIZE.
+    let config = fixture(dir.path(), "[pipeline]\ngraph_enabled = false\n");
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(&conn, &dir.path().join("data"), "https://example.com/a");
+    let knowledge = memory_knowledge();
+    let worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(FakeFetcher {
+                result: Fake::Html(ARTICLE_HTML),
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            Arc::clone(&knowledge),
+        )
+        .unwrap(),
+    );
+
+    tick(&worker).await; // SCRAPE
+    tick(&worker).await; // CLEAN
+    tick(&worker).await; // VECTORIZE
+
+    let doc = control::get(&conn, &doc_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocStatus::Vectorized);
+    assert_eq!(doc.chunk_count, 1, "single short article = one chunk");
+    assert!(doc.token_count.unwrap_or(0) > 0);
+
+    // Registry rows point at the embedder's model; the vector is present under
+    // the same model's collection (§4 namespace discipline).
+    let (chunk_id, model): (String, String) = conn
+        .query_row(
+            "SELECT chunk_id, embedding_model FROM chunks WHERE doc_id = ?1",
+            [&doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(model, "fake-embedder");
+    let space = VectorSpace::Chunks {
+        model_id: ohara::knowledge::ModelId::new(model.clone()),
+    };
+    assert!(
+        knowledge
+            .has_vector(space.clone(), &chunk_id)
+            .await
+            .unwrap(),
+        "chunk vector must exist after VECTORIZE"
+    );
+
+    // KNN with the exact vector finds the chunk (§9 postcondition).
+    let query: Vec<f32> = {
+        let text: String = conn
+            .query_row(
+                "SELECT embed_text FROM chunks WHERE chunk_id = ?1",
+                [&chunk_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        FixedEmbedder.embed(&[&text]).unwrap().remove(0)
+    };
+    let hits = knowledge
+        .knn(space, &query, 5, &ChunkFilter {})
+        .await
+        .unwrap();
+    assert_eq!(hits.first().map(|h| h.id.as_str()), Some(chunk_id.as_str()));
+
+    // FTS is trigger-synced with the registry (§5): the chunk text is searchable.
+    let fts_hits: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'sqlite'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(fts_hits >= 1, "chunks_fts must see the chunk text");
+
+    // graph_enabled=false ends the chain at VECTORIZE (§6): no EXTRACT job.
+    let extract: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'EXTRACT'",
+            [&doc_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extract, 0);
+    let _ = KnowledgeError::Backend("witness".to_string());
+    let _ = ScoredHit {
+        id: String::new(),
+        score: 0.0,
+    };
+}
+
+/// Live end-to-end probe (§14 + §15 step 4 acceptance): the real `Worker::new`
+/// stack — real HTTP fetch, readability clean, chunker, the pinned ONNX
+/// embedder, and the on-disk Ladybug store — drives one document to
+/// `VECTORIZED`. Ignores by default: needs the network (Wikipedia) and the
+/// pinned model, cached once under `data/models` (we symlink the shared cache
+/// to avoid re-downloading 130 MB per run). Run with `cargo test --ignored`.
+#[tokio::test]
+#[ignore = "live: fetches a real article and embeds with the real pinned model"]
+async fn live_worker_drives_a_document_to_vectorized() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // Reuse the machine-wide model cache so the run is offline after the very
+    // first fetch of the pinned model.
+    if let Some(home) = std::env::var_os("HOME") {
+        let shared = std::path::PathBuf::from(home).join(".cache/ohara-test/models");
+        if shared.is_dir() {
+            std::os::unix::fs::symlink(shared, data.join("models")).unwrap();
+        }
+    }
+    let toml_path = dir.path().join("ohara.toml");
+    std::fs::write(
+        &toml_path,
+        format!(
+            "data_dir = {:?}\n[pipeline]\ngraph_enabled = false\n",
+            data.display()
+        ),
+    )
+    .unwrap();
+    let config = Arc::new(Config::load(Some(&toml_path)).unwrap());
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(&conn, &data, "https://en.wikipedia.org/wiki/SQLite");
+    drop(conn);
+
+    // REAL ports: engine fetcher + readability + ONNX embedder + Ladybug store.
+    let worker = Arc::new(Worker::new(Arc::clone(&config)).unwrap());
+    for _ in 0..3 {
+        tick(&worker).await;
+    }
+
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc = control::get(&conn, &doc_id).unwrap().unwrap();
+    assert_eq!(
+        doc.status,
+        DocStatus::Vectorized,
+        "live run reached VECTORIZE"
+    );
+    assert!(doc.chunk_count >= 1);
+    // FTS sees the live-cleaned text (§5 trigger sync).
+    let fts: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'database'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(fts >= 1, "chunks_fts must be searchable after the live run");
 }

@@ -151,6 +151,8 @@ mod tests {
         Arc::new(Config::load(Some(&toml_path)).unwrap())
     }
 
+    use crate::pipeline::test_support::{NeverEmbedder, NeverKnowledge};
+
     /// An extractor that must never be called by the scrape stage.
     struct NeverExtractor;
 
@@ -205,6 +207,8 @@ mod tests {
                     handle: &handle,
                     fetcher: &fetcher,
                     extractor: &NeverExtractor,
+                    embedder: &NeverEmbedder,
+                    knowledge: &NeverKnowledge,
                 };
                 run(&ctx, &run_job)
             }
@@ -264,6 +268,8 @@ mod tests {
                     handle: &handle,
                     fetcher: &fetcher,
                     extractor: &NeverExtractor,
+                    embedder: &NeverEmbedder,
+                    knowledge: &NeverKnowledge,
                 };
                 run(&ctx, &run_job)
             }

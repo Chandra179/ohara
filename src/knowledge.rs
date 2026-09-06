@@ -1,11 +1,16 @@
-//! KNOWLEDGE PLANE facade (§1.3) — owns all `LadybugDB` access (§1.2.2): HNSW vector
+//! KNOWLEDGE PLANE facade (§1.3) — owns all `LadybugDB` access (§1.2.2): vector
 //! collections and the property graph, behind the [`KnowledgeStore`] port. `SQLite`
 //! and `data/` are the system of record; everything behind this port is a
 //! rebuildable index (§7.9).
 
+#[cfg(feature = "ladybug")]
 mod graph;
 mod reconcile;
+#[cfg(feature = "ladybug")]
 mod vectors;
+
+#[cfg(feature = "ladybug")]
+pub use vectors::LadybugStore;
 
 use async_trait::async_trait;
 
@@ -54,7 +59,7 @@ impl std::fmt::Display for ModelId {
 /// Which vector collection a call addresses (§9): one per model (§4) plus entity
 /// names. All vector ops are scoped by this — collection isolation is a
 /// contract-tested property (§9).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VectorSpace {
     /// Chunk vectors for one embedding model/variant.
     Chunks {
@@ -139,6 +144,28 @@ impl Predicate {
             Predicate::Produces => "PRODUCES",
             Predicate::Founded => "FOUNDED",
             Predicate::DependsOn => "DEPENDS_ON",
+        }
+    }
+}
+
+impl std::str::FromStr for Predicate {
+    type Err = KnowledgeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "LOCATED_IN" => Ok(Predicate::LocatedIn),
+            "PART_OF" => Ok(Predicate::PartOf),
+            "CREATED_BY" => Ok(Predicate::CreatedBy),
+            "CAUSED" => Ok(Predicate::Caused),
+            "AFFECTED" => Ok(Predicate::Affected),
+            "PARTICIPATED_IN" => Ok(Predicate::ParticipatedIn),
+            "ASSOCIATED_WITH" => Ok(Predicate::AssociatedWith),
+            "PRODUCES" => Ok(Predicate::Produces),
+            "FOUNDED" => Ok(Predicate::Founded),
+            "DEPENDS_ON" => Ok(Predicate::DependsOn),
+            other => Err(KnowledgeError::Backend(format!(
+                "unknown predicate {other:?}"
+            ))),
         }
     }
 }
@@ -233,13 +260,17 @@ pub trait KnowledgeStore: Send + Sync {
     /// Capability declaration.
     fn capabilities(&self) -> KsCapabilities;
 
-    /// Deterministically upserts vectors into `space`, pairing `ids` with `vectors`.
+    /// Deterministically upserts vectors into `space`, pairing `ids` with
+    /// `vectors`. `doc_id` records which document each vector belongs to so
+    /// [`delete_doc`](KnowledgeStore::delete_doc) can honor the delete→KNN
+    /// postcondition (§7.6); non-document collections (entity names) pass `""`.
     ///
     /// # Errors
     /// [`KnowledgeError`] per its taxonomy.
     async fn upsert_vectors(
         &self,
         space: VectorSpace,
+        doc_id: &str,
         ids: &[&str],
         vectors: &[Vec<f32>],
     ) -> Result<(), KnowledgeError>;

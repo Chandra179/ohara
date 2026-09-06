@@ -11,10 +11,10 @@ mod sites;
 
 pub use db::{DbError, connect};
 pub use documents::{
-    CleanResult, DeletionIntent, Document, EnqueueOutcome, NewDocument, due_for_recrawl,
-    execute_deletion, find_id_by_content_hash, find_id_by_url, get, insert_new,
-    mark_quality_rejected, pending_deletions, request_deletion, update_clean_result,
-    update_fetch_result,
+    ChunkSignature, CleanResult, DeletionIntent, Document, EnqueueOutcome, NewChunkRow,
+    NewDocument, chunk_signatures, due_for_recrawl, execute_deletion, find_id_by_content_hash,
+    find_id_by_url, get, insert_new, mark_quality_rejected, pending_deletions, replace_chunks,
+    request_deletion, update_clean_result, update_fetch_result, update_vectorize_result,
 };
 pub use jobs::{claim_next, complete, dead, enqueue, record_event, requeue, retry};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage};

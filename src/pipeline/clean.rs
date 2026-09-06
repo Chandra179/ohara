@@ -437,6 +437,8 @@ tables, indices, triggers, and views lives inside one portable file.";
             handle,
             fetcher: &NeverFetcher,
             extractor,
+            embedder: &crate::pipeline::test_support::NeverEmbedder,
+            knowledge: &crate::pipeline::test_support::NeverKnowledge,
         }
     }
 

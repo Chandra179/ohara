@@ -422,6 +422,123 @@ pub fn update_clean_result(
     Ok(())
 }
 
+/// One chunk of a document (§5 `chunks`): the registry row for what was
+/// embedded. `chunk_id` is the cross-store identity (`sha256(doc_id:seq)`, §3);
+/// `text` is display text, `embed_text` the exact embedded string.
+pub struct NewChunkRow {
+    /// The cross-store chunk identity.
+    pub chunk_id: String,
+    /// 0-based position within the document.
+    pub seq: i64,
+    /// "Title > H1 > H2" breadcrumb.
+    pub header_path: String,
+    /// Display text.
+    pub text: String,
+    /// The exact string embedded (breadcrumb included, §8).
+    pub embed_text: String,
+    /// Token count in the embedder's tokenizer (§4).
+    pub token_count: i64,
+    /// Model whose vectors this row currently carries (§4).
+    pub embedding_model: String,
+    /// sha256 of `embed_text` — replay dedup key (§8 Stage 3).
+    pub content_hash: String,
+}
+
+/// An existing chunk row's replay signature: `(seq, content_hash, chunk_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkSignature {
+    /// 0-based position within the document.
+    pub seq: i64,
+    /// sha256 of the row's `embed_text`.
+    pub content_hash: String,
+    /// The cross-store identity.
+    pub chunk_id: String,
+}
+
+/// Reads the replay signature of every chunk row for `doc_id`, ordered by `seq`.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure.
+pub fn chunk_signatures(conn: &Connection, doc_id: &str) -> Result<Vec<ChunkSignature>, DbError> {
+    let mut stmt = conn
+        .prepare("SELECT seq, content_hash, chunk_id FROM chunks WHERE doc_id = ?1 ORDER BY seq")?;
+    let rows = stmt.query_map(rusqlite::params![doc_id], |row| {
+        Ok(ChunkSignature {
+            seq: row.get(0)?,
+            content_hash: row.get(1)?,
+            chunk_id: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Replaces all chunk rows for `doc_id` with `chunks` in one transaction (§8
+/// Stage 3). Conflicts on `(doc_id, seq)` upsert — never `INSERT OR REPLACE`
+/// (§5: REPLACE churns the `chunks.id` surrogate and the FTS rowid mapping).
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure (the transaction rolls back).
+pub fn replace_chunks(
+    conn: &Connection,
+    doc_id: &str,
+    chunks: &[NewChunkRow],
+) -> Result<(), DbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM chunks WHERE doc_id = ?1",
+        rusqlite::params![doc_id],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO chunks (chunk_id, doc_id, seq, header_path, text, embed_text,
+                                 token_count, embedding_model, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(doc_id, seq) DO UPDATE SET
+                chunk_id = excluded.chunk_id, header_path = excluded.header_path,
+                text = excluded.text, embed_text = excluded.embed_text,
+                token_count = excluded.token_count,
+                embedding_model = excluded.embedding_model,
+                content_hash = excluded.content_hash",
+        )?;
+        for c in chunks {
+            stmt.execute(rusqlite::params![
+                c.chunk_id,
+                doc_id,
+                c.seq,
+                c.header_path,
+                c.text,
+                c.embed_text,
+                c.token_count,
+                c.embedding_model,
+                c.content_hash,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Records Stage 3's aggregate result on the document row: how many chunks the
+/// document now has and their total token count (§5).
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure.
+pub fn update_vectorize_result(
+    conn: &Connection,
+    doc_id: &str,
+    chunk_count: i64,
+    token_count: i64,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE documents
+            SET chunk_count = ?2, token_count = ?3, last_processed_at = ?4
+          WHERE doc_id = ?1",
+        rusqlite::params![doc_id, chunk_count, token_count, now_stamp],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely

@@ -54,8 +54,8 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Control store | SQLite via `rusqlite` (bundled), WAL | Stable; migrations versioned in `migrations/` |
 | Cleaning | `readability` (Rust) + `html2md` | Behind `Extractor` port; swap = alternate impl |
 | Text utils | `whatlang`, `symspell` | Pure functions in `text.rs`; symspell gets a domain dictionary |
-| Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher, HNSW extension) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port; pinned version; Kùzu-compatible API makes fallback realistic. **Build gates before step 4 of §15:** verify (a) the transaction model — are reads concurrent with a write transaction? — and (b) edge-rewire/fold support (§7.8). Contingency for (a): serialize knowledge-plane access through one actor task with small write transactions |
-| Embedder | BAAI `bge-small-en-v1.5` via ONNX (384-dim, cosine, fp32 default) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1 |
+| Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher) via the `lbug` crate (pinned 0.20.2) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port. **§2 build gates verified empirically against lbug 0.20.2 (2026-09-06):** (a) *transaction model* — MVCC snapshot reads run concurrently with the single write transaction; a second concurrent writer is refused (maps to `KnowledgeError::Unavailable`, Retry) — the single-worker default already serializes writers, so the actor-task contingency is not needed; (b) *edge-rewire/fold (§7.8)* — `CREATE`+`DELETE`+node deletion in one `BEGIN`/`COMMIT` verified. The bundled engine ships **no HNSW** (`query_hnsw_index` is absent); Phase 4 ships exact KNN via the in-engine `array_cosine_similarity` scalar — the HNSW index is a drop-in swap behind the same port (§11). Note: `lbug` links OpenSSL at link time (`libssl-dev` is a build prerequisite) |
+| Embedder | BAAI `bge-small-en-v1.5` via ONNX (`fastembed` 6.0.2 + `ort`, fp32; tokenizer via `tokenizers`/`hf-hub` — rustls-only features, never native-tls) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1. Model + tokenizer files fetched once from the HF hub into `data/models/` (fail-fast at boot), offline afterwards. Behind the `Embedder` port; the port also exposes `count_tokens` so chunk budgets are measured in the model's own tokenizer (§4) |
 | Reranker | FlashRank tiny models (default), bge-reranker-base ONNX **int8** (optional) | Behind `Reranker` port; CPU-optimized models only — never fp32 (§11.1); identity impl as baseline |
 | LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned on the reference profile: `phi4-mini:latest` on GPU (§11.2); cloud Haiku class **opt-in** | Behind `Llm` port; cost counters mandatory; endpoint health-checked at boot (config fail-fast) — mid-run unavailability maps to `LlmError::Unavailable` (Transient, backoff); §12 governs egress |
 
@@ -368,8 +368,8 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 - **Layer 1:** split on `#`/`##`/`###` boundaries. **Layer 2:** sections over budget → recursive split (`\n\n` → `\n` → sentence) with 10–15% overlap. Tables and fenced code blocks are atomic — never split mid-block; a table larger than the budget becomes its own chunk.
 - **Budget:** ≤ 512 tokens in the *embedder's tokenizer*, breadcrumb included.
 - **Breadcrumb prefix** (part of `embed_text`, kept separate in `text`): document title + header path; doc summary once Stage 2 enrichment is on.
-- Chunk-level exact-dup skip via `chunks.content_hash`.
-- Batch embed → `upsert_vectors(VectorSpace::Chunks { model }, …)` + chunk rows (deterministic `chunk_id`, `embedding_model` = the model, `ON CONFLICT DO UPDATE`) — the FTS triggers fire in the same transaction. → `VECTORIZED`.
+- Chunk-level exact-dup skip via `chunks.content_hash` (identical `embed_text`s share one inference; every chunk id still gets its vector).
+- Batch embed → chunk rows upserted first (deterministic `chunk_id` = `sha256(doc_id:seq)`, `embedding_model` = the model, `ON CONFLICT(doc_id, seq) DO UPDATE` — the FTS triggers fire in the same transaction), then `upsert_vectors(VectorSpace::Chunks { model }, doc_id, …)`. Replay semantics per §7.3: identical signature → repair missing vectors only; drift → §7.4 delete-first. → `VECTORIZED`.
 
 ### Stage 4 — Extract graph
 
@@ -447,8 +447,9 @@ pub trait Fetcher: Send + Sync {
 #[async_trait]
 pub trait KnowledgeStore: Send + Sync {
     fn capabilities(&self) -> KsCapabilities;               // { filtered_ann, graph_traversal }
-    // vector ops — collection-scoped
-    async fn upsert_vectors(&self, space: VectorSpace, ids: &[&str],
+    // vector ops — collection-scoped; doc_id records membership so
+    // delete_doc can honor the delete→KNN postcondition (§7.6)
+    async fn upsert_vectors(&self, space: VectorSpace, doc_id: &str, ids: &[&str],
                             vectors: &[Vec<f32>]) -> Result<(), KnowledgeError>;
     async fn knn(&self, space: VectorSpace, q: &[f32], k: usize,
                  f: &ChunkFilter) -> Result<Vec<ScoredHit>, KnowledgeError>;
@@ -465,6 +466,8 @@ pub trait KnowledgeStore: Send + Sync {
 pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;                             // "bge-small-en-v1.5"
     fn dim(&self) -> usize;                                 // 384
+    fn count_tokens(&self, text: &str) -> usize;            // §4: budgets measured in
+                                                            // the model's tokenizer
     // Sync by contract: CPU-bound batch. Callers invoke it inside spawn_blocking.
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError>;
 }
@@ -549,7 +552,7 @@ The performance story is **LLM-dominated**; everything else is rounding error. I
 
 - Rerank realism: bge-reranker on CPU over 50 × 400-token pairs is 100–500 ms — hence FlashRank tiny models as the default.
 - Levers: extraction batch size, per-stage concurrency, local Ollama extraction (free, no data egress — wall-clock bound; parallel requests/batched prompts help), prompt versioning to avoid re-paying extraction after prompt tweaks (`triplets.model` guards this). Pin the chosen Ollama model by name + version like any other model (§1.2.7); a model change is an extraction migration, not a config flip.
-- **HNSW params:** `M=16`, `ef_construction=64`, and `ef_search = max(128, 2·k)` — 128 at the k=50 rerank pool (an `ef` below `k` cannot return `k` candidates with sane recall). The knobs are gated by vector-path recall@20 on the golden set (§8.5), not by folklore; revisit at >1M chunks.
+- **HNSW params:** `M=16`, `ef_construction=64`, and `ef_search = max(128, 2·k)` — 128 at the k=50 rerank pool (an `ef` below `k` cannot return `k` candidates with sane recall). The knobs are gated by vector-path recall@20 on the golden set (§8.5), not by folklore; revisit at >1M chunks. **Current posture:** the bundled `lbug` engine ships no HNSW, so retrieval runs *exact* KNN in-engine (`array_cosine_similarity`, order-limited) — correct, sub-10ms at personal-corpus scale, and the parameterized index becomes a drop-in port impl swap when it ships.
 
 ### 11.1 Quantization policy
 
@@ -607,7 +610,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 1. Scaffold crate (module tree, `config.rs`, migrations, worker-loop skeleton)
 2. Control store: documents + jobs with lease claiming + stage chaining
 3. Fetch ladder leg 1 (HTTP) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
-4. Chunker + local embedder + vector collections + `chunks_fts` — **after the Ladybug build gates (§2) pass**
+4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + rerank (no graph) — measured on the golden set
 6. Stage 4: extraction, entity resolution, graph path
 7. Obscura leg + full ladder
@@ -661,3 +664,11 @@ Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage
 17. **Reference hardware envelope (§11.2):** pinned deployment profile for the dev machine — `phi4-mini` extraction, CPU/int8 embedder + reranker, knowledge-plane RAM envelope (~10⁶-chunk ceiling on 15 GB).
 18. **LLM accelerator, settled after a flip-flop:** the profile briefly went CPU-only to avoid driver coupling; reinstated on GPU once the driver was stable. Both configurations are documented in §11.2.
 19. **GPU profile (§11.2):** RTX 4050 6 GB via Ubuntu's prebuilt signed module packages (no DKMS); LLM on GPU (`phi4-mini` ≈ 4–7 h per 15k calls), embedder + reranker stay CPU/int8; driver-hygiene notes recorded (headers alignment, deliberate install); all-CPU documented as the fallback profile.
+
+### B.3 — v2.1 implementation amendments (Phase 4 build)
+
+1. **§2 build gates verified empirically against `lbug` 0.20.2** (2026-09-06): MVCC snapshot reads run concurrently with the single write transaction (a second concurrent writer is refused → `KnowledgeError::Unavailable`, Retry); the §7.8 fold (`CREATE` rewire + `DELETE` edges + node delete in one `BEGIN`/`COMMIT`) works. The bundled engine ships **no HNSW** — vector collections are `FLOAT[dim]` node-table properties with exact in-engine KNN (`array_cosine_similarity`); an HNSW index is a drop-in swap behind the port. `lbug` links OpenSSL at link time (`libssl-dev` build prerequisite).
+2. **`KnowledgeStore::upsert_vectors` gained a `doc_id` parameter:** the §7.6 delete flow ("every vector collection") requires the store to know vector→document membership; entity-name vectors pass `""`. The §9 sketch above predates this.
+3. **`Embedder` port gained `count_tokens`:** §4 requires chunk budgets measured in the embedder's *tokenizer*; the port owns that so stage code never names a vendor tokenizer.
+4. **§7.3 realized as idempotent replay, not a sweep:** the Stage 3 body compares the registry's `(seq, content_hash)` signature — identical → repair missing vectors via `has_vector`; drift → §7.4 delete-first. No separate boot pass for knowledge state (deletion intents + audit retention remain in `control::reconcile`).
+5. **Feature gates:** `ladybug` and `onnx-embedder` features (both default-on) isolate the heavy native stacks; `--no-default-features` builds for deployments injecting remote providers through `Worker::with_ports`.

@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite as the control plane, LadybugDB (vectors + graph) as the knowledge plane, and an external fetcher engine as the only moving part.
 
-> **Status:** build order §15 in progress — **Phases 1–3 landed**: crate scaffold; the **control store** (documents, §6 lease queue with transactional stage chaining, boot reconciliation); and **§15 step 3** — fetch ladder leg 1 (plain HTTP with §12 SSRF guard, robots.txt, politeness), the `sites` policy table, URL normalization, and working **Stages 1–2** (scrape → readability clean → dedup → quality + language gate). Stages 3–4 remain honest stubs. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** build order §15 in progress — **Phases 1–4 landed**: crate scaffold; the **control store** (documents, §6 lease queue with transactional stage chaining, boot reconciliation); fetch ladder leg 1 (plain HTTP with §12 SSRF guard, robots.txt, politeness) and working **Stages 1–2** (scrape → readability clean → dedup → quality + language gate); and **§15 step 4** — the `LadybugDB` knowledge store behind its port (both §2 build gates verified empirically), the tokenizer-aligned **chunker**, the pinned `bge-small-en-v1.5` **local embedder**, vector collections, and the trigger-synced `chunks_fts` index — **Stage 3 works end to end** (`NEW` → `VECTORIZED`). Stage 4 (graph extraction) remains an honest stub. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -13,7 +13,7 @@
  [ Stage 2: Clean ] ──► normalized Markdown ──► SQLite 'CLEANED'
          │          readability → html2md → sanitize → hash/dedup → quality gate
          ▼
- [ Stage 3: Chunk & Vectorize ] ──► embeddings ──► LadybugDB HNSW   'VECTORIZED'
+ [ Stage 3: Chunk & Vectorize ] ──► embeddings ──► LadybugDB vectors   'VECTORIZED'
          │          header-aware split → recursive fallback → breadcrumbs
          ▼
  [ Stage 4: Extract Graph ] ──► triplets ──► LadybugDB property graph
@@ -38,6 +38,24 @@
 | LLM | [Ollama](https://ollama.com) (local, GPU; pinned: `phi4-mini`) — cloud Haiku opt-in | Extraction + synthesis — behind the `Llm` port; nothing leaves the machine by default |
 
 Every third-party engine sits behind a small trait so it can be swapped without touching pipeline logic — see [Ports & substitution](docs/ARCHITECTURE.md#9-ports--substitution-lsp) in the architecture doc.
+
+## Building
+
+Rust 1.85+ (edition 2024). Two native prerequisites:
+
+- **OpenSSL development libraries** — the `lbug` crate's bundled engine links
+  OpenSSL at link time: `sudo apt install libssl-dev` (Ubuntu/Debian). Without
+  sudo, symlinking the runtime libs into a scratch dir works too:
+  `mkdir -p /tmp/ossl/lib && ln -s /usr/lib/x86_64-linux-gnu/libssl.so.3 /tmp/ossl/lib/libssl.so && ln -s /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /tmp/ossl/lib/libcrypto.so && OPENSSL_DIR=/tmp/ossl cargo build`.
+- **CMake + a C++ toolchain** — `lbug` compiles its bundled C++ engine on first
+  build (this takes a while and needs ~2 GB of scratch space).
+
+The ONNX Runtime and the pinned embedder model (`bge-small-en-v1.5`, ~130 MB)
+are fetched on first use from the network and cached under `data/models/`;
+afterwards everything runs offline. Heavy native stacks are feature-gated:
+`cargo build --no-default-features` drops `lbug` + the ONNX embedder (for
+deployments that inject remote `KnowledgeStore`/`Embedder` providers at boot,
+§9).
 
 ## Repository layout
 
@@ -71,15 +89,21 @@ ohara/
     │   └── obscura.rs         #   ladder leg 3: Obscura process, versioned JSON protocol
     ├── knowledge.rs           # KNOWLEDGE PLANE facade — pub trait KnowledgeStore (the port)
     ├── knowledge/
-    │   ├── vectors.rs         #   HNSW upsert / KNN / delete
-    │   ├── graph.rs           #   openCypher: MERGE entities, :MENTIONS edges, traversals
-    │   └── reconcile.rs       #   boot-time sweep: SQLite intent vs. what actually landed
+    │   ├── vectors.rs         #   LadybugStore: vector collections (FLOAT[n] node tables,
+    │   │                      #   exact in-engine cosine KNN), delete sweep, graph schema
+    │   ├── graph.rs           #   openCypher: entity upserts, :MENTIONS edges, the §7.8
+    │   │                      #   fold (one transaction), hop-wise fact traversals
+    │   └── reconcile.rs       #   reconciliation posture: replay-idempotent writes + lease
+    │                          #   reclaim make a separate boot sweep redundant (§7.3)
     ├── pipeline.rs            # worker loop: claim jobs, dispatch stages, retries, audit
     ├── pipeline/
     │   ├── scrape.rs          # Stage 1
     │   ├── clean.rs           # Stage 2 — declares the Extractor port
-    │   ├── chunk.rs           # Stage 3a: two-layer chunking + breadcrumbs
-    │   ├── embed.rs           # Stage 3b: pub trait Embedder + local ONNX impl
+    │   ├── chunk.rs           # Stage 3a: pure §8 chunker — header-aware split, atomic
+    │   │                      #   tables/code, recursive fallback with overlap, breadcrumbs
+    │   ├── embed.rs           # Stage 3b: pub trait Embedder (incl. tokenizer counting) +
+    │   │                      #   LocalEmbedder (fastembed bge-small-en-v1.5) + the stage body
+    │   │                      #   with the §7 replay/repair and delete-first protocol
     │   ├── extract.rs         # Stage 4: triplets, entity resolution, cross-linking
     │   └── retrieve.rs        # Stage 5: three-path retrieval + rerank + QueryNormalizer port
     ├── llm.rs                 # pub trait Llm — cloud/local clients, retry, cost counters
@@ -109,7 +133,7 @@ ohara/
 1. Scaffold the crate: module tree, config, migrations, worker-loop skeleton
 2. Control store: documents + jobs (lease claiming)
 3. Fetch ladder leg 1 (HTTP) + Stages 1–2 (clean, dedup, quality gate)
-4. Chunker + local embedder + HNSW upsert
+4. Chunker + local embedder + vector collections + `chunks_fts` — landed with the `LadybugDB` build gates passing (exact KNN; HNSW stays a drop-in port swap)
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — *no graph yet* — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path
 7. Obscura leg + full ladder

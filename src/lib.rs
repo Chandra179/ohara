@@ -79,6 +79,12 @@ pub enum BootError {
     /// The fetcher could not be built at boot.
     #[error("fetcher: {0}")]
     Fetch(#[from] engine::FetchError),
+    /// The embedder could not be built or loaded at boot (§4).
+    #[error("embedder: {0}")]
+    Embed(#[from] pipeline::EmbedError),
+    /// The knowledge store could not be opened at boot (§3).
+    #[error("knowledge store: {0}")]
+    Knowledge(#[from] knowledge::KnowledgeError),
     /// The worker loop task failed unexpectedly.
     #[error("worker loop failed: {0}")]
     Worker(String),
