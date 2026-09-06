@@ -518,6 +518,45 @@ pub fn replace_chunks(
     Ok(())
 }
 
+/// A chunk's retrieval-visible fields (§8 Stage 5): identity, owning document,
+/// and display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkText {
+    /// The cross-store chunk identity.
+    pub chunk_id: String,
+    /// The owning document.
+    pub doc_id: String,
+    /// Display text.
+    pub text: String,
+}
+
+/// Looks up chunk texts by their cross-store ids — the vector path's hydration
+/// step (KNN returns ids; the registry owns text, §3). Missing ids are skipped.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure.
+pub fn chunks_by_ids(conn: &Connection, ids: &[&str]) -> Result<Vec<ChunkText>, DbError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql =
+        format!("SELECT chunk_id, doc_id, text FROM chunks WHERE chunk_id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok(ChunkText {
+            chunk_id: row.get(0)?,
+            doc_id: row.get(1)?,
+            text: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Records Stage 3's aggregate result on the document row: how many chunks the
 /// document now has and their total token count (§5).
 ///

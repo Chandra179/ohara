@@ -56,7 +56,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Text utils | `whatlang`, `symspell` | Pure functions in `text.rs`; symspell gets a domain dictionary |
 | Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher) via the `lbug` crate (pinned 0.20.2) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port. **§2 build gates verified empirically against lbug 0.20.2 (2026-09-06):** (a) *transaction model* — MVCC snapshot reads run concurrently with the single write transaction; a second concurrent writer is refused (maps to `KnowledgeError::Unavailable`, Retry) — the single-worker default already serializes writers, so the actor-task contingency is not needed; (b) *edge-rewire/fold (§7.8)* — `CREATE`+`DELETE`+node deletion in one `BEGIN`/`COMMIT` verified. The bundled engine ships **no HNSW** (`query_hnsw_index` is absent); Phase 4 ships exact KNN via the in-engine `array_cosine_similarity` scalar — the HNSW index is a drop-in swap behind the same port (§11). Note: `lbug` links OpenSSL at link time (`libssl-dev` is a build prerequisite) |
 | Embedder | BAAI `bge-small-en-v1.5` via ONNX (`fastembed` 6.0.2 + `ort`, fp32; tokenizer via `tokenizers`/`hf-hub` — rustls-only features, never native-tls) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1. Model + tokenizer files fetched once from the HF hub into `data/models/` (fail-fast at boot), offline afterwards. Behind the `Embedder` port; the port also exposes `count_tokens` so chunk budgets are measured in the model's own tokenizer (§4) |
-| Reranker | FlashRank tiny models (default), bge-reranker-base ONNX **int8** (optional) | Behind `Reranker` port; CPU-optimized models only — never fp32 (§11.1); identity impl as baseline |
+| Reranker | `bge-reranker-base` ONNX **int8** (Xenova export, ~280 MB) via fastembed's user-defined loader; FlashRank tiny models as a later swap; identity impl as baseline | Behind `Reranker` port; CPU-optimized models only — never fp32 (§11.1); model + tokenizer cached under `data/models` like the embedder |
 | LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned on the reference profile: `phi4-mini:latest` on GPU (§11.2); cloud Haiku class **opt-in** | Behind `Llm` port; cost counters mandatory; endpoint health-checked at boot (config fail-fast) — mid-run unavailability maps to `LlmError::Unavailable` (Transient, backoff); §12 governs egress |
 
 **Rule:** any dependency whose API is not its own standard (Obscura, LadybugDB, embedder runtime) must be reachable only through its port facade. No other module may name the vendor's types.
@@ -389,7 +389,9 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 ### Stage 5 — Retrieval (GraphRAG)
 
-1. **Query preprocessing:** language detect, symspell with a domain dictionary (it "corrects" jargon otherwise), optional HyDE (flag; +300–500 ms).
+*Baseline form landed (§15 step 5): steps 1 (language detect only), 3 (BM25 + vector paths), 4 (RRF), 5 (rerank with degradation), and 7 (the golden-set harness). The graph path, symspell, HyDE, and Llm synthesis land with steps 6–8. Measured baseline on the golden set: both paths recall@20 = 1.000, fused MRR = 1.000.*
+
+1. **Query preprocessing:** language detect, symspell with a domain dictionary (it "corrects" jargon otherwise), optional HyDE (flag; +300–500 ms). *Landed: whatlang detection is confidence-gated at 0.5 — measured, short technical queries sit at 0.02–0.10 confidence and mislabel; below the floor the query is treated as English (the Stage 2 gate bounds corpus languages anyway).*
 2. **Query entities:** typed alias match against `entity_aliases` — a homograph alias returns **all** its type-variants and lets rerank/graph context disambiguate — plus embedding KNN over the `EntityNames` collection above a threshold.
 3. **Three paths:** BM25 via `chunks_fts` (embeddings are weak on exact identifiers like "SQLite"):
 
@@ -611,7 +613,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 2. Control store: documents + jobs with lease claiming + stage chaining
 3. Fetch ladder leg 1 (HTTP) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
-5. Retrieval baseline: FTS5 + vector + rerank (no graph) — measured on the golden set
+5. Retrieval baseline: FTS5 + vector + rerank (no graph) — **landed, measured on the golden set** (50 queries, synthetic 48-chunk corpus, relevance true by construction): BM25 recall@20 = 1.000, vector recall@20 = 1.000, fused MRR = 1.000 with the real pinned models (rerank delta +0.000 — fusion order was already perfect on this set; the harness is the deliverable, the numbers the baseline to beat). Not yet built: the graph path and query entities (step 6), symspell correction, `HyDE`, `Llm` synthesis
 6. Stage 4: extraction, entity resolution, graph path
 7. Obscura leg + full ladder
 8. Eval expansion + ops tooling (`ohara backup` / `prune` / `requeue` / `er merge`) + cost dashboards

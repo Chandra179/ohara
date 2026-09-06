@@ -26,7 +26,12 @@ pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, Readabi
 #[cfg(feature = "onnx-embedder")]
 pub use embed::LocalEmbedder;
 pub use embed::{EmbedError, Embedder};
-pub use retrieve::{Lang, QueryNormalizer, RerankError, Reranker, ScoredChunk};
+#[cfg(feature = "onnx-embedder")]
+pub use retrieve::LocalReranker;
+pub use retrieve::{
+    IdentityReranker, Lang, QueryNormalizer, RETRIEVAL_POOL, RerankError, Reranker, RetrieveError,
+    Retriever, ScoredChunk, WhatlangNormalizer, fts_match_expression,
+};
 
 /// What a stage body reports on success (§10: domain outcomes are values, not
 /// errors — they never route through [`StageError`]).
@@ -648,7 +653,9 @@ pub(crate) mod test_support {
     }
 
     /// Deterministic embedder fake (§14): whitespace token counting +2 for
-    /// specials, vectors derived from the text's first byte. Counts embed calls.
+    /// specials, vectors derived from a word hash — chunks sharing vocabulary
+    /// score similar, so fusion-order assertions are meaningful. Counts embed
+    /// calls.
     pub struct FakeEmbedder {
         calls: Mutex<usize>,
     }
@@ -689,8 +696,19 @@ pub(crate) mod test_support {
             Ok(texts
                 .iter()
                 .map(|t| {
-                    let seed = f32::from(t.as_bytes().first().copied().unwrap_or(b' '));
-                    vec![seed % 8.0 + 1.0, seed % 5.0 + 1.0, 1.0, 0.5]
+                    // Word-hash bag: each word's initial lands in one of four
+                    // buckets; normalized so cosine = lexical overlap.
+                    let mut v = [0.0f32; 4];
+                    for word in t.split_whitespace() {
+                        let b = usize::from(word.as_bytes().first().copied().unwrap_or(b' '));
+                        v[b % 4] += 1.0;
+                    }
+                    let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt();
+                    if norm > 0.0 {
+                        v.map(|x| x / norm).to_vec()
+                    } else {
+                        v.to_vec()
+                    }
                 })
                 .collect())
         }
