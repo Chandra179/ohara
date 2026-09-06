@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite as the control plane, LadybugDB (vectors + graph) as the knowledge plane, and an external fetcher engine as the only moving part.
 
-> **Status:** build order §15 in progress — **Phases 1–2 landed**: crate scaffold (module tree, config, migrations incl. FTS5) and the **control store**: documents registry with `ohara enqueue`-style registration + URL dedup, the §6 job queue with lease claiming, transactional stage chaining (DONE + milestone + successor job), requeue recovery, and the §7.3 boot reconciliation sweep (deletion intents, audit pruning). All pipeline stages remain honest stubs. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** build order §15 in progress — **Phases 1–3 landed**: crate scaffold; the **control store** (documents, §6 lease queue with transactional stage chaining, boot reconciliation); and **§15 step 3** — fetch ladder leg 1 (plain HTTP with §12 SSRF guard, robots.txt, politeness), the `sites` policy table, URL normalization, and working **Stages 1–2** (scrape → readability clean → dedup → quality + language gate). Stages 3–4 remain honest stubs. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 

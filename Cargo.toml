@@ -29,14 +29,21 @@ module_name_repetitions = "allow" # plane modules legitimately repeat their plan
 [dependencies]
 async-trait = "0.1.92"
 chrono = "0.4.45"
+flate2 = "1.1.10"
+html2md = "0.2.17"
+readability = { version = "0.3", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "signal", "fs", "macros"] }
 toml = "1.1.5"
+unicode-normalization = "0.1.25"
 url = "2.5.8"
 uuid = { version = "1.26.0", features = ["v7"] }
+whatlang = "0.18.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

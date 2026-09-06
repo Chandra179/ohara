@@ -351,7 +351,8 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 - **Fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → impersonated client → Obscura (JS + stealth). Escalation triggers: `FetchError::AntiBot`, JS-shell heuristic (tiny content + script-heavy raw HTML), or `sites.fetch_hint`.
 - **URL normalization** (load-bearing for `source_url_normalized` dedup — specified, not folklore): lowercase scheme/host, punycode IDN, drop default ports and fragments, sort query parameters, strip configurable tracking params (`utm_*`, `fbclid`, `gclid`, …), absolutize relative URLs against `final_url`. Implemented once in the `NormalizedUrl` newtype with fixture tests.
-- `FetchedDoc { html, js_executed, final_url, status, content_type, fetched_at }` — the contract is "return what you fetched, labeled" (§9), and the pipeline escalates when the label says rendering didn't happen.
+- `FetchedDoc { html, js_executed, final_url, status, content_type, etag, last_modified, fetched_at }` — the contract is "return what you fetched, labeled" (§9), and the pipeline escalates when the label says rendering didn't happen. The validators ride along for §7.5 conditional re-crawl.
+- **Per-fetch policy:** the port takes `fetch_with_policy(url, &FetchPolicy)` — the stage reads the control plane (`sites.rate_limit_ms`, the robots toggle) and the fetcher enforces (§8 politeness floor is `max(impl default, policy)`); plain `fetch(url)` applies the default. Robots rules use a per-host cache; an unreadable robots.txt is cached as disallow-all (conservative RFC 9309).
 - Payload → `data/raw/<doc_id>.html.gz`; document row → `SCRAPED`.
 - **Politeness:** `robots.txt` honored (config toggle, default on; cached per host); per-domain token bucket (`sites.rate_limit_ms` overrides the global default 1 req / 2 s); global concurrency cap; honest User-Agent.
 
@@ -438,7 +439,9 @@ pub enum VectorSpace {
 #[async_trait]
 pub trait Fetcher: Send + Sync {
     fn capabilities(&self) -> FetchCapabilities;            // { js_rendering, stealth }
-    async fn fetch(&self, url: &NormalizedUrl) -> Result<FetchedDoc, FetchError>;
+    async fn fetch_with_policy(&self, url: &NormalizedUrl, policy: &FetchPolicy)
+        -> Result<FetchedDoc, FetchError>;                  // §8 politeness + robots
+    async fn fetch(&self, url: &NormalizedUrl) -> Result<FetchedDoc, FetchError> { /* default policy */ }
 }
 
 #[async_trait]

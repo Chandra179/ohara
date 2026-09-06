@@ -76,6 +76,9 @@ pub enum BootError {
     /// A data directory could not be created.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The fetcher could not be built at boot.
+    #[error("fetcher: {0}")]
+    Fetch(#[from] engine::FetchError),
     /// The worker loop task failed unexpectedly.
     #[error("worker loop failed: {0}")]
     Worker(String),

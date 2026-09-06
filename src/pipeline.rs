@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::Class;
 use crate::config::Config;
 use crate::control::{self, ClaimedJob, Completion, DbError, Stage};
+use crate::engine::Fetcher;
 
-pub use clean::{ExtractError, ExtractedArticle, Extractor};
+pub use crate::engine::HttpFetcher;
+pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, ReadabilityExtractor};
 pub use embed::{EmbedError, Embedder};
 pub use retrieve::{Lang, QueryNormalizer, RerankError, Reranker, ScoredChunk};
 
@@ -102,6 +104,29 @@ impl StageError {
     }
 }
 
+impl From<DbError> for StageError {
+    /// A store failure while a stage runs is §10's "store returns corrupt data"
+    /// shape: audit-preserving shutdown (drain, reconcile at next boot) beats
+    /// pretending the stage can continue.
+    fn from(source: DbError) -> Self {
+        StageError::Fatal {
+            source: Box::new(source),
+        }
+    }
+}
+
+/// What a stage needs for one claimed job (§1.3): validated config, the store
+/// connection (held by the tick), the async runtime handle for port calls, and
+/// the ports themselves — fakes substitute cleanly in tests (§14).
+pub(crate) struct StageCtx<'a> {
+    pub(crate) config: &'a Config,
+    pub(crate) conn: &'a rusqlite::Connection,
+    /// Handle for `block_on`-ing async port calls from the blocking thread.
+    pub(crate) handle: &'a tokio::runtime::Handle,
+    pub(crate) fetcher: &'a dyn Fetcher,
+    pub(crate) extractor: &'a dyn Extractor,
+}
+
 /// What the loop does after one claimed job's outcome is recorded.
 enum Flow {
     /// Keep scheduling.
@@ -110,27 +135,60 @@ enum Flow {
     Abort(Box<StageError>),
 }
 
-/// The worker: owns the control connection and the validated configuration. The
-/// connection sits behind a [`Mutex`] — `rusqlite::Connection`
+/// The worker: owns the control connection, the validated configuration, and the
+/// ports. The connection sits behind a [`Mutex`] — `rusqlite::Connection`
 /// is `Send` but not `Sync`, and the loop reaches it from blocking tasks.
 pub struct Worker {
     config: Arc<Config>,
     conn: Mutex<rusqlite::Connection>,
+    handle: tokio::runtime::Handle,
+    fetcher: Arc<dyn Fetcher>,
+    extractor: Arc<dyn Extractor>,
     id: String,
 }
 
 impl Worker {
-    /// Boots a worker: opens (and migrates) the control store. Callers create the
-    /// data directories first ([`run`] does).
+    /// Boots a worker with the real engine-plane fetcher (ladder leg 1) and the
+    /// readability extractor. Callers create the data directories first
+    /// ([`run`] does).
     ///
     /// # Errors
-    /// [`crate::BootError`] if the store cannot be opened or migrated.
+    /// [`crate::BootError`] if the store cannot be opened/migrated, the runtime
+    /// handle is unavailable, or the fetcher cannot be built.
     pub fn new(config: Arc<Config>) -> Result<Self, crate::BootError> {
+        let fetcher = Arc::new(HttpFetcher::new(crate::engine::HttpFetcherParams {
+            user_agent: config.fetcher().user_agent().to_string(),
+            timeout: config.fetcher().timeout(),
+            rate_limit: config.rate_limit(),
+            allow_private_hosts: config.fetcher().allow_private_hosts(),
+        })?);
+        let extractor = Arc::new(ReadabilityExtractor);
+        Self::with_ports(config, fetcher, extractor)
+    }
+
+    /// Boots a worker with explicit ports (§14 integration: canned fetcher, fake
+    /// extractor). Must be called inside a tokio runtime — stage bodies drive
+    /// async port calls from blocking threads via its handle.
+    ///
+    /// # Errors
+    /// [`crate::BootError`] if the store cannot be opened or migrated, or if no
+    /// tokio runtime is active.
+    pub fn with_ports(
+        config: Arc<Config>,
+        fetcher: Arc<dyn Fetcher>,
+        extractor: Arc<dyn Extractor>,
+    ) -> Result<Self, crate::BootError> {
         let id = format!("worker-{}", std::process::id());
         let conn = control::connect(config.db_path())?;
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            crate::BootError::Worker("ohara must run inside a tokio runtime".to_string())
+        })?;
         Ok(Self {
             config,
             conn: Mutex::new(conn),
+            handle,
+            fetcher,
+            extractor,
             id,
         })
     }
@@ -159,15 +217,16 @@ impl Worker {
         )
     }
 
-    /// One scheduling tick: for each stage in pipeline order, claim → execute →
-    /// record. Returns the number of jobs executed.
+    /// One scheduling step: claim the next runnable job in pipeline order,
+    /// execute it, record the outcome. One job per call — the run loop spins
+    /// back immediately while the queue drains, and tests/hosts can advance the
+    /// pipeline step by step ([`Worker::tick_once`]).
     ///
     /// # Errors
     /// [`DbError`] on store failure; a `Fatal` stage error aborts scheduling (§6)
     /// and is returned as the tick's [`Flow`].
     fn tick(&self) -> Result<(usize, Flow), DbError> {
         let conn = self.conn();
-        let mut executed = 0;
         let now = control::now();
         for stage in Stage::ALL {
             let Some(job) = control::claim_next(
@@ -180,13 +239,24 @@ impl Worker {
             else {
                 continue;
             };
-            executed += 1;
             let flow = self.execute(&conn, stage, &job)?;
-            if let Flow::Abort(err) = flow {
-                return Ok((executed, Flow::Abort(err)));
-            }
+            return Ok((1, flow));
         }
-        Ok((executed, Flow::Continue))
+        Ok((0, Flow::Continue))
+    }
+
+    /// Advances the loop by one claim → execute → record step (§6). Public for
+    /// embedding and §14 integration tests; [`run`] loops it until `Ctrl-C`.
+    ///
+    /// # Errors
+    /// [`crate::BootError::Fatal`] if a stage failed fatally (the caller drains
+    /// and reconciles at next boot); [`crate::BootError::Worker`] on store
+    /// failure.
+    pub fn tick_once(&self) -> Result<usize, crate::BootError> {
+        match self.tick().map_err(crate::BootError::Control)? {
+            (_, Flow::Abort(err)) => Err(crate::BootError::Fatal(err)),
+            (executed, Flow::Continue) => Ok(executed),
+        }
     }
 
     /// Executes one claimed job and records the outcome (§6, §10). Panics are
@@ -202,7 +272,14 @@ impl Worker {
         job: &ClaimedJob,
     ) -> Result<Flow, DbError> {
         let now = control::now();
-        let outcome = catch_unwind(AssertUnwindSafe(|| dispatch(stage, &self.config, job)));
+        let ctx = StageCtx {
+            config: &self.config,
+            conn,
+            handle: &self.handle,
+            fetcher: self.fetcher.as_ref(),
+            extractor: self.extractor.as_ref(),
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| dispatch(stage, &ctx, job)));
         match outcome {
             Ok(Ok(outcome)) => {
                 // §6 stage chaining: milestone + successor job in one transaction,
@@ -314,14 +391,18 @@ impl Worker {
 }
 
 /// Dispatches one claimed job to its stage. Stage bodies take their dependencies
-/// as traits (§1.3) — until a stage's build step lands, it rejects jobs honestly
-/// as `Permanent` rather than pretending success.
-fn dispatch(stage: Stage, config: &Config, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
+/// through [`StageCtx`] (§1.3) — the ports are trait objects, so fakes substitute
+/// cleanly in tests (§14).
+fn dispatch(
+    stage: Stage,
+    ctx: &StageCtx<'_>,
+    job: &ClaimedJob,
+) -> Result<StageOutcome, StageError> {
     match stage {
-        Stage::Scrape => scrape::run(config, job),
-        Stage::Clean => clean::run(config, job),
-        Stage::Vectorize => chunk::run(config, job),
-        Stage::Extract => extract::run(config, job),
+        Stage::Scrape => scrape::run(ctx, job),
+        Stage::Clean => clean::run(ctx, job),
+        Stage::Vectorize => chunk::run(ctx.config, job),
+        Stage::Extract => extract::run(ctx.config, job),
     }
 }
 
@@ -356,30 +437,20 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
     worker.reconcile()?;
 
     loop {
-        let outcome = tokio::task::spawn_blocking({
+        let executed = tokio::task::spawn_blocking({
             let worker = Arc::clone(&worker);
-            move || worker.tick()
+            move || worker.tick_once()
         })
-        .await;
-        let (executed, flow) =
-            outcome.map_err(|join| crate::BootError::Worker(join.to_string()))??;
+        .await
+        .map_err(|join| crate::BootError::Worker(join.to_string()))??;
 
-        match flow {
-            Flow::Continue => {
-                if executed == 0 {
-                    tokio::select! {
-                        () = tokio::time::sleep(config.poll_interval()) => {}
-                        _ = tokio::signal::ctrl_c() => break,
-                    }
-                }
-                // Jobs executed: loop immediately to drain the queue.
-            }
-            Flow::Abort(err) => {
-                // §6: drain (spawn_blocking joins above), then exit non-zero; the
-                // boot sweep finishes recovery.
-                return Err(crate::BootError::Fatal(err));
+        if executed == 0 {
+            tokio::select! {
+                () = tokio::time::sleep(config.poll_interval()) => {}
+                _ = tokio::signal::ctrl_c() => break,
             }
         }
+        // Jobs executed: loop immediately to drain the queue.
     }
     Ok(())
 }

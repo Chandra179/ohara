@@ -28,6 +28,14 @@ mod defaults {
     pub const LLM_BASE_URL: &str = "http://localhost:11434";
     /// Pinned extraction model (§11.2).
     pub const LLM_EXTRACTION_MODEL: &str = "phi4-mini:latest";
+    /// Fetch deadline per request (§8 Stage 1).
+    pub const FETCH_TIMEOUT_SECS: u64 = 30;
+    /// Honest User-Agent (§8): identifies the crawler and its owner.
+    pub const USER_AGENT: &str = concat!(
+        "ohara/",
+        env!("CARGO_PKG_VERSION"),
+        " (https://github.com/Chandra179/ohara)"
+    );
 }
 
 /// Boot failures from [`Config::load`] — fail fast at boot, never mid-stage (§10).
@@ -63,6 +71,7 @@ pub struct Config {
     rate_limit: Duration,
     target_languages: Vec<String>,
     pipeline: PipelineConfig,
+    fetcher: FetcherConfig,
     embedder: EmbedderConfig,
     knowledge: KnowledgeConfig,
     llm: LlmConfig,
@@ -90,6 +99,21 @@ pub struct KnowledgeConfig {
     write_model: String,
 }
 
+/// Fetch-ladder knobs (§8 Stage 1, §12). The SSRF guard itself is not a knob:
+/// only globally-routable targets are fetchable unless `allow_private_hosts` is
+/// set explicitly.
+#[derive(Debug, Clone)]
+pub struct FetcherConfig {
+    /// Honor `robots.txt` (§8; cached per host).
+    robots: bool,
+    /// Per-request deadline.
+    timeout: Duration,
+    /// Honest User-Agent header (§8).
+    user_agent: String,
+    /// §12 override for tests and intranets; defaults to refused.
+    allow_private_hosts: bool,
+}
+
 /// LLM endpoint and pinned models (§2, §11.2, §12).
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
@@ -112,9 +136,33 @@ struct RawConfig {
     default_rate_limit_ms: Option<u64>,
     target_languages: Option<Vec<String>>,
     pipeline: Option<RawPipeline>,
+    fetcher: Option<RawFetcher>,
     embedder: Option<RawEmbedder>,
     knowledge: Option<RawKnowledge>,
     llm: Option<RawLlm>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFetcher {
+    robots: Option<bool>,
+    timeout_secs: Option<u64>,
+    user_agent: Option<String>,
+    allow_private_hosts: Option<bool>,
+}
+
+fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
+    FetcherConfig {
+        robots: raw.and_then(|f| f.robots).unwrap_or(true),
+        timeout: Duration::from_secs(
+            raw.and_then(|f| f.timeout_secs)
+                .unwrap_or(defaults::FETCH_TIMEOUT_SECS),
+        ),
+        user_agent: raw
+            .and_then(|f| f.user_agent.clone())
+            .unwrap_or_else(|| defaults::USER_AGENT.to_string()),
+        allow_private_hosts: raw.and_then(|f| f.allow_private_hosts).unwrap_or(false),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -204,6 +252,8 @@ impl Config {
                 .unwrap_or(true),
         };
 
+        let fetcher = build_fetcher(raw.fetcher.as_ref());
+
         let embedder = raw.embedder.as_ref();
         let embedder = EmbedderConfig {
             model_id: embedder
@@ -260,6 +310,7 @@ impl Config {
             rate_limit,
             target_languages,
             pipeline,
+            fetcher,
             embedder,
             knowledge,
             llm,
@@ -306,6 +357,14 @@ impl Config {
         checked(
             !self.llm.extraction_model.is_empty(),
             "llm.extraction_model must be non-empty",
+        )?;
+        checked(
+            !self.fetcher.timeout.is_zero(),
+            "fetcher.timeout_secs must be > 0",
+        )?;
+        checked(
+            !self.fetcher.user_agent.is_empty(),
+            "fetcher.user_agent must be non-empty (§8: honest User-Agent)",
         )?;
         checked(
             matches!(self.llm.base_url.scheme(), "http" | "https"),
@@ -372,6 +431,12 @@ impl Config {
         &self.pipeline
     }
 
+    /// Fetch-ladder knobs (§8 Stage 1, §12).
+    #[must_use]
+    pub fn fetcher(&self) -> &FetcherConfig {
+        &self.fetcher
+    }
+
     /// Pinned embedder identity (§4).
     #[must_use]
     pub fn embedder(&self) -> &EmbedderConfig {
@@ -397,6 +462,32 @@ impl PipelineConfig {
     #[must_use]
     pub fn graph_enabled(&self) -> bool {
         self.graph_enabled
+    }
+}
+
+impl FetcherConfig {
+    /// Whether `robots.txt` is honored (§8, default on).
+    #[must_use]
+    pub fn robots(&self) -> bool {
+        self.robots
+    }
+
+    /// Per-request fetch deadline.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Honest User-Agent header (§8).
+    #[must_use]
+    pub fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    /// Whether private/loopback targets are fetchable (§12 override; default no).
+    #[must_use]
+    pub fn allow_private_hosts(&self) -> bool {
+        self.allow_private_hosts
     }
 }
 
@@ -481,6 +572,29 @@ mod tests {
             config.pipeline().graph_enabled(),
             "graph on by default (§6)"
         );
+    }
+
+    #[test]
+    fn fetcher_defaults_are_honest() {
+        let config = Config::load(None).expect("defaults are valid");
+        assert!(config.fetcher().robots());
+        assert_eq!(config.fetcher().timeout(), Duration::from_secs(30));
+        assert!(config.fetcher().user_agent().starts_with("ohara/"));
+        assert!(
+            !config.fetcher().allow_private_hosts(),
+            "§12: SSRF guard on"
+        );
+    }
+
+    #[test]
+    fn fetcher_overrides_apply() {
+        let config = Config::load_from_str(
+            "[fetcher]\nrobots = false\ntimeout_secs = 5\nallow_private_hosts = true\n",
+        )
+        .expect("valid config");
+        assert!(!config.fetcher().robots());
+        assert_eq!(config.fetcher().timeout(), Duration::from_secs(5));
+        assert!(config.fetcher().allow_private_hosts());
     }
 
     #[test]

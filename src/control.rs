@@ -7,16 +7,19 @@ mod documents;
 mod jobs;
 mod models;
 mod reconcile;
+mod sites;
 
 pub use db::{DbError, connect};
 pub use documents::{
-    DeletionIntent, Document, EnqueueOutcome, NewDocument, due_for_recrawl, execute_deletion,
-    find_id_by_content_hash, find_id_by_url, get, insert_new, mark_quality_rejected,
-    pending_deletions, request_deletion,
+    CleanResult, DeletionIntent, Document, EnqueueOutcome, NewDocument, due_for_recrawl,
+    execute_deletion, find_id_by_content_hash, find_id_by_url, get, insert_new,
+    mark_quality_rejected, pending_deletions, request_deletion, update_clean_result,
+    update_fetch_result,
 };
 pub use jobs::{claim_next, complete, dead, enqueue, record_event, requeue, retry};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage};
 pub use reconcile::{ReconcileReport, reconcile};
+pub use sites::{LadderHint, SitePolicy, get as site_policy, set as set_site_policy};
 
 pub(crate) use db::{now, now_plus};
 

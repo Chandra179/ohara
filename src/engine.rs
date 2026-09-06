@@ -4,22 +4,38 @@
 
 mod http;
 mod obscura;
+mod robots;
+
+use std::time::Duration;
+
+pub use http::{HttpFetcher, HttpFetcherParams};
 
 use async_trait::async_trait;
 
 use crate::Class;
 
-/// A validated, absolute URL — parsed once at the boundary, so invalid states are
-/// unrepresentable downstream (§10 newtype discipline). Full normalization (§8
-/// Stage 1: lowercase scheme/host, punycode IDN, default-port and fragment
-/// dropping, sorted query parameters, tracking-param stripping) lands with the
-/// Stage 1 build step; this type is its home.
+/// Query parameters stripped by [`NormalizedUrl::parse`] — the §8 Stage 1
+/// tracking-parameter list. `utm_*` is handled as a prefix rule; these are the
+/// verbatim names (sorted — [`NormalizedUrl::normalize`] binary-searches them).
+const TRACKING_PARAMS: &[&str] = &[
+    "_hsenc", "_hsmi", "dclid", "fbclid", "gclid", "igshid", "irclid", "mc_cid", "mc_eid",
+    "msclkid", "ref_src", "ref_url", "twclid",
+];
+
+/// A validated, normalized URL — parsed once at the boundary, so invalid states
+/// are unrepresentable downstream (§10 newtype discipline).
+///
+/// Normalization (§8 Stage 1, load-bearing for the `source_url_normalized` dedup
+/// key): lowercase scheme/host and punycode IDN (the [`url`] parser does both),
+/// default ports and fragments dropped, query parameters sorted, tracking
+/// parameters (`utm_*` and [`TRACKING_PARAMS`]) stripped. Idempotent — the
+/// normalized form parses to itself.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NormalizedUrl(url::Url);
 
 impl NormalizedUrl {
-    /// Parses and validates `raw`, absolutizing against `final_url` when the raw
-    /// form is relative (§8 Stage 1).
+    /// Parses `raw`, absolutizing against `final_url` when `raw` is relative
+    /// (§8 Stage 1), then normalizes.
     ///
     /// # Errors
     /// [`UrlError::Invalid`] for unparseable input; [`UrlError::Scheme`] for
@@ -30,16 +46,64 @@ impl NormalizedUrl {
             .base_url(Some(&base))
             .parse(raw)
             .map_err(UrlError::Invalid)?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(UrlError::Scheme(parsed.scheme().to_string()));
-        }
-        Ok(Self(parsed))
+        Self::normalize(parsed)
     }
 
-    /// The absolute URL as a string.
+    /// Parses an absolute URL and normalizes it (the `ohara enqueue <url>` path:
+    /// the dedup key exists before any fetch).
+    ///
+    /// # Errors
+    /// [`UrlError::Invalid`] for unparseable input; [`UrlError::Scheme`] for
+    /// anything but `http`/`https` (§12).
+    pub fn parse(raw: &str) -> Result<Self, UrlError> {
+        let parsed = url::Url::parse(raw).map_err(UrlError::Invalid)?;
+        Self::normalize(parsed)
+    }
+
+    /// Applies the §8 Stage 1 normalization to an already-absolute URL.
+    fn normalize(mut url: url::Url) -> Result<Self, UrlError> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(UrlError::Scheme(url.scheme().to_string()));
+        }
+        url.set_fragment(None);
+        let mut pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.retain(|(k, _)| !is_tracking_param(k));
+        pairs.sort();
+        // Rebuild the query from the sorted, filtered pairs; an empty set drops
+        // the `?` entirely.
+        let rebuilt = pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", urlencode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        url.set_query(if rebuilt.is_empty() {
+            None
+        } else {
+            Some(&rebuilt)
+        });
+        Ok(Self(url))
+    }
+
+    /// The normalized URL as a string — the `source_url_normalized` form.
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// The host, for per-host policy lookups (§5 `sites`) — always lowercase
+    /// (punycode for IDN).
+    #[must_use]
+    pub fn host_str(&self) -> &str {
+        self.0.host_str().unwrap_or_default()
+    }
+
+    /// The underlying URL (path, port, query…) for request construction inside
+    /// the engine plane.
+    pub(crate) fn as_url(&self) -> &url::Url {
+        &self.0
     }
 }
 
@@ -55,6 +119,31 @@ impl std::fmt::Display for NormalizedUrl {
     }
 }
 
+/// A tracking parameter per the §8 Stage 1 list: verbatim [`TRACKING_PARAMS`]
+/// entries, or anything under the `utm_` prefix.
+fn is_tracking_param(key: &str) -> bool {
+    key.starts_with("utm_") || TRACKING_PARAMS.binary_search(&key).is_ok()
+}
+
+/// Percent-encodes a rebuilt query value (the [`url`] crate keeps pairs decoded;
+/// `form_urlencoded` re-encodes with the standard `+`-for-space query rules).
+fn urlencode(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' => {
+                out.push(*byte as char);
+            }
+            b' ' => out.push('+'),
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// URL validation failures.
 #[derive(Debug, thiserror::Error)]
 pub enum UrlError {
@@ -64,6 +153,28 @@ pub enum UrlError {
     /// The scheme is not `http`/`https` (§12).
     #[error("unsupported scheme {0:?}: only http/https are fetched")]
     Scheme(String),
+}
+
+/// Per-fetch policy handed to a [`Fetcher`] by the stage (§8 Stage 1): the stage
+/// reads the control plane (`sites` overrides, config toggles) — the fetcher
+/// enforces. `rate_limit` is a *floor addition*: the impl never fetches faster
+/// than its own default or this value, whichever is larger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchPolicy {
+    /// Minimum spacing between requests to one host (§8 politeness); `ZERO` keeps
+    /// the impl's own default.
+    pub rate_limit: Duration,
+    /// Honor `robots.txt` for this fetch (§8: config toggle, default on).
+    pub robots: bool,
+}
+
+impl Default for FetchPolicy {
+    fn default() -> Self {
+        Self {
+            rate_limit: Duration::ZERO,
+            robots: true,
+        }
+    }
 }
 
 /// What was fetched, labeled (§8 Stage 1): the contract is "return what you
@@ -81,7 +192,12 @@ pub struct FetchedDoc {
     pub status: u16,
     /// Content-Type as reported by the server, if any.
     pub content_type: Option<String>,
-    /// Fetch completion timestamp, §5 format.
+    /// Conditional re-crawl validators (§7.5), as served.
+    pub etag: Option<String>,
+    /// Conditional re-crawl validators (§7.5), as served.
+    pub last_modified: Option<String>,
+    /// Fetch completion timestamp (informational, RFC 3339; the §5 rule governs
+    /// store columns, and the stage stamps those itself).
     pub fetched_at: String,
 }
 
@@ -119,6 +235,8 @@ pub enum FetchError {
         url: String,
     },
     /// The peer or subprocess violated the protocol (external behavior is data, §10).
+    /// Also covers §12 SSRF refusals and unsupported content types — retried within
+    /// the attempt budget, then dead.
     #[error("protocol violation: {0}")]
     Protocol(String),
 }
@@ -138,17 +256,119 @@ impl FetchError {
     }
 }
 
+impl From<UrlError> for FetchError {
+    /// Inside a fetch flow, a malformed or non-HTTP URL (e.g. a redirect target)
+    /// is a protocol violation, not a panic (§10: external behavior is data).
+    fn from(error: UrlError) -> Self {
+        FetchError::Protocol(error.to_string())
+    }
+}
+
 /// One leg of the fetch ladder (§9). Contracts: rendered-or-labeled HTML; honest
 /// [`capabilities`](Fetcher::capabilities); native errors collapse into
-/// [`FetchError`] (contract-tested per impl).
+/// [`FetchError`] (contract-tested per impl); per-hop redirect re-validation and
+/// the [`FetchPolicy`] floors are honored by every impl (§8, §12).
 #[async_trait]
 pub trait Fetcher: Send + Sync {
     /// Capability declaration — queried at composition time by the ladder.
     fn capabilities(&self) -> FetchCapabilities;
 
-    /// Fetches `url`, following redirects (each hop re-validated, §12).
+    /// Fetches `url` under `policy` (§8 politeness floor, robots toggle),
+    /// following redirects — each hop re-validated per §12.
     ///
     /// # Errors
     /// [`FetchError`] per the §10 taxonomy and retry classes.
-    async fn fetch(&self, url: &NormalizedUrl) -> Result<FetchedDoc, FetchError>;
+    async fn fetch_with_policy(
+        &self,
+        url: &NormalizedUrl,
+        policy: &FetchPolicy,
+    ) -> Result<FetchedDoc, FetchError>;
+
+    /// Fetches `url` under the default policy ([`FetchPolicy::default`]).
+    ///
+    /// # Errors
+    /// [`FetchError`] per the §10 taxonomy and retry classes.
+    async fn fetch(&self, url: &NormalizedUrl) -> Result<FetchedDoc, FetchError> {
+        self.fetch_with_policy(url, &FetchPolicy::default()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
+
+    use super::*;
+
+    #[test]
+    fn parse_lowercases_and_drops_fragments_and_default_ports() {
+        let url = NormalizedUrl::parse("HTTP://EXAMPLE.com:80/Path/?x=1#frag").unwrap();
+        assert_eq!(url.as_str(), "http://example.com/Path/?x=1");
+    }
+
+    #[test]
+    fn parse_strips_tracking_params_and_sorts_the_rest() {
+        let url = NormalizedUrl::parse("https://example.com/p?utm_source=feed&z=2&a=1&fbclid=abc")
+            .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/p?a=1&z=2");
+    }
+
+    #[test]
+    fn parse_drops_the_query_entirely_when_only_tracking_params_remain() {
+        let url = NormalizedUrl::parse("https://example.com/p?utm_content=x").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/p");
+    }
+
+    #[test]
+    fn parse_punycodes_internationalized_hosts() {
+        let url = NormalizedUrl::parse("https://Bücher.example/lesenswert").unwrap();
+        assert_eq!(url.as_str(), "https://xn--bcher-kva.example/lesenswert");
+    }
+
+    #[test]
+    fn new_absolutizes_relative_forms_against_the_final_url() {
+        let url = NormalizedUrl::new("/next/page?a=1", "https://example.com/dir/post").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/next/page?a=1");
+    }
+
+    #[test]
+    fn normalization_is_idempotent() {
+        let once = NormalizedUrl::parse("https://example.com/p?b=2&a=1&utm_medium=rss").unwrap();
+        let twice = NormalizedUrl::parse(once.as_str()).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn non_http_schemes_are_rejected() {
+        let err = NormalizedUrl::parse("ftp://example.com/file").unwrap_err();
+        assert!(matches!(err, UrlError::Scheme(s) if s == "ftp"));
+        let err = NormalizedUrl::parse("javascript:alert(1)").unwrap_err();
+        assert!(matches!(err, UrlError::Scheme(_)));
+    }
+
+    #[test]
+    fn unparseable_input_is_rejected() {
+        assert!(matches!(
+            NormalizedUrl::parse("not a url at all").unwrap_err(),
+            UrlError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn host_str_is_lowercase_punycode() {
+        let url = NormalizedUrl::parse("https://Ünïcode.example/path").unwrap();
+        let host = url.host_str();
+        assert!(
+            host.starts_with("xn--") && host == host.to_lowercase(),
+            "IDN host must serialize as lowercase punycode, got {host}"
+        );
+    }
+
+    #[test]
+    fn query_values_survive_reencoding() {
+        // `+` is form-encoding for a space; the rebuilt query re-encodes it.
+        let url = NormalizedUrl::parse("https://example.com/q?q=rust+sqlite&lang=en").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/q?lang=en&q=rust+sqlite");
+        let url = NormalizedUrl::parse("https://example.com/q?q=a%2Bb").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/q?q=a%2Bb");
+    }
 }

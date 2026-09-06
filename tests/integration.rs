@@ -5,5 +5,7 @@
 
 #[path = "integration/boot.rs"]
 mod boot;
+#[path = "integration/pipeline.rs"]
+mod pipeline;
 #[path = "integration/store.rs"]
 mod store;

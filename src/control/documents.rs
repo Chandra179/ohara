@@ -350,6 +350,78 @@ pub fn execute_deletion(conn: &Connection, doc_id: &str) -> Result<bool, DbError
     Ok(deleted == 1)
 }
 
+/// The Stage 2 result columns (§5 `documents`), written by the clean stage body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanResult {
+    /// Where the cleaned Markdown lives — `data/clean/<doc_id>.md` (§3).
+    pub clean_file_path: String,
+    /// `sha256` of the cleaned Markdown — the content-level dedup key (§8 Stage 2).
+    pub clean_content_hash: String,
+    /// Page title, from the extractor.
+    pub title: Option<String>,
+    /// Byline, from the extractor.
+    pub author: Option<String>,
+    /// whatlang result (§8 Stage 2 gate).
+    pub language: Option<String>,
+    /// Clean-text word count.
+    pub word_count: i64,
+}
+
+/// Records the Stage 1 fetch result (§8): HTTP status and the §7.5 conditional
+/// re-crawl validators, stamped `fetched_at`.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure.
+pub fn update_fetch_result(
+    conn: &Connection,
+    doc_id: &str,
+    http_status: i64,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE documents
+            SET http_status = ?2, etag = ?3, last_modified = ?4,
+                fetched_at = ?5, last_processed_at = ?5
+          WHERE doc_id = ?1",
+        rusqlite::params![doc_id, http_status, etag, last_modified, now_stamp],
+    )?;
+    Ok(())
+}
+
+/// Records the Stage 2 result (§8): the clean file location, the content hash
+/// (the §5 `UNIQUE` dedup key), and the extraction metadata.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure (a duplicated `clean_content_hash`
+/// violates the §5 UNIQUE constraint — the stage checks [`find_id_by_content_hash`]
+/// first and routes duplicates to a `SkippedDuplicate` outcome).
+pub fn update_clean_result(
+    conn: &Connection,
+    doc_id: &str,
+    result: &CleanResult,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE documents
+            SET clean_file_path = ?2, clean_content_hash = ?3, title = ?4, author = ?5,
+                language = ?6, word_count = ?7, last_processed_at = ?8
+          WHERE doc_id = ?1",
+        rusqlite::params![
+            doc_id,
+            result.clean_file_path,
+            result.clean_content_hash,
+            result.title,
+            result.author,
+            result.language,
+            result.word_count,
+            now_stamp,
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
