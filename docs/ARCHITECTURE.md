@@ -57,7 +57,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher, HNSW extension) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port; pinned version; Kùzu-compatible API makes fallback realistic. **Build gates before step 4 of §15:** verify (a) the transaction model — are reads concurrent with a write transaction? — and (b) edge-rewire/fold support (§7.8). Contingency for (a): serialize knowledge-plane access through one actor task with small write transactions |
 | Embedder | BAAI `bge-small-en-v1.5` via ONNX (384-dim, cosine, fp32 default) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1 |
 | Reranker | FlashRank tiny models (default), bge-reranker-base ONNX **int8** (optional) | Behind `Reranker` port; CPU-optimized models only — never fp32 (§11.1); identity impl as baseline |
-| LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned on the reference profile: `phi4-mini:latest`, **CPU-only** (§11.2); cloud Haiku class **opt-in** | Behind `Llm` port; cost counters mandatory; endpoint health-checked at boot (config fail-fast) — mid-run unavailability maps to `LlmError::Unavailable` (Transient, backoff); §12 governs egress |
+| LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned on the reference profile: `phi4-mini:latest` on GPU (§11.2); cloud Haiku class **opt-in** | Behind `Llm` port; cost counters mandatory; endpoint health-checked at boot (config fail-fast) — mid-run unavailability maps to `LlmError::Unavailable` (Transient, backoff); §12 governs egress |
 
 **Rule:** any dependency whose API is not its own standard (Obscura, LadybugDB, embedder runtime) must be reachable only through its port facade. No other module may name the vendor's types.
 
@@ -537,7 +537,7 @@ The performance story is **LLM-dominated**; everything else is rounding error. I
 | Scrape + clean | 1k docs | minutes (network-bound) | — |
 | Embed | 15k chunks | ~2–4 min CPU | $0 (local) |
 | Summaries | 1k calls | — | ~$0.5–1 |
-| **Triplet extraction** | **15k calls** (~700 in / 150 out tok) | Ollama `phi4-mini` on CPU: free but the throughput bottleneck — ≈ 1.5–2 days single-stream, ≈ 1 day with parallel requests (§11.2) | **~$5–8** |
+| **Triplet extraction** | **15k calls** (~700 in / 150 out tok) | Ollama `phi4-mini`: **GPU ≈ 4–7 h**; all-CPU fallback ≈ 1 day with parallelism (§11.2) | **~$5–8** |
 | Entity resolution | in-process | ms-scale | — |
 | Retrieval (per query) | 3 paths + rerank | ~50–300 ms | synthesis only |
 
@@ -556,13 +556,13 @@ The performance story is **LLM-dominated**; everything else is rounding error. I
 
 A concrete instance of the cost model (the development machine) — the knobs move with hardware, the shape doesn't:
 
-- **Device:** i5-13420H (8C/12T, AVX2 + AVX_VNNI, no AVX-512/AMX), 15 GB RAM, RTX 4050 Mobile 6 GB VRAM (present but **deliberately unused** — below), ~565 GB free disk, Ollama local.
-- **LLM decision — CPU-only, deliberate.** The GPU is not part of the profile. Rationale: it removes the kernel/DKMS maintenance coupling (proprietary driver modules lag kernel updates, as observed in practice) and keeps ohara's dependency surface free of driver requirements. CPU is sufficient for personal-scale extraction run as an overnight batch; when wall-clock matters, the cloud opt-in (§12) is the escape hatch — not the GPU.
-- **Pinned on this profile:** embedder `bge-small-en-v1.5` fp32 in-process (~130 MB; 15k chunks ≈ 2–4 min on 12 threads); reranker FlashRank tiny default / bge-reranker-base **int8** (~280 MB, VNNI-accelerated); extraction LLM **`phi4-mini:latest`** via Ollama on CPU (~3 GB RAM, free) — 15k calls ≈ **1.5–2 days** single-stream; `OLLAMA_NUM_PARALLEL = 2–4` within the 12 threads brings wall clock to ≈ **1 day**. Quality fallback `llama3.1:8b-instruct-q4_K_M` (~5.5 GB RAM) ≈ 2.5–3 days on CPU — reserve it for quality-critical runs, not the default. Schedule extraction batches overnight; cloud Haiku (~$5–8) stays the same-day option (§12).
+- **Device:** i5-13420H (8C/12T, AVX2 + AVX_VNNI, no AVX-512/AMX), 15 GB RAM, RTX 4050 Mobile 6 GB VRAM (proprietary 595 driver, Ubuntu prebuilt signed kernel modules — no DKMS), ~565 GB free disk, Ollama local.
+- **Accelerator split — LLM on GPU, everything else on CPU.** The GPU belongs to the LLM (Ollama) and to nothing else: ohara itself contains no GPU code — knowledge plane, embedder, and reranker stay CPU/int8, because a CUDA EP adds hundreds of MB of dependency weight to an embedded tool for wins the cost model doesn't need. The all-CPU fallback profile remains valid for driver-less machines: extraction ≈ 1 day per 15k chunks with parallelism.
+- **Pinned on this profile:** embedder `bge-small-en-v1.5` fp32 in-process (~130 MB; 15k chunks ≈ 2–4 min on 12 threads); reranker FlashRank tiny default / bge-reranker-base **int8** (~280 MB, VNNI-accelerated); extraction LLM **`phi4-mini:latest`** via Ollama on GPU — fits 6 GB VRAM with headroom, tolerates `OLLAMA_NUM_PARALLEL = 2–4`, 15k calls ≈ **4–7 h**. Quality fallback `llama3.1:8b-instruct-q4_K_M` (~4.9 GB VRAM, ~4k context, parallel ≤ 2) ≈ 8–12 h. Cloud Haiku (~$5–8) stays the same-day option when no GPU is available (§12).
 - **Knowledge-plane RAM envelope:** 10⁴ chunks ≈ 15–30 MB; 10⁵ ≈ 150–300 MB; 10⁶ ≈ 1.5–2.5 GB. On 15 GB total, the practical ceiling is ~10⁶ chunks with Ollama loaded — well past the realistic personal-corpus range.
 - **Disk:** worst case at 10⁵ docs (raw + clean + both stores + models) ≈ 20–30 GB.
-- **Accelerator policy:** CPU everywhere — embedder, reranker, and LLM. No CUDA EP, no GPU scheduling: one uniform execution story, zero driver coupling. Revisit only with profiling evidence; the first candidate would be Ollama on GPU (~10× extraction speedup), which the profile deliberately forgoes.
-- **Coexistence steady state:** worker + stores at 10⁵ chunks ⇒ ohara's own footprint ≈ 0.5–1 GB RAM; Ollama adds ~3 GB while `phi4-mini` is loaded. Extraction batches saturate CPU threads by design — run them overnight; retrieval between batches stays responsive (it touches the LLM only for synthesis).
+- **Driver hygiene (learned the hard way):** prefer Ubuntu's prebuilt signed module packages (`linux-modules-nvidia-*`) over DKMS on stock kernels, keep `linux-headers-$(uname -r)` installed with the HWE meta aligned, and know that the one observed failure mode was a kernel update outrunning the NVIDIA module package. The proprietary stack is pinned away and reinstalled deliberately — never left half-present.
+- **Coexistence steady state:** Ollama in VRAM (~3.3 GB for `phi4-mini`) + worker + stores at 10⁵ chunks ⇒ ohara's own footprint ≈ 0.5–1 GB RAM. Extraction batches are GPU-bound — CPU stays free for interactive use; retrieval between batches touches the LLM only for synthesis.
 
 ---
 
@@ -617,6 +617,7 @@ Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage
 - Absolute `crate::` paths (the book's stated preference); `super::` only for parent-sibling access.
 - `src/bin/*` for extra binaries (`ohara backup`, `ohara er merge`, the re-embed tool); `[features]` gate heavy deps (`obscura`, `onnx-embedder`).
 - **Workspace graduation (ch14):** each facade file is the future `lib.rs` of `crates/{control,engine,knowledge,pipeline,…}`; the day-one visibility discipline makes the split mechanical.
+- Code style, API design, and lint policy live in [CODE_GUIDE.md](CODE_GUIDE.md) — the Rust API Guidelines and Rust Style Guide applied to ohara.
 
 ## Appendix B — Change log
 
@@ -652,4 +653,5 @@ Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage
 15. **Doc fixes:** port homes in the tree (`Extractor` → `pipeline/clean.rs`, `QueryNormalizer` → `pipeline/retrieve.rs`), `config.rs` naming, chunk writes via `ON CONFLICT DO UPDATE` (never `OR REPLACE`).
 16. **Quantization policy (§11.1):** embedder fp32 default (int8 gated by golden-set recall), reranker int8 default (never fp32); quantization variant is part of `model_id` and gets its own collection.
 17. **Reference hardware envelope (§11.2):** pinned deployment profile for the dev machine — `phi4-mini` extraction, CPU/int8 embedder + reranker, knowledge-plane RAM envelope (~10⁶-chunk ceiling on 15 GB).
-18. **CPU-only LLM decision (§11.2):** the reference profile drops the GPU entirely — no CUDA EP, no DKMS/driver coupling; extraction runs Ollama `phi4-mini` on CPU as an overnight batch (`OLLAMA_NUM_PARALLEL = 2–4` ⇒ ≈ 1 day per 15k chunks); the cloud opt-in remains the wall-clock escape hatch.
+18. **LLM accelerator, settled after a flip-flop:** the profile briefly went CPU-only to avoid driver coupling; reinstated on GPU once the driver was stable. Both configurations are documented in §11.2.
+19. **GPU profile (§11.2):** RTX 4050 6 GB via Ubuntu's prebuilt signed module packages (no DKMS); LLM on GPU (`phi4-mini` ≈ 4–7 h per 15k calls), embedder + reranker stay CPU/int8; driver-hygiene notes recorded (headers alignment, deliberate install); all-CPU documented as the fallback profile.

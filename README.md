@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite as the control plane, LadybugDB (vectors + graph) as the knowledge plane, and an external fetcher engine as the only moving part.
 
-> **Status:** design phase — no code yet. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** build order §15 in progress — **Phase 1 (crate scaffold) landed**: module tree, config, migrations (full §5 schema incl. FTS5), and the §6 worker loop run; all stages are honest stubs. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -35,7 +35,7 @@
 | Knowledge store | [LadybugDB](https://github.com/LadybugDB/ladybug) | Embedded property graph (openCypher) + native HNSW vector index — behind the `KnowledgeStore` port |
 | Embedder | BAAI `bge-small-en-v1.5` via ONNX (pinned, fp32) | 384-dim local embeddings — behind the `Embedder` port |
 | Reranker | FlashRank (default), ONNX bge-reranker **int8** (optional) | Local cross-encoder reranking — behind the `Reranker` port |
-| LLM | [Ollama](https://ollama.com) (local, CPU; pinned: `phi4-mini`) — cloud Haiku opt-in | Extraction + synthesis — behind the `Llm` port; nothing leaves the machine by default |
+| LLM | [Ollama](https://ollama.com) (local, GPU; pinned: `phi4-mini`) — cloud Haiku opt-in | Extraction + synthesis — behind the `Llm` port; nothing leaves the machine by default |
 
 Every third-party engine sits behind a small trait so it can be swapped without touching pipeline logic — see [Ports & substitution](docs/ARCHITECTURE.md#9-ports--substitution-lsp) in the architecture doc.
 
@@ -46,10 +46,12 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   └── ARCHITECTURE.md        # system design (v2.1) — the source of truth
+│   ├── ARCHITECTURE.md        # system design (v2.1) — the source of truth
+│   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
 ├── tests/
+│   ├── integration.rs         # suite mount: each tests/integration/*.rs is one suite
 │   ├── ports/                 # contract tests — same suite run against every impl of a port
 │   └── integration/           # end-to-end tests via the public library API only
 └── src/
