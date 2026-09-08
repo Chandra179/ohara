@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite as the control plane, LadybugDB (vectors + graph) as the knowledge plane, and an external fetcher engine as the only moving part.
 
-> **Status:** build order §15 in progress — **Phases 1–4 landed**: crate scaffold; the **control store** (documents, §6 lease queue with transactional stage chaining, boot reconciliation); fetch ladder leg 1 (plain HTTP with §12 SSRF guard, robots.txt, politeness) and working **Stages 1–2** (scrape → readability clean → dedup → quality + language gate); and **§15 step 4** — the `LadybugDB` knowledge store behind its port (both §2 build gates verified empirically), the tokenizer-aligned **chunker**, the pinned `bge-small-en-v1.5` **local embedder**, vector collections, and the trigger-synced `chunks_fts` index — **Stage 3 works end to end** (`NEW` → `VECTORIZED`). Stage 4 (graph extraction) remains an honest stub. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** build order §15 in progress — **Phases 1–6 landed**: crate scaffold; the **control store** (documents, §6 lease queue with transactional stage chaining, boot reconciliation); fetch ladder leg 1 (plain HTTP with §12 SSRF guard, robots.txt, politeness); **Stages 1–2** (scrape → readability clean → dedup → quality + language gate); the `LadybugDB` knowledge store behind its port (§2 build gates verified empirically), the tokenizer-aligned **chunker**, the pinned `bge-small-en-v1.5` **local embedder**, vector collections, the trigger-synced `chunks_fts` index — Stage 3 end to end (`NEW` → `VECTORIZED`); the **retrieval baseline** (BM25 + vector + RRF + rerank) with the golden-set eval harness; the **local Ollama `Llm` provider** (JSON-schema structured outputs, usage counters, boot health check); **Stage 4 graph extraction** (`VECTORIZED` → `INDEXED`): per-chunk LLM triplets validated against the §8 type-compatibility matrix, staged as the §7.7 cost cache, conservative type-consistent entity resolution (typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties), `:MENTIONS` links and capped fact-edge aggregation in Ladybug; and the **Stage 5 graph retrieval path** — query entities (typed aliases over phrase windows + `EntityNames` embedding KNN) feeding `:MENTIONS`-linked chunks into three-path RRF fusion, capability-gated on the knowledge store. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -80,6 +80,7 @@ ohara/
     ├── control/
     │   ├── db.rs              #   connections, WAL pragmas, migrations, the one now()
     │   ├── documents.rs       #   document registry, enqueue + dedup, deletion intents
+    │   ├── entities.rs        #   Stage 4 registry: triplets cost cache, entities/aliases, er_review
     │   ├── jobs.rs            #   job queue: lease claim, stage chaining, requeue
     │   ├── reconcile.rs       #   §7.3 sweep: interrupted deletions, audit retention
     │   └── models.rs          #   row types + the §6 state machine's shape knowledge
@@ -104,9 +105,11 @@ ohara/
     │   ├── embed.rs           # Stage 3b: pub trait Embedder (incl. tokenizer counting) +
     │   │                      #   LocalEmbedder (fastembed bge-small-en-v1.5) + the stage body
     │   │                      #   with the §7 replay/repair and delete-first protocol
-    │   ├── extract.rs         # Stage 4: triplets, entity resolution, cross-linking
+    │   ├── extract.rs         # Stage 4: LLM triplets → §8 matrix validation → entity
+    │   │                      #   resolution → :MENTIONS links + fact-edge aggregation
     │   └── retrieve.rs        # Stage 5: three-path retrieval + rerank + QueryNormalizer port
-    ├── llm.rs                 # pub trait Llm — cloud/local clients, retry, cost counters
+    ├── llm.rs                 # pub trait Llm + the local Ollama provider (structured
+                               #   outputs, usage counters, boot health check)
     └── text.rs                # pure text functions: langid, symspell, tokenizer, unicode
 ```
 
@@ -134,8 +137,8 @@ ohara/
 2. Control store: documents + jobs (lease claiming)
 3. Fetch ladder leg 1 (HTTP) + Stages 1–2 (clean, dedup, quality gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed with the `LadybugDB` build gates passing (exact KNN; HNSW stays a drop-in port swap)
-5. Retrieval baseline: BM25 (FTS5) + vector + rerank — *no graph yet* — measured on the golden set
-6. Stage 4: triplet extraction, entity resolution, graph path
+5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
+6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, measured at recall@20 = 1.000 on the real-model golden set)
 7. Obscura leg + full ladder
 8. Eval harness expansion + cost dashboards
 

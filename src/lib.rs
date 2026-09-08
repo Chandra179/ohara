@@ -85,6 +85,9 @@ pub enum BootError {
     /// The knowledge store could not be opened at boot (§3).
     #[error("knowledge store: {0}")]
     Knowledge(#[from] knowledge::KnowledgeError),
+    /// The LLM endpoint could not be built or health-checked at boot (§2).
+    #[error("llm: {0}")]
+    Llm(#[from] llm::LlmError),
     /// The worker loop task failed unexpectedly.
     #[error("worker loop failed: {0}")]
     Worker(String),

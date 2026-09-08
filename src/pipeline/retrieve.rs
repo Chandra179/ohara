@@ -1,19 +1,25 @@
-//! Stage 5 — Retrieval (§8), baseline form (§15 step 5: BM25 + vector + rerank,
-//! no graph path yet): query normalization → two-path candidate generation →
-//! Reciprocal Rank Fusion → rerank with degradation. Its two ports,
-//! [`QueryNormalizer`] and [`Reranker`] (§1.3), plus the baseline
-//! implementations.
+//! Stage 5 — Retrieval (§8), full three-path form: query normalization → query
+//! entities → BM25 + vector + graph candidate paths → Reciprocal Rank Fusion →
+//! rerank with degradation. Its two ports, [`QueryNormalizer`] and
+//! [`Reranker`] (§1.3), plus the baseline implementations.
 //!
-//! §8 Stage 5 items that land with later steps: the graph path and query
-//! entities (§15 step 6), symspell domain-dictionary correction and optional
-//! `HyDE` (ops/eval expansion), synthesis via the `Llm` port.
+//! §8 Stage 5 items that land with later steps: symspell domain-dictionary
+//! correction, optional `HyDE`, and synthesis via the `Llm` port (§15 step 8).
+//!
+//! The graph path (§8 Stage 5.2–5.3) runs whenever the knowledge store declares
+//! `graph_traversal` — query entities come from typed aliases plus
+//! `EntityNames` embedding KNN, and their `:MENTIONS`-linked chunks join the
+//! fusion pool as a third list. A store without the capability degrades to the
+//! two-path baseline: the query never fails on a missing path.
 
 use async_trait::async_trait;
 
 use crate::Class;
+use crate::config::RetrievalConfig;
 use crate::control::{self, DbError};
-use crate::knowledge::{KnowledgeError, KnowledgeStore, ModelId, VectorSpace};
+use crate::knowledge::{KnowledgeError, KnowledgeStore, ModelId, ScoredHit, VectorSpace};
 use crate::pipeline::Embedder;
+use crate::text::normalize_surface_form;
 
 /// Candidate-pool size per path and after fusion (§8 Stage 5: fusion produces
 /// the top-50, rerank returns the top-5).
@@ -280,10 +286,9 @@ impl Reranker for LocalReranker {
     }
 }
 
-/// The two-path fusion pool: each list contributes `1/(k + rank)` (§8).
-fn rrf_fuse(
-    lists: [Vec<(String, String)>; 2], // (chunk_id, text) per path, best first
-) -> Vec<ScoredChunk> {
+/// The fusion pool: each list contributes `1/(k + rank)` per candidate (§8) —
+/// any number of paths, best first.
+fn rrf_fuse(lists: Vec<Vec<(String, String)>>) -> Vec<ScoredChunk> {
     let mut scores: std::collections::HashMap<String, (f32, String)> =
         std::collections::HashMap::new();
     for list in lists {
@@ -310,7 +315,29 @@ fn rrf_fuse(
     fused
 }
 
-/// The retrieval engine (§8 Stage 5): two candidate paths over the stores,
+/// One query entity resolved from the query text (§8 Stage 5.2) — an entity id
+/// with the evidence that surfaced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryEntity {
+    /// The resolved entity id.
+    pub entity_id: String,
+    /// How the entity was found: `alias` (exact typed-alias hit) or `embedding`
+    /// (`EntityNames` KNN above the similarity floor).
+    pub source: QueryEntitySource,
+    /// The similarity score for embedding hits; 1.0 for exact alias hits.
+    pub score: f32,
+}
+
+/// How a [`QueryEntity`] was surfaced (§8 Stage 5.2) — metrics/audit metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryEntitySource {
+    /// Exact typed-alias hit on `entity_aliases`.
+    Alias,
+    /// `EntityNames` embedding KNN above the similarity floor.
+    Embedding,
+}
+
+/// The retrieval engine (§8 Stage 5): three candidate paths over the stores,
 /// fusion, rerank. Ports are injected (§9); the connection borrows the caller's
 /// control store. `query` is async — its only blocking work is one query
 /// embedding (ms-scale, unlike the worker's batch path, §9) and the `SQLite`
@@ -321,12 +348,13 @@ pub struct Retriever<'a> {
     embedder: &'a dyn Embedder,
     normalizer: &'a dyn QueryNormalizer,
     reranker: &'a dyn Reranker,
+    retrieval: RetrievalConfig,
 }
 
 impl<'a> Retriever<'a> {
-    /// Builds a retriever; must be called inside a tokio runtime (the vector
-    /// path drives the async [`KnowledgeStore`] port from this sync context
-    /// via the captured handle).
+    /// Builds a retriever over the config's `[retrieval]` knobs; must be called
+    /// inside a tokio runtime (the vector and graph paths drive the async
+    /// [`KnowledgeStore`] port from this sync context via the captured handle).
     #[must_use]
     pub fn new(
         conn: &'a rusqlite::Connection,
@@ -334,6 +362,7 @@ impl<'a> Retriever<'a> {
         embedder: &'a dyn Embedder,
         normalizer: &'a dyn QueryNormalizer,
         reranker: &'a dyn Reranker,
+        retrieval: RetrievalConfig,
     ) -> Self {
         Self {
             conn,
@@ -341,11 +370,12 @@ impl<'a> Retriever<'a> {
             embedder,
             normalizer,
             reranker,
+            retrieval,
         }
     }
 
-    /// Runs one query (§8 Stage 5): normalize → BM25 + vector paths → RRF
-    /// fusion → rerank with degradation → top `top_k`.
+    /// Runs one query (§8 Stage 5): normalize → query entities → BM25 + vector
+    /// + graph paths → RRF fusion → rerank with degradation → top `top_k`.
     ///
     /// # Errors
     /// [`RetrieveError`] — the rerank step degrades to fusion order instead
@@ -365,11 +395,16 @@ impl<'a> Retriever<'a> {
         // switch).
         let vector = self.vector_path(&normalized).await?;
 
+        // Path 3 — graph (§8 Stage 5.3): chunks that mention the query's
+        // entities. Capability-gated: a store without graph traversal keeps
+        // the two-path baseline rather than failing the query.
+        let mut paths = vec![bm25, vector];
+        if self.knowledge.capabilities().graph_traversal {
+            paths.push(self.graph_path(&normalized).await?);
+        }
+
         // Fusion (§8 Stage 5.4): RRF with k=60 → top-50 pool.
-        let pool: Vec<ScoredChunk> = rrf_fuse([bm25, vector])
-            .into_iter()
-            .take(RETRIEVAL_POOL)
-            .collect();
+        let pool: Vec<ScoredChunk> = rrf_fuse(paths).into_iter().take(RETRIEVAL_POOL).collect();
 
         // Rerank with degradation (§8 Stage 5.5): on RerankError the fusion
         // order is returned as-is — the query never fails on the reranker.
@@ -378,6 +413,122 @@ impl<'a> Retriever<'a> {
             Err(_degraded) => pool,
         };
         Ok(ranked.into_iter().take(top_k).collect())
+    }
+
+    /// Query entities (§8 Stage 5.2): each normalized query term is looked up
+    /// as a typed alias (a homograph contributes all its type-variants), then
+    /// the whole query is matched against the `EntityNames` collection above
+    /// the embedding floor. Exact alias hits rank ahead of embedding hits; the
+    /// combined list caps at `max_query_entities`.
+    ///
+    /// # Errors
+    /// [`RetrieveError`] on store or embedding failure.
+    pub async fn query_entities(
+        &self,
+        normalized: &str,
+    ) -> Result<Vec<QueryEntity>, RetrieveError> {
+        if normalized.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pass 1 — exact typed-alias hits over query phrases (§8: a homograph
+        // yields every entity; disambiguation moves downstream). Entity
+        // surface names are often multi-word ("wal checkpointing"), so the
+        // pass tries every phrase window, longest first — a longer window
+        // ranks ahead of its fragments' windows in the alias-first ordering,
+        // and `seen` keeps one row per entity regardless of how many phrases
+        // hit it. Terms are normalized the way stored aliases were (§8
+        // Stage 4.1).
+        let mut aliases: Vec<QueryEntity> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let terms: Vec<String> = normalized
+            .split_whitespace()
+            .map(normalize_surface_form)
+            .collect();
+        for window in (1..=terms.len()).rev() {
+            for start in 0..=terms.len().saturating_sub(window) {
+                let phrase = terms[start..start + window].join(" ");
+                for entity_id in control::lookup_alias_all_types(self.conn, &phrase)? {
+                    if seen.insert(entity_id.clone()) {
+                        aliases.push(QueryEntity {
+                            entity_id,
+                            source: QueryEntitySource::Alias,
+                            score: 1.0,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Pass 2 — `EntityNames` embedding KNN above the floor. The collection
+        // spans supertypes; query entities deliberately do not filter by type —
+        // the query names no type, so all variants ride along and rerank and
+        // graph context do the disambiguating.
+        let mut embedding: Vec<QueryEntity> = Vec::new();
+        let embedded = self.embedder.embed(&[normalized])?;
+        if let Some(q) = embedded.into_iter().next() {
+            let floor = self.retrieval.entity_embedding_threshold();
+            let hits = self
+                .knowledge
+                .knn(
+                    VectorSpace::EntityNames,
+                    &q,
+                    self.retrieval.max_query_entities() * 2,
+                    &crate::knowledge::ChunkFilter {},
+                )
+                .await?;
+            for ScoredHit { id, score } in hits {
+                if f64::from(score) >= floor && seen.insert(id.clone()) {
+                    embedding.push(QueryEntity {
+                        entity_id: id,
+                        source: QueryEntitySource::Embedding,
+                        score,
+                    });
+                }
+            }
+        }
+        embedding.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
+
+        let mut out = aliases;
+        out.extend(embedding);
+        out.truncate(self.retrieval.max_query_entities());
+        Ok(out)
+    }
+
+    /// Graph path (§8 Stage 5.3): chunks whose `:MENTIONS` edges connect to
+    /// the query's entities. Best-first order is mention-then-chunk-id — the
+    /// store returns an unordered set; RRF needs a deterministic sequence.
+    ///
+    /// # Errors
+    /// [`RetrieveError`] on store or embedding failure.
+    async fn graph_path(&self, normalized: &str) -> Result<Vec<(String, String)>, RetrieveError> {
+        let entities = self.query_entities(normalized).await?;
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = entities.iter().map(|e| e.entity_id.as_str()).collect();
+        let chunk_ids = self.knowledge.chunks_for_entities(&ids).await?;
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Deterministic order (RRF ranks by position): sort by chunk id, then
+        // hydrate. The store's set semantics make the ordering arbitrary, so
+        // any deterministic total order preserves the contract.
+        let mut sorted_ids = chunk_ids;
+        sorted_ids.sort();
+        sorted_ids.dedup();
+        let ids: Vec<&str> = sorted_ids.iter().map(String::as_str).collect();
+        let hydrated = control::chunks_by_ids(self.conn, &ids)?;
+        let by_id: std::collections::HashMap<String, String> =
+            hydrated.into_iter().map(|c| (c.chunk_id, c.text)).collect();
+        Ok(sorted_ids
+            .into_iter()
+            .filter_map(|id| by_id.get(&id).map(|text| (id.clone(), text.clone())))
+            .collect())
     }
 
     /// BM25 path (§8 Stage 5.3): `chunks_fts` `MATCH`, bm25 order, best first.
@@ -434,7 +585,12 @@ impl<'a> Retriever<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::float_cmp
+)] // exact-value assertions
 mod tests {
     use std::sync::Arc;
 
@@ -445,7 +601,9 @@ mod tests {
     use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
     use crate::text::sha256_hex;
 
-    use super::{IdentityReranker, Retriever, WhatlangNormalizer, fts_match_expression};
+    use super::{
+        IdentityReranker, QueryEntitySource, Retriever, WhatlangNormalizer, fts_match_expression,
+    };
     use crate::knowledge::KnowledgeStore;
     use crate::pipeline::{Embedder, QueryNormalizer};
 
@@ -511,6 +669,8 @@ mod tests {
         config: Arc<Config>,
         store: std::path::PathBuf,
         doc_ids: Vec<String>,
+        /// Per-doc chunk ids (`sha256(doc_id:seq)`, §3), seq order.
+        chunk_ids: Vec<Vec<String>>,
     }
 
     /// Seeds two documents with three chunks each; chunk texts carry distinct
@@ -528,6 +688,7 @@ mod tests {
         let store = dir.path().join("store.db");
         let conn = control::connect(&store).unwrap();
         let mut doc_ids = Vec::new();
+        let mut chunk_ids: Vec<Vec<String>> = Vec::new();
         for slug in ["wal", "hnsw"] {
             let doc_id = seed_doc(&conn, slug);
             doc_ids.push(doc_id.clone());
@@ -553,6 +714,7 @@ mod tests {
                     }
                 })
                 .collect();
+            chunk_ids.push(rows.iter().map(|r| r.chunk_id.clone()).collect());
             control::replace_chunks(&conn, &doc_id, &rows).unwrap();
         }
         drop(conn);
@@ -561,6 +723,7 @@ mod tests {
             config,
             store,
             doc_ids,
+            chunk_ids,
         }
     }
 
@@ -601,6 +764,7 @@ mod tests {
             &embedder,
             &WhatlangNormalizer,
             &IdentityReranker,
+            fx.config.retrieval().clone(),
         );
 
         let hits = retriever.query("wal throttling", 5).await.unwrap();
@@ -627,6 +791,7 @@ mod tests {
             &embedder,
             &WhatlangNormalizer,
             &BrokenReranker,
+            fx.config.retrieval().clone(),
         );
 
         // Broken reranker: degradation, not failure (§8 Stage 5.5) — the
@@ -648,7 +813,171 @@ mod tests {
             &embedder,
             &WhatlangNormalizer,
             &IdentityReranker,
+            fx.config.retrieval().clone(),
         );
         assert!(retriever.query("", 5).await.unwrap().is_empty());
+    }
+
+    /// The graph-path fixture: the §8 Stage 4 write shape, seeded directly —
+    /// registry entities + aliases in `SQLite`, nodes + name vectors +
+    /// `:MENTIONS` edges in the knowledge store.
+    async fn graph_fixture() -> (
+        Fixture,
+        rusqlite::Connection,
+        FakeEmbedder,
+        InMemoryKnowledge,
+    ) {
+        let fx = fixture();
+        let conn = control::connect(&fx.store).unwrap();
+        let embedder = FakeEmbedder::new();
+        let knowledge = InMemoryKnowledge::default();
+
+        // One entity ("sqlite", PRODUCT) mentioned by doc 0's first chunk.
+        control::ensure_entity(&conn, "ent-sqlite", "sqlite", "PRODUCT", None).unwrap();
+        control::upsert_alias(&conn, "sqlite", "PRODUCT", "ent-sqlite").unwrap();
+        knowledge
+            .upsert_entity(&crate::knowledge::EntityRecord {
+                entity_id: "ent-sqlite".to_string(),
+                canonical_name: "sqlite".to_string(),
+                entity_type: crate::knowledge::EntityType::Product,
+                subtype: None,
+            })
+            .await
+            .unwrap();
+        let name_vec = embedder.embed(&["sqlite"]).unwrap().remove(0);
+        knowledge
+            .upsert_vectors(VectorSpace::EntityNames, "", &["ent-sqlite"], &[name_vec])
+            .await
+            .unwrap();
+        knowledge
+            .link_mention(&fx.chunk_ids[0][0], "ent-sqlite")
+            .await
+            .unwrap();
+
+        // A homograph: "checkpointing" is both a CONCEPT and an EVENT, each
+        // mentioned by a different chunk (§8 Stage 5.2 disambiguation shape).
+        let ckpt_concept_chunk = fx.chunk_ids[0][1].clone();
+        let ckpt_event_chunk = fx.chunk_ids[1][0].clone();
+        for (id, etype, mention) in [
+            (
+                "ent-ckpt-c",
+                crate::knowledge::EntityType::Concept,
+                &ckpt_concept_chunk,
+            ),
+            (
+                "ent-ckpt-e",
+                crate::knowledge::EntityType::Event,
+                &ckpt_event_chunk,
+            ),
+        ] {
+            control::ensure_entity(&conn, id, "checkpointing", etype.as_str(), None).unwrap();
+            control::upsert_alias(&conn, "checkpointing", etype.as_str(), id).unwrap();
+            knowledge
+                .upsert_entity(&crate::knowledge::EntityRecord {
+                    entity_id: id.to_string(),
+                    canonical_name: "checkpointing".to_string(),
+                    entity_type: etype,
+                    subtype: None,
+                })
+                .await
+                .unwrap();
+            knowledge.link_mention(mention, id).await.unwrap();
+        }
+        (fx, conn, embedder, knowledge)
+    }
+
+    #[tokio::test]
+    async fn query_entities_resolve_aliases_and_embeddings() {
+        let (fx, conn, embedder, knowledge) = graph_fixture().await;
+        let retriever = Retriever::new(
+            &conn,
+            &knowledge,
+            &embedder,
+            &WhatlangNormalizer,
+            &IdentityReranker,
+            fx.config.retrieval().clone(),
+        );
+
+        // Exact alias hit — one term, one entity, all type-variants. Embedding
+        // hits may follow (the fake's vectors are coarse); the alias hit leads.
+        let entities = retriever.query_entities("sqlite").await.unwrap();
+        let first = entities.first().unwrap();
+        assert_eq!(first.entity_id, "ent-sqlite");
+        assert_eq!(first.source, QueryEntitySource::Alias);
+        assert_eq!(first.score, 1.0); // exact-alias hits carry the constant 1.0
+        assert!(entities.len() <= fx.config.retrieval().max_query_entities());
+
+        // Homograph: every type-variant comes back (§8 Stage 5.2). The fake
+        // embedder's coarse vectors may also surface embedding hits — the
+        // invariant under test is that both alias variants are present.
+        let entities = retriever.query_entities("checkpointing").await.unwrap();
+        let ids: Vec<&str> = entities.iter().map(|e| e.entity_id.as_str()).collect();
+        assert!(
+            ids.contains(&"ent-ckpt-c") && ids.contains(&"ent-ckpt-e"),
+            "got {ids:?}"
+        );
+        assert!(
+            entities.iter().all(|e| e.source == QueryEntitySource::Alias
+                || e.source == QueryEntitySource::Embedding)
+        );
+
+        // Embedding pass: the fake embedder gives "sqlite" a word-hash vector;
+        // a query sharing vocabulary lands above the floor and the entity
+        // resolves via `EntityNames` KNN. The embedding threshold in the
+        // fixture's default config is 0.75; cosine of identical vectors is 1.
+        let entities = retriever.query_entities("sqlite database").await.unwrap();
+        assert!(entities.iter().any(|e| e.entity_id == "ent-sqlite"));
+
+        // Unknown terms resolve nothing.
+        assert!(
+            retriever
+                .query_entities("nothing matches")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(fx);
+    }
+
+    #[tokio::test]
+    async fn graph_path_surfaces_mentioning_chunks_into_fusion() {
+        let (fx, conn, embedder, knowledge) = graph_fixture().await;
+        let retriever = Retriever::new(
+            &conn,
+            &knowledge,
+            &embedder,
+            &WhatlangNormalizer,
+            &IdentityReranker,
+            fx.config.retrieval().clone(),
+        );
+
+        // The graph path is reachable through the public query: "sqlite" hits
+        // the alias, `:MENTIONS` links doc 0's first chunk, and that chunk
+        // competes in fusion on equal footing with the lexical paths.
+        let hits = retriever.query("sqlite", 5).await.unwrap();
+        assert!(
+            hits.iter().any(|h| h.chunk_id == fx.chunk_ids[0][0]),
+            "the mentioning chunk must be a candidate, got {hits:?}"
+        );
+
+        // A query naming no entity still works through the lexical paths.
+        let hits = retriever.query("wal truncation", 5).await.unwrap();
+        assert!(hits[0].text.contains("truncation"));
+
+        // The graph path degrades gracefully for a store without traversal
+        // (§9 honest capabilities): the lexical paths still answer. This store
+        // has no chunk vectors either — the BM25 path alone carries the query.
+        let knowledge = InMemoryKnowledge::without_graph();
+        let retriever = Retriever::new(
+            &conn,
+            &knowledge,
+            &embedder,
+            &WhatlangNormalizer,
+            &IdentityReranker,
+            fx.config.retrieval().clone(),
+        );
+        let hits = retriever.query("wal truncation", 5).await.unwrap();
+        assert!(!hits.is_empty(), "the lexical paths must still answer");
+        drop(fx);
     }
 }

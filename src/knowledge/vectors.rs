@@ -350,6 +350,26 @@ impl KnowledgeStore for LadybugStore {
         super::graph::fold_entity(self, loser, winner)
     }
 
+    async fn merge_fact(
+        &self,
+        subject_id: &str,
+        predicate: crate::knowledge::Predicate,
+        object_id: &str,
+        evidence_chunk: &str,
+        properties: Option<&serde_json::Value>,
+        caps: crate::knowledge::FactCaps,
+    ) -> Result<(), KnowledgeError> {
+        super::graph::merge_fact(
+            self,
+            subject_id,
+            predicate,
+            object_id,
+            evidence_chunk,
+            properties,
+            caps,
+        )
+    }
+
     /// Deletes every trace of `doc_id`: all chunk-vector collections plus the
     /// graph's `Chunk` nodes (and their `:MENTIONS` edges) — §7.6.
     async fn delete_doc(&self, doc_id: &str) -> Result<(), KnowledgeError> {

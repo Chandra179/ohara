@@ -103,6 +103,22 @@ impl EntityType {
     }
 }
 
+impl std::str::FromStr for EntityType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "PERSON" => Ok(EntityType::Person),
+            "ORGANIZATION" => Ok(EntityType::Organization),
+            "LOCATION" => Ok(EntityType::Location),
+            "EVENT" => Ok(EntityType::Event),
+            "CONCEPT" => Ok(EntityType::Concept),
+            "PRODUCT" => Ok(EntityType::Product),
+            other => Err(format!("unknown entity type {other:?}")),
+        }
+    }
+}
+
 /// The closed predicate set for fact edges — mirrors the §5 CHECK constraint on
 /// `triplets.predicate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -200,6 +216,17 @@ pub struct Fact {
     pub support_count: u64,
     /// Edge properties JSON (`occurred_on`, `as_of`, …), if any.
     pub properties: Option<serde_json::Value>,
+}
+
+/// Bounds on the per-edge aggregation (§8 Stage 4): `evidence` (chunk ids
+/// asserting the fact) and `occurrences` (`occurred_on` values) are capped
+/// lists, so one heavily-asserted fact cannot grow unbounded on the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FactCaps {
+    /// Maximum evidence chunk ids kept per edge.
+    pub max_evidence: usize,
+    /// Maximum `occurred_on` values kept per edge.
+    pub max_occurrences: usize,
 }
 
 /// A KNN hit: the vector id and its similarity score.
@@ -312,6 +339,27 @@ pub trait KnowledgeStore: Send + Sync {
     /// # Errors
     /// [`KnowledgeError`] per its taxonomy.
     async fn fold_entity(&self, loser: &str, winner: &str) -> Result<(), KnowledgeError>;
+
+    /// Merges one chunk's assertion of a fact into the entity-level edge whose
+    /// identity is `(subject_id, predicate, object_id)` (§8 Stage 4): the edge is
+    /// created if absent; otherwise its aggregation updates — `support_count`
+    /// increments iff `evidence_chunk` is new to the edge's evidence list, and
+    /// `occurred_on` values from `properties` are unioned. Both lists honor
+    /// `caps`. Replay with the same inputs is a no-op (§7.1). Both endpoint
+    /// entities must already exist (callers upsert entities before facts, §7.2).
+    ///
+    /// # Errors
+    /// [`KnowledgeError::Backend`] when either endpoint entity is missing, or the
+    /// store fails.
+    async fn merge_fact(
+        &self,
+        subject_id: &str,
+        predicate: Predicate,
+        object_id: &str,
+        evidence_chunk: &str,
+        properties: Option<&serde_json::Value>,
+        caps: FactCaps,
+    ) -> Result<(), KnowledgeError>;
 
     /// Deletes every trace of `doc_id` — all vector collections plus the graph —
     /// so the delete→KNN postcondition holds everywhere (§9).

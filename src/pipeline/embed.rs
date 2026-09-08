@@ -471,6 +471,7 @@ mod tests {
                 extractor: &NeverExtractor,
                 embedder: embedder.as_ref(),
                 knowledge: knowledge.as_ref(),
+                llm: &crate::pipeline::test_support::NeverLlm,
             };
             run(&ctx, &job)
         })

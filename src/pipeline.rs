@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::control::{self, ClaimedJob, Completion, DbError, Stage};
 use crate::engine::Fetcher;
 use crate::knowledge::KnowledgeStore;
+use crate::llm::Llm;
 
 pub use crate::engine::HttpFetcher;
 #[cfg(feature = "ladybug")]
@@ -29,8 +30,9 @@ pub use embed::{EmbedError, Embedder};
 #[cfg(feature = "onnx-embedder")]
 pub use retrieve::LocalReranker;
 pub use retrieve::{
-    IdentityReranker, Lang, QueryNormalizer, RETRIEVAL_POOL, RerankError, Reranker, RetrieveError,
-    Retriever, ScoredChunk, WhatlangNormalizer, fts_match_expression,
+    IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer, RETRIEVAL_POOL,
+    RerankError, Reranker, RetrieveError, Retriever, ScoredChunk, WhatlangNormalizer,
+    fts_match_expression,
 };
 
 /// What a stage body reports on success (§10: domain outcomes are values, not
@@ -138,6 +140,7 @@ pub(crate) struct StageCtx<'a> {
     pub(crate) extractor: &'a dyn Extractor,
     pub(crate) embedder: &'a dyn Embedder,
     pub(crate) knowledge: &'a dyn KnowledgeStore,
+    pub(crate) llm: &'a dyn Llm,
 }
 
 /// What the loop does after one claimed job's outcome is recorded.
@@ -159,6 +162,7 @@ pub struct Worker {
     extractor: Arc<dyn Extractor>,
     embedder: Arc<dyn Embedder>,
     knowledge: Arc<dyn KnowledgeStore>,
+    llm: Arc<dyn Llm>,
     id: String,
 }
 
@@ -203,6 +207,23 @@ fn default_knowledge(_config: &Config) -> Result<Arc<dyn KnowledgeStore>, crate:
     ))
 }
 
+/// The default [`Llm`]: the local Ollama provider (§2, §11.2), health-checked at
+/// boot (§2 fail-fast) when the graph is enabled — without the graph, no stage
+/// ever reaches the LLM, so deployments without a running Ollama stay bootable.
+fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, crate::BootError> {
+    if !config.pipeline().graph_enabled() {
+        return Ok(Arc::new(crate::llm::NoLlm));
+    }
+    let ollama = crate::llm::Ollama::new(config.llm().base_url().clone())?;
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        crate::BootError::Worker(
+            "ohara must run inside a tokio runtime to health-check the LLM endpoint".to_string(),
+        )
+    })?;
+    handle.block_on(ollama.verify_endpoint())?;
+    Ok(Arc::new(ollama))
+}
+
 impl Worker {
     /// Boots a worker with the real ports: engine-plane fetcher (ladder leg 1),
     /// the readability extractor, the pinned local embedder, and the embedded
@@ -222,7 +243,8 @@ impl Worker {
         let extractor = Arc::new(ReadabilityExtractor);
         let embedder = default_embedder(&config)?;
         let knowledge = default_knowledge(&config)?;
-        Self::with_ports(config, fetcher, extractor, embedder, knowledge)
+        let llm = default_llm(&config)?;
+        Self::with_ports(config, fetcher, extractor, embedder, knowledge, llm)
     }
 
     /// Boots a worker with explicit ports (§14 integration: canned fetcher, fake
@@ -238,6 +260,7 @@ impl Worker {
         extractor: Arc<dyn Extractor>,
         embedder: Arc<dyn Embedder>,
         knowledge: Arc<dyn KnowledgeStore>,
+        llm: Arc<dyn Llm>,
     ) -> Result<Self, crate::BootError> {
         let id = format!("worker-{}", std::process::id());
         let conn = control::connect(config.db_path())?;
@@ -252,6 +275,7 @@ impl Worker {
             extractor,
             embedder,
             knowledge,
+            llm,
             id,
         })
     }
@@ -343,6 +367,7 @@ impl Worker {
             extractor: self.extractor.as_ref(),
             embedder: self.embedder.as_ref(),
             knowledge: self.knowledge.as_ref(),
+            llm: self.llm.as_ref(),
         };
         let outcome = catch_unwind(AssertUnwindSafe(|| dispatch(stage, &ctx, job)));
         match outcome {
@@ -467,7 +492,7 @@ fn dispatch(
         Stage::Scrape => scrape::run(ctx, job),
         Stage::Clean => clean::run(ctx, job),
         Stage::Vectorize => embed::run(ctx, job),
-        Stage::Extract => extract::run(ctx.config, job),
+        Stage::Extract => extract::run(ctx, job),
     }
 }
 
@@ -531,7 +556,8 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
 
     use crate::knowledge::{
-        ChunkFilter, EntityRecord, Fact, KnowledgeError, KnowledgeStore, ScoredHit, VectorSpace,
+        ChunkFilter, EntityRecord, Fact, KnowledgeError, KnowledgeStore, Predicate, ScoredHit,
+        VectorSpace,
     };
 
     /// An extractor no stage under test may call.
@@ -586,6 +612,23 @@ pub(crate) mod test_support {
         }
     }
 
+    /// An LLM no stage under test may call.
+    pub struct NeverLlm;
+
+    #[async_trait::async_trait]
+    impl crate::llm::Llm for NeverLlm {
+        async fn complete(
+            &self,
+            _req: crate::llm::CompletionRequest,
+        ) -> Result<crate::llm::CompletionResponse, crate::llm::LlmError> {
+            panic!("stage must not call the LLM")
+        }
+
+        fn usage(&self) -> crate::llm::LlmUsage {
+            panic!("stage must not call the LLM")
+        }
+    }
+
     /// A knowledge store no stage under test may call.
     pub struct NeverKnowledge;
 
@@ -632,6 +675,18 @@ pub(crate) mod test_support {
         }
 
         async fn fold_entity(&self, _loser: &str, _winner: &str) -> Result<(), KnowledgeError> {
+            panic!("stage must not touch the knowledge plane")
+        }
+
+        async fn merge_fact(
+            &self,
+            _subject_id: &str,
+            _predicate: crate::knowledge::Predicate,
+            _object_id: &str,
+            _evidence_chunk: &str,
+            _properties: Option<&serde_json::Value>,
+            _caps: crate::knowledge::FactCaps,
+        ) -> Result<(), KnowledgeError> {
             panic!("stage must not touch the knowledge plane")
         }
 
@@ -717,12 +772,41 @@ pub(crate) mod test_support {
     /// One stored vector: `(doc_id, vector)`.
     type StoredVector = (String, Vec<f32>);
 
+    /// The §8 Stage 4 aggregation a [`KnowledgeStore`] fake must hold for
+    /// fact-merge assertions.
+    type StoredFact = (
+        String,      // subject_id
+        Predicate,   // predicate
+        String,      // object_id
+        u64,         // support_count
+        Vec<String>, // evidence chunk ids (capped)
+        Vec<String>, // occurrences (capped)
+    );
+
     /// The in-memory `KnowledgeStore` fake (§14): vectors keyed by
-    /// `(space, id)` with document membership, brute-force cosine KNN. Graph
-    /// methods are out of scope until Stage 4 tests (§15 step 6).
-    #[derive(Default)]
+    /// `(space, id)` with document membership, brute-force cosine KNN, plus the
+    /// graph state Stage 4 writes (entities, `:MENTIONS`, fact edges with the
+    /// §8 aggregation). Graph reads mirror the postconditions of the real impl.
     pub struct InMemoryKnowledge {
         vectors: Mutex<HashMap<(String, String), StoredVector>>,
+        entities: Mutex<HashMap<String, EntityRecord>>,
+        mentions: Mutex<std::collections::HashSet<(String, String)>>,
+        facts: Mutex<HashMap<(String, String, String), StoredFact>>,
+        graph_traversal: bool,
+    }
+
+    impl Default for InMemoryKnowledge {
+        fn default() -> Self {
+            Self {
+                vectors: Mutex::new(HashMap::new()),
+                entities: Mutex::new(HashMap::new()),
+                mentions: Mutex::new(std::collections::HashSet::new()),
+                facts: Mutex::new(HashMap::new()),
+                // The fake mirrors the real store's reads (§14), so it declares
+                // the same capability by default.
+                graph_traversal: true,
+            }
+        }
     }
 
     fn key(space: &VectorSpace, id: &str) -> (String, String) {
@@ -730,9 +814,24 @@ pub(crate) mod test_support {
     }
 
     impl InMemoryKnowledge {
+        /// The capability-off variant: a store without graph traversal, for
+        /// the §8 Stage 5 degradation tests.
+        #[must_use]
+        pub fn without_graph() -> Self {
+            Self {
+                graph_traversal: false,
+                ..Self::default()
+            }
+        }
+
         /// Test helper: simulates a lost vector (§7.3 repair path).
         pub fn remove(&self, id: &str) {
             self.vectors.lock().unwrap().retain(|(_, key), _| key != id);
+        }
+
+        /// Test helper: all fact edges currently stored.
+        pub fn facts(&self) -> Vec<StoredFact> {
+            self.facts.lock().unwrap().values().cloned().collect()
         }
 
         fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -752,7 +851,7 @@ pub(crate) mod test_support {
         fn capabilities(&self) -> crate::knowledge::KsCapabilities {
             crate::knowledge::KsCapabilities {
                 filtered_ann: false,
-                graph_traversal: false,
+                graph_traversal: self.graph_traversal,
             }
         }
 
@@ -795,19 +894,83 @@ pub(crate) mod test_support {
             Ok(self.vectors.lock().unwrap().contains_key(&key(&space, id)))
         }
 
-        async fn upsert_entity(&self, _e: &EntityRecord) -> Result<(), KnowledgeError> {
+        async fn upsert_entity(&self, e: &EntityRecord) -> Result<(), KnowledgeError> {
+            self.entities
+                .lock()
+                .unwrap()
+                .insert(e.entity_id.clone(), e.clone());
             Ok(())
         }
 
         async fn link_mention(
             &self,
-            _chunk_id: &str,
-            _entity_id: &str,
+            chunk_id: &str,
+            entity_id: &str,
         ) -> Result<(), KnowledgeError> {
+            self.mentions
+                .lock()
+                .unwrap()
+                .insert((chunk_id.to_string(), entity_id.to_string()));
             Ok(())
         }
 
         async fn fold_entity(&self, _loser: &str, _winner: &str) -> Result<(), KnowledgeError> {
+            Ok(())
+        }
+
+        async fn merge_fact(
+            &self,
+            subject_id: &str,
+            predicate: Predicate,
+            object_id: &str,
+            evidence_chunk: &str,
+            properties: Option<&serde_json::Value>,
+            caps: crate::knowledge::FactCaps,
+        ) -> Result<(), KnowledgeError> {
+            let identity = (
+                subject_id.to_string(),
+                predicate.as_str().to_string(),
+                object_id.to_string(),
+            );
+            let mut facts = self.facts.lock().unwrap();
+            let entry = facts.entry(identity).or_insert_with(|| {
+                (
+                    subject_id.to_string(),
+                    predicate,
+                    object_id.to_string(),
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            });
+            // §8 aggregation mirror: support increments on new evidence; lists
+            // capped + deduped; replay with the same chunk is a no-op.
+            if !entry.4.iter().any(|c| c == evidence_chunk) {
+                entry.3 += 1;
+                if entry.4.len() < caps.max_evidence {
+                    entry.4.push(evidence_chunk.to_string());
+                }
+            }
+            if let Some(props) = properties {
+                let values: Vec<String> = props.get("occurred_on").map_or_else(Vec::new, |v| {
+                    v.as_array()
+                        .map_or_else(Vec::new, |arr| {
+                            arr.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .into_iter()
+                        .chain(v.as_str().map(str::to_string))
+                        .collect()
+                });
+                for value in values {
+                    if !entry.5.iter().any(|o| o == &value) && entry.5.len() < caps.max_occurrences
+                    {
+                        entry.5.push(value);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -816,16 +979,55 @@ pub(crate) mod test_support {
             Ok(())
         }
 
-        async fn chunks_for_entities(&self, _ids: &[&str]) -> Result<Vec<String>, KnowledgeError> {
-            Ok(Vec::new())
+        async fn chunks_for_entities(&self, ids: &[&str]) -> Result<Vec<String>, KnowledgeError> {
+            let mentions = self.mentions.lock().unwrap();
+            let mut chunks: Vec<String> = mentions
+                .iter()
+                .filter(|(_, entity)| ids.iter().any(|id| id == entity))
+                .map(|(chunk, _)| chunk.clone())
+                .collect();
+            chunks.sort();
+            chunks.dedup();
+            Ok(chunks)
         }
 
         async fn facts_within_hops(
             &self,
-            _ids: &[&str],
-            _hops: u8,
+            ids: &[&str],
+            hops: u8,
         ) -> Result<Vec<Fact>, KnowledgeError> {
-            Ok(Vec::new())
+            if ids.is_empty() || hops == 0 {
+                return Ok(Vec::new());
+            }
+            let facts = self.facts.lock().unwrap();
+            let mut frontier: std::collections::HashSet<String> =
+                ids.iter().map(|s| (*s).to_string()).collect();
+            let mut out: Vec<Fact> = Vec::new();
+            let mut seen: std::collections::HashSet<(String, String, String)> =
+                std::collections::HashSet::new();
+            for _ in 0..hops {
+                let mut next = std::collections::HashSet::new();
+                for (subj, pred, obj, support, _evidence, _occ) in facts.values() {
+                    if frontier.contains(subj) || frontier.contains(obj) {
+                        if seen.insert((subj.clone(), pred.as_str().to_string(), obj.clone())) {
+                            out.push(Fact {
+                                subject_id: subj.clone(),
+                                predicate: *pred,
+                                object_id: obj.clone(),
+                                support_count: *support,
+                                properties: None,
+                            });
+                        }
+                        next.insert(subj.clone());
+                        next.insert(obj.clone());
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+            Ok(out)
         }
     }
 }

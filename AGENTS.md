@@ -5,7 +5,7 @@ Single-crate Rust workspace (edition 2024, Rust 1.85+): `lib.rs` holds all logic
 ## Docs of record (read before editing)
 - `docs/ARCHITECTURE.md` — the design source of truth (§ numbers cited everywhere in code).
 - `docs/CODE_GUIDE.md` — style + lint policy (C-* guidelines), §7 has the CI gates.
-- `TODO.md` — what is NOT implemented yet. Notably: Stage 4 (`src/pipeline/extract.rs`) is a stub that returns a `Permanent` error; `src/engine/obscura.rs` is a 2-line placeholder; `src/llm.rs` has the `Llm` port types but no provider impl. These are tracked, not broken — don't "fix" them as bugs.
+- `TODO.md` — what is NOT implemented yet. Notably: `src/engine/obscura.rs` is a 2-line placeholder (fetch ladder legs 2–3, §15 step 7), the cloud `Llm` provider is opt-in-not-built, and the ops CLI subcommands / Llm synthesis (§8 Stage 5.6) are open. These are tracked, not broken — don't "fix" them as bugs.
 
 ## Build prerequisites (non-obvious)
 - `lbug` links OpenSSL at link time → `sudo apt install libssl-dev` (README §Building has a no-sudo `OPENSSL_DIR` workaround) and compiles its bundled C++ engine on first build (CMake + C++ toolchain, ~2 GB scratch).

@@ -157,6 +157,7 @@ async fn worker_drives_a_document_from_new_to_cleaned() {
             Arc::new(ohara::pipeline::ReadabilityExtractor),
             Arc::new(FixedEmbedder),
             memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
         )
         .unwrap(),
     );
@@ -236,6 +237,7 @@ async fn quality_rejection_completes_without_chaining() {
             Arc::new(ohara::pipeline::ReadabilityExtractor),
             Arc::new(FixedEmbedder),
             memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
         )
         .unwrap(),
     );
@@ -282,6 +284,7 @@ async fn not_found_dead_job_fails_its_document() {
             Arc::new(ohara::pipeline::ReadabilityExtractor),
             Arc::new(FixedEmbedder),
             memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
         )
         .unwrap(),
     );
@@ -337,6 +340,7 @@ async fn extractor_failure_retries_via_backoff() {
             Arc::new(FailingExtractor),
             Arc::new(FixedEmbedder),
             memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
         )
         .unwrap(),
     );
@@ -398,6 +402,7 @@ async fn worker_drives_a_document_from_new_to_vectorized() {
             Arc::new(ohara::pipeline::ReadabilityExtractor),
             Arc::new(FixedEmbedder),
             Arc::clone(&knowledge),
+            Arc::new(ohara::llm::NoLlm),
         )
         .unwrap(),
     );
@@ -473,6 +478,214 @@ async fn worker_drives_a_document_from_new_to_vectorized() {
         id: String::new(),
         score: 0.0,
     };
+}
+
+/// The §15 step 6 milestone: the worker drives a document all the way to
+/// `INDEXED` — Stage 4 runs end to end (LLM fake, real Ladybug graph): triplets
+/// staged, entities + aliases registered, `:MENTIONS` linked, fact edges merged,
+/// the §6 chain terminating at EXTRACT with no successor.
+#[tokio::test]
+async fn worker_drives_a_document_from_new_to_indexed() {
+    // The scripted extractor: one valid triplet for the article's single chunk.
+    struct ScriptedLlm;
+    #[async_trait::async_trait]
+    impl ohara::llm::Llm for ScriptedLlm {
+        async fn complete(
+            &self,
+            _req: ohara::llm::CompletionRequest,
+        ) -> Result<ohara::llm::CompletionResponse, ohara::llm::LlmError> {
+            Ok(ohara::llm::CompletionResponse {
+                text: r#"{"triplets":[{"subject":"SQLite","subject_type":"PRODUCT",
+                     "predicate":"CREATED_BY","object":"D. Richard Hipp",
+                     "object_type":"PERSON"}]}"#
+                    .to_string(),
+                prompt_tokens: 40,
+                completion_tokens: 30,
+            })
+        }
+
+        fn usage(&self) -> ohara::llm::LlmUsage {
+            ohara::llm::LlmUsage::default()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    // Graph on: the chain continues past VECTORIZE into EXTRACT (§6).
+    let config = fixture(dir.path(), "");
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(&conn, &dir.path().join("data"), "https://example.com/a");
+    let knowledge = memory_knowledge();
+
+    let worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(FakeFetcher {
+                result: Fake::Html(ARTICLE_HTML),
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            Arc::clone(&knowledge),
+            Arc::new(ScriptedLlm),
+        )
+        .unwrap(),
+    );
+
+    tick(&worker).await; // SCRAPE
+    tick(&worker).await; // CLEAN
+    tick(&worker).await; // VECTORIZE
+    tick(&worker).await; // EXTRACT
+
+    let doc = control::get(&conn, &doc_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocStatus::Indexed, "the full chain ran");
+
+    // Stage 4's registry rows: the triplet cost cache and both entities.
+    let triplets: i64 = conn
+        .query_row("SELECT count(*) FROM triplets", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(triplets, 1);
+    let (entities, aliases): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM entities), (SELECT count(*) FROM entity_aliases)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(entities, 2, "sqlite + d. richard hipp");
+    assert_eq!(aliases, 2);
+
+    // The knowledge plane: the MENTIONS edge and the fact edge (§8 Stage 4).
+    let entity_ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT entity_id FROM entities ORDER BY canonical_name")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let mentions = knowledge
+        .chunks_for_entities(&entity_ids.iter().map(String::as_str).collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(mentions.len(), 1, "the chunk mentions both entities");
+    let facts = knowledge
+        .facts_within_hops(
+            &entity_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(facts.len(), 1, "one fact edge: {facts:?}");
+    assert_eq!(facts[0].predicate, ohara::knowledge::Predicate::CreatedBy);
+    assert_eq!(facts[0].support_count, 1);
+
+    // §6: EXTRACT has no successor — the chain ends here, fully audited.
+    let extract_jobs: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'EXTRACT'",
+            [&doc_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(extract_jobs, 1);
+    let done_events: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM stage_events WHERE doc_id = ?1 AND outcome = 'DONE'",
+            [&doc_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(done_events, 4, "SCRAPE, CLEAN, VECTORIZE, EXTRACT audited");
+}
+
+#[tokio::test]
+async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
+    // Same scripted extractor as the NEW→INDEXED test: one CREATED_BY triplet
+    // with SQLite as the subject.
+    struct ScriptedLlm;
+    #[async_trait::async_trait]
+    impl ohara::llm::Llm for ScriptedLlm {
+        async fn complete(
+            &self,
+            _req: ohara::llm::CompletionRequest,
+        ) -> Result<ohara::llm::CompletionResponse, ohara::llm::LlmError> {
+            Ok(ohara::llm::CompletionResponse {
+                text: r#"{"triplets":[{"subject":"SQLite","subject_type":"PRODUCT",
+                     "predicate":"CREATED_BY","object":"D. Richard Hipp",
+                     "object_type":"PERSON"}]}"#
+                    .to_string(),
+                prompt_tokens: 40,
+                completion_tokens: 30,
+            })
+        }
+
+        fn usage(&self) -> ohara::llm::LlmUsage {
+            ohara::llm::LlmUsage::default()
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let config = fixture(dir.path(), "");
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(&conn, &dir.path().join("data"), "https://example.com/a");
+    let knowledge = memory_knowledge();
+
+    let worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(FakeFetcher {
+                result: Fake::Html(ARTICLE_HTML),
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            Arc::clone(&knowledge),
+            Arc::new(ScriptedLlm),
+        )
+        .unwrap(),
+    );
+    for _ in 0..4 {
+        tick(&worker).await;
+    }
+    let doc = control::get(&conn, &doc_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocStatus::Indexed);
+
+    // The Stage 5 read side over the Stage 4 write side (§15 step 6): a query
+    // naming the entity resolves it via the typed alias, and the graph path
+    // surfaces the mentioning chunk.
+    let retriever = ohara::pipeline::Retriever::new(
+        &conn,
+        knowledge.as_ref(),
+        &FixedEmbedder,
+        &ohara::pipeline::WhatlangNormalizer,
+        &ohara::pipeline::IdentityReranker,
+        config.retrieval().clone(),
+    );
+
+    // Query entities: the "sqlite" alias hit is exact and first.
+    let entities = retriever.query_entities("sqlite created by").await.unwrap();
+    assert!(
+        entities
+            .iter()
+            .any(|e| !e.entity_id.is_empty()
+                && e.source == ohara::pipeline::QueryEntitySource::Alias),
+        "the typed alias must resolve: {entities:?}"
+    );
+    let sqlite_id: &str = entities
+        .iter()
+        .find(|e| e.source == ohara::pipeline::QueryEntitySource::Alias)
+        .map(|e| e.entity_id.as_str())
+        .unwrap();
+
+    // The full query fuses all three paths; the chunk that mentions SQLite
+    // must rank. The fake embedder's vectors are coarse, so assert presence in
+    // the pool rather than the top slot.
+    let hits = retriever.query("sqlite", 5).await.unwrap();
+    let chunk_ids = knowledge.chunks_for_entities(&[sqlite_id]).await.unwrap();
+    assert_eq!(chunk_ids.len(), 1, "one mentioning chunk");
+    assert!(
+        hits.iter().any(|h| h.chunk_id == chunk_ids[0]),
+        "the mentioning chunk must be a retrieval candidate, got {hits:?}"
+    );
 }
 
 /// Live end-to-end probe (§14 + §15 step 4 acceptance): the real `Worker::new`

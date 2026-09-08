@@ -4,6 +4,7 @@
 
 mod db;
 mod documents;
+mod entities;
 mod jobs;
 mod models;
 mod reconcile;
@@ -17,12 +18,18 @@ pub use documents::{
     pending_deletions, replace_chunks, request_deletion, update_clean_result, update_fetch_result,
     update_vectorize_result,
 };
+pub use entities::{
+    NameCandidate, NewTriplet, TripletRow, canonical_names, chunks_without_triplets, ensure_entity,
+    entity_type_of, er_review_candidate, lookup_alias, lookup_alias_all_types, stage_triplets,
+    triplets_of_doc, upsert_alias,
+};
 pub use jobs::{claim_next, complete, dead, enqueue, record_event, requeue, retry};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage};
 pub use reconcile::{ReconcileReport, reconcile};
 pub use sites::{LadderHint, SitePolicy, get as site_policy, set as set_site_policy};
 
 pub(crate) use db::{now, now_plus};
+pub(crate) use entities::new_entity_id;
 
 /// Shared in-crate fixtures for the control-plane unit tests (§10: tests unwrap
 /// freely).

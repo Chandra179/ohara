@@ -28,6 +28,25 @@ mod defaults {
     pub const LLM_BASE_URL: &str = "http://localhost:11434";
     /// Pinned extraction model (§11.2).
     pub const LLM_EXTRACTION_MODEL: &str = "phi4-mini:latest";
+    /// §8 Stage 4.2: normalized-name similarity floor for same-supertype
+    /// entity-resolution matches.
+    pub const ER_NAME_SIMILARITY: f64 = 0.85;
+    /// §8 Stage 4.2: entity-name embedding similarity floor (the `EntityNames`
+    /// collection) for same-supertype matches.
+    pub const ER_EMBEDDING_SIMILARITY: f64 = 0.75;
+    /// §8 Stage 4: evidence chunk ids kept per fact edge.
+    pub const ER_MAX_EVIDENCE: usize = 8;
+    /// §8 Stage 4: `occurred_on` values kept per fact edge.
+    pub const ER_MAX_OCCURRENCES: usize = 8;
+    /// §8 Stage 5.2: `EntityNames` embedding-similarity floor for query
+    /// entities — same conservative posture as ER's floor.
+    pub const RETRIEVAL_ENTITY_THRESHOLD: f64 = 0.75;
+    /// §8 Stage 5.2: cap on query entities (typed-alias hits + embedding
+    /// matches) feeding the graph paths.
+    pub const RETRIEVAL_MAX_QUERY_ENTITIES: usize = 8;
+    /// §8 Stage 5.3: fact-graph hops from query entities (1–2 for
+    /// precision-first context).
+    pub const RETRIEVAL_FACT_HOPS: u8 = 2;
     /// Fetch deadline per request (§8 Stage 1).
     pub const FETCH_TIMEOUT_SECS: u64 = 30;
     /// Honest User-Agent (§8): identifies the crawler and its owner.
@@ -75,6 +94,8 @@ pub struct Config {
     embedder: EmbedderConfig,
     knowledge: KnowledgeConfig,
     llm: LlmConfig,
+    er: ErConfig,
+    retrieval: RetrievalConfig,
 }
 
 /// Pinned embedder identity (§4, §11.1): model and quantization variant are one id.
@@ -123,6 +144,26 @@ pub struct LlmConfig {
     cloud_llm_enabled: bool,
 }
 
+/// Entity-resolution thresholds and fact-edge caps (§8 Stage 4). The thresholds
+/// are conservative by default — validated numbers on real corpora come from the
+/// eval expansion step (§15 step 8); the caps are the §8 aggregation bounds.
+#[derive(Debug, Clone)]
+pub struct ErConfig {
+    name_sim_threshold: f64,
+    embedding_sim_threshold: f64,
+    max_evidence: usize,
+    max_occurrences: usize,
+}
+
+/// Stage 5 retrieval knobs (§8 Stage 5): the graph path's candidate bounds and
+/// the `EntityNames` similarity floor for query entities.
+#[derive(Debug, Clone)]
+pub struct RetrievalConfig {
+    entity_embedding_threshold: f64,
+    max_query_entities: usize,
+    fact_hops: u8,
+}
+
 /// Raw TOML mirror — `deny_unknown_fields` so a typo'd knob fails at boot, not never.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,6 +181,8 @@ struct RawConfig {
     embedder: Option<RawEmbedder>,
     knowledge: Option<RawKnowledge>,
     llm: Option<RawLlm>,
+    er: Option<RawEr>,
+    retrieval: Option<RawRetrieval>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -192,6 +235,52 @@ struct RawLlm {
     extraction_model: Option<String>,
     fallback_model: Option<String>,
     cloud_llm_enabled: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEr {
+    name_similarity_threshold: Option<f64>,
+    embedding_similarity_threshold: Option<f64>,
+    max_evidence: Option<usize>,
+    max_occurrences: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetrieval {
+    entity_embedding_threshold: Option<f64>,
+    max_query_entities: Option<usize>,
+    fact_hops: Option<u8>,
+}
+
+fn build_er(raw: Option<&RawEr>) -> ErConfig {
+    let default_raw = RawEr::default();
+    let raw = raw.unwrap_or(&default_raw);
+    ErConfig {
+        name_sim_threshold: raw
+            .name_similarity_threshold
+            .unwrap_or(defaults::ER_NAME_SIMILARITY),
+        embedding_sim_threshold: raw
+            .embedding_similarity_threshold
+            .unwrap_or(defaults::ER_EMBEDDING_SIMILARITY),
+        max_evidence: raw.max_evidence.unwrap_or(defaults::ER_MAX_EVIDENCE),
+        max_occurrences: raw.max_occurrences.unwrap_or(defaults::ER_MAX_OCCURRENCES),
+    }
+}
+
+fn build_retrieval(raw: Option<&RawRetrieval>) -> RetrievalConfig {
+    let default_raw = RawRetrieval::default();
+    let raw = raw.unwrap_or(&default_raw);
+    RetrievalConfig {
+        entity_embedding_threshold: raw
+            .entity_embedding_threshold
+            .unwrap_or(defaults::RETRIEVAL_ENTITY_THRESHOLD),
+        max_query_entities: raw
+            .max_query_entities
+            .unwrap_or(defaults::RETRIEVAL_MAX_QUERY_ENTITIES),
+        fact_hops: raw.fact_hops.unwrap_or(defaults::RETRIEVAL_FACT_HOPS),
+    }
 }
 
 impl Config {
@@ -300,6 +389,9 @@ impl Config {
                 .unwrap_or(false),
         };
 
+        let er = build_er(raw.er.as_ref());
+        let retrieval = build_retrieval(raw.retrieval.as_ref());
+
         let config = Self {
             db_path,
             data_dir,
@@ -314,6 +406,8 @@ impl Config {
             embedder,
             knowledge,
             llm,
+            er,
+            retrieval,
         };
         config.validate()?;
         Ok(config)
@@ -373,6 +467,31 @@ impl Config {
                 self.llm.base_url.scheme()
             )
             .as_str(),
+        )?;
+        checked(
+            self.er.name_sim_threshold > 0.0 && self.er.name_sim_threshold <= 1.0,
+            "er.name_similarity_threshold must be in (0, 1]",
+        )?;
+        checked(
+            self.er.embedding_sim_threshold > 0.0 && self.er.embedding_sim_threshold <= 1.0,
+            "er.embedding_similarity_threshold must be in (0, 1]",
+        )?;
+        checked(
+            self.er.max_evidence > 0 && self.er.max_occurrences > 0,
+            "er.max_evidence / er.max_occurrences must be > 0 (§8 Stage 4 caps)",
+        )?;
+        checked(
+            self.retrieval.entity_embedding_threshold > 0.0
+                && self.retrieval.entity_embedding_threshold <= 1.0,
+            "retrieval.entity_embedding_threshold must be in (0, 1]",
+        )?;
+        checked(
+            self.retrieval.max_query_entities > 0,
+            "retrieval.max_query_entities must be > 0 (§8 Stage 5.2)",
+        )?;
+        checked(
+            self.retrieval.fact_hops > 0 && self.retrieval.fact_hops <= 2,
+            "retrieval.fact_hops must be in 1..=2 (§8 Stage 5.3 precision-first)",
         )?;
         Ok(())
     }
@@ -453,6 +572,18 @@ impl Config {
     #[must_use]
     pub fn llm(&self) -> &LlmConfig {
         &self.llm
+    }
+
+    /// Entity-resolution and fact-edge aggregation knobs (§8 Stage 4).
+    #[must_use]
+    pub fn er(&self) -> &ErConfig {
+        &self.er
+    }
+
+    /// Stage 5 retrieval knobs (§8 Stage 5).
+    #[must_use]
+    pub fn retrieval(&self) -> &RetrievalConfig {
+        &self.retrieval
     }
 }
 
@@ -545,9 +676,56 @@ impl LlmConfig {
     }
 }
 
+impl ErConfig {
+    /// Normalized-name similarity floor for same-supertype matches (§8 Stage 4.2).
+    #[must_use]
+    pub fn name_sim_threshold(&self) -> f64 {
+        self.name_sim_threshold
+    }
+
+    /// Entity-name embedding similarity floor for same-supertype matches (§8 Stage 4.2).
+    #[must_use]
+    pub fn embedding_sim_threshold(&self) -> f64 {
+        self.embedding_sim_threshold
+    }
+
+    /// Evidence chunk-id cap per fact edge (§8 Stage 4).
+    #[must_use]
+    pub fn max_evidence(&self) -> usize {
+        self.max_evidence
+    }
+
+    /// `occurred_on` cap per fact edge (§8 Stage 4).
+    #[must_use]
+    pub fn max_occurrences(&self) -> usize {
+        self.max_occurrences
+    }
+}
+
+impl RetrievalConfig {
+    /// `EntityNames` embedding-similarity floor for query entities (§8
+    /// Stage 5.2).
+    #[must_use]
+    pub fn entity_embedding_threshold(&self) -> f64 {
+        self.entity_embedding_threshold
+    }
+
+    /// Cap on query entities feeding the graph paths (§8 Stage 5.2).
+    #[must_use]
+    pub fn max_query_entities(&self) -> usize {
+        self.max_query_entities
+    }
+
+    /// Fact-graph hops from query entities (§8 Stage 5.3).
+    #[must_use]
+    pub fn fact_hops(&self) -> u8 {
+        self.fact_hops
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)] // §10: tests unwrap freely
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)] // exact-representation knob assertions
 
     use super::*;
 
@@ -631,5 +809,70 @@ mod tests {
         assert_eq!(config.embedder().model_id(), "bge-small-en-v1.5:int8");
         // knowledge pointers follow the embedder override.
         assert_eq!(config.knowledge().read_model(), "bge-small-en-v1.5:int8");
+    }
+
+    #[test]
+    fn er_knobs_default_and_override() {
+        let config = Config::load(None).expect("defaults are valid");
+        assert_eq!(config.er().name_sim_threshold(), 0.85);
+        assert_eq!(config.er().embedding_sim_threshold(), 0.75);
+        assert_eq!(config.er().max_evidence(), 8);
+        assert_eq!(config.er().max_occurrences(), 8);
+
+        let config = Config::load_from_str(
+            "[er]\nname_similarity_threshold = 0.9\nembedding_similarity_threshold = 0.8\nmax_evidence = 3\nmax_occurrences = 2\n",
+        )
+        .expect("valid");
+        assert_eq!(config.er().name_sim_threshold(), 0.9);
+        assert_eq!(config.er().embedding_sim_threshold(), 0.8);
+        assert_eq!(config.er().max_evidence(), 3);
+        assert_eq!(config.er().max_occurrences(), 2);
+    }
+
+    #[test]
+    fn er_thresholds_are_validated() {
+        let err =
+            Config::load_from_str("[er]\nname_similarity_threshold = 1.5").expect_err("must fail");
+        assert!(
+            matches!(err, ConfigError::Validation(m) if m.contains("name_similarity_threshold"))
+        );
+
+        let err = Config::load_from_str("[er]\nmax_evidence = 0").expect_err("must fail");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("max_evidence")));
+    }
+
+    #[test]
+    fn retrieval_knobs_default_and_override() {
+        let config = Config::load(None).expect("defaults are valid");
+        assert_eq!(config.retrieval().entity_embedding_threshold(), 0.75);
+        assert_eq!(config.retrieval().max_query_entities(), 8);
+        assert_eq!(config.retrieval().fact_hops(), 2);
+
+        let config = Config::load_from_str(
+            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\n",
+        )
+        .expect("valid");
+        assert_eq!(config.retrieval().entity_embedding_threshold(), 0.8);
+        assert_eq!(config.retrieval().max_query_entities(), 4);
+        assert_eq!(config.retrieval().fact_hops(), 1);
+    }
+
+    #[test]
+    fn retrieval_knobs_are_validated() {
+        let err = Config::load_from_str("[retrieval]\nentity_embedding_threshold = 1.5")
+            .expect_err("must fail");
+        assert!(
+            matches!(err, ConfigError::Validation(m) if m.contains("entity_embedding_threshold"))
+        );
+
+        let err = Config::load_from_str("[retrieval]\nfact_hops = 0").expect_err("must fail");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("fact_hops")));
+
+        let err = Config::load_from_str("[retrieval]\nfact_hops = 3").expect_err("must fail");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("fact_hops")));
+
+        let err =
+            Config::load_from_str("[retrieval]\nmax_query_entities = 0").expect_err("must fail");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("max_query_entities")));
     }
 }

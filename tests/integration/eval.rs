@@ -3,10 +3,12 @@
 //!
 //! Corpus: 12 topics × 4 sections = 48 chunks; every chunk is identified by a
 //! unique (topic, section-key) pair baked into its text. 50 queries — one per
-//! chunk plus two paraphrases — each with exactly one relevant chunk.
+//! chunk plus two paraphrases — each with exactly one relevant chunk. Each
+//! topic also seeds a CONCEPT entity (typed alias + `EntityNames` vector) with
+//! `:MENTIONS` edges from its chunks, so the graph path has real structure.
 //!
-//! Metrics (§8 Stage 5.7 / §14): recall@20 per path, MRR of the fused list,
-//! rerank delta (reranked top-5 vs fused top-5).
+//! Metrics (§8 Stage 5.7 / §14): recall@20 per path (BM25, vector, graph), MRR
+//! of the fused list, rerank delta (reranked top-5 vs fused top-5).
 //!
 //! Two runs: `eval_retrieval_baseline_machinery` is hermetic (fakes) and proves
 //! the machinery; `eval_retrieval_baseline_real_models` (ignored — fetches the
@@ -55,17 +57,62 @@ struct EvalFixture {
     store: std::path::PathBuf,
     #[allow(dead_code)] // holds the tempdir open for the test
     data_dir: std::path::PathBuf,
+    /// Validated from the fixture's TOML — feeds the retriever's knobs.
+    config: Config,
+}
+
+/// Seeds the graph side for one topic (§8 Stage 4 write shape): a CONCEPT
+/// entity with a typed alias, its `EntityNames` vector, `:MENTIONS` edges from
+/// every chunk, so the graph path has structure to traverse.
+async fn seed_topic_graph(
+    conn: &rusqlite::Connection,
+    knowledge: &ohara::knowledge::LadybugStore,
+    embedder: &dyn Embedder,
+    t: usize,
+    topic: &str,
+    chunk_ids: &[String],
+) {
+    let topic_entity = format!("ent-{t}");
+    let normalized = ohara::text::normalize_surface_form(topic);
+    control::ensure_entity(conn, &topic_entity, &normalized, "CONCEPT", None).unwrap();
+    control::upsert_alias(conn, &normalized, "CONCEPT", &topic_entity).unwrap();
+    knowledge
+        .upsert_entity(&ohara::knowledge::EntityRecord {
+            entity_id: topic_entity.clone(),
+            canonical_name: topic.to_string(),
+            entity_type: ohara::knowledge::EntityType::Concept,
+            subtype: None,
+        })
+        .await
+        .unwrap();
+    let name_vec = embedder.embed(&[topic]).unwrap().remove(0);
+    knowledge
+        .upsert_vectors(VectorSpace::EntityNames, "", &[&topic_entity], &[name_vec])
+        .await
+        .unwrap();
+    for chunk_id in chunk_ids {
+        knowledge
+            .link_mention(chunk_id, &topic_entity)
+            .await
+            .unwrap();
+    }
 }
 
 /// Builds the corpus: documents + chunk rows in the registry, vectors in the
 /// knowledge store, keyed by the embedder's own model id.
-async fn build_corpus(embedder: &dyn Embedder) -> (EvalFixture, Vec<GoldenQuery>) {
+async fn build_corpus(
+    embedder: &dyn Embedder,
+) -> (
+    EvalFixture,
+    ohara::knowledge::LadybugStore,
+    Vec<GoldenQuery>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let toml_path = dir.path().join("ohara.toml");
     std::fs::write(&toml_path, format!("data_dir = {:?}\n", data_dir.display())).unwrap();
-    let _config = Config::load(Some(&toml_path)).unwrap();
+    let config = Config::load(Some(&toml_path)).unwrap();
     let store = dir.path().join("store.db");
     let conn = control::connect(&store).unwrap();
 
@@ -125,6 +172,18 @@ async fn build_corpus(embedder: &dyn Embedder) -> (EvalFixture, Vec<GoldenQuery>
                 .await
                 .unwrap();
         }
+
+        // The graph side (§8 Stage 4 write shape) — every chunk of this topic
+        // mentions the topic entity.
+        seed_topic_graph(
+            &conn,
+            &knowledge,
+            embedder,
+            t,
+            topic,
+            &rows.iter().map(|r| r.chunk_id.clone()).collect::<Vec<_>>(),
+        )
+        .await;
     }
     // Two paraphrase queries beyond the 48 canonical ones (§14: 50 total).
     queries.push(GoldenQuery {
@@ -146,8 +205,9 @@ async fn build_corpus(embedder: &dyn Embedder) -> (EvalFixture, Vec<GoldenQuery>
         dir,
         store,
         data_dir,
+        config,
     };
-    (fixture, queries)
+    (fixture, knowledge, queries)
 }
 
 fn find_doc(conn: &rusqlite::Connection, url: &str) -> String {
@@ -159,11 +219,17 @@ fn find_doc(conn: &rusqlite::Connection, url: &str) -> String {
     .unwrap()
 }
 
+/// The fixture's validated retrieval knobs (§8 Stage 5.2).
+fn fixture_config(fixture: &EvalFixture) -> ohara::config::RetrievalConfig {
+    fixture.config.retrieval().clone()
+}
+
 /// Per-path metrics: recall@20 (path's own top-20) and the fused/reranked MRR.
 #[derive(Debug)]
 struct Metrics {
     bm25_recall20: f64,
     vector_recall20: f64,
+    graph_recall20: f64,
     fused_mrr: f64,
     fused_top5_mrr: f64,
     reranked_top5_mrr: f64,
@@ -177,10 +243,12 @@ impl Metrics {
     fn report(name: &str) -> impl Fn(&Metrics) + '_ {
         move |m: &Metrics| {
             println!(
-                "[{name}] bm25_recall20={:.3} vector_recall20={:.3} fused_mrr={:.3} \
-                 fused_top5_mrr={:.3} reranked_top5_mrr={:.3} rerank_delta={:+.3}",
+                "[{name}] bm25_recall20={:.3} vector_recall20={:.3} graph_recall20={:.3} \
+                 fused_mrr={:.3} fused_top5_mrr={:.3} reranked_top5_mrr={:.3} \
+                 rerank_delta={:+.3}",
                 m.bm25_recall20,
                 m.vector_recall20,
+                m.graph_recall20,
                 m.fused_mrr,
                 m.fused_top5_mrr,
                 m.reranked_top5_mrr,
@@ -193,37 +261,27 @@ impl Metrics {
 /// Runs every golden query through the retriever and the raw paths.
 async fn run_eval(
     fixture: &EvalFixture,
+    knowledge: &ohara::knowledge::LadybugStore,
     embedder: &dyn Embedder,
     queries: &[GoldenQuery],
     reranker: &dyn ohara::pipeline::Reranker,
 ) -> Metrics {
     let conn = control::connect(&fixture.store).unwrap();
-    let knowledge = ohara::knowledge::LadybugStore::in_memory(embedder.dim()).unwrap();
-    // Re-embed the corpus into this store (the fixture's store was consumed by
-    // build_corpus's own instance; registry rows persist, vectors re-populate).
     let space = VectorSpace::Chunks {
         model_id: ModelId::new(embedder.model_id().to_string()),
     };
-    let mut stmt = conn
-        .prepare("SELECT chunk_id, doc_id, embed_text FROM chunks")
-        .unwrap();
-    let rows: Vec<(String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    drop(stmt);
-    for (chunk_id, doc_id, embed_text) in &rows {
-        let vec = embedder.embed(&[embed_text]).unwrap().remove(0);
-        knowledge
-            .upsert_vectors(space.clone(), doc_id, &[chunk_id.as_str()], &[vec])
-            .await
-            .unwrap();
-    }
 
-    let retriever = Retriever::new(&conn, &knowledge, embedder, &WhatlangNormalizer, reranker);
+    let retriever = Retriever::new(
+        &conn,
+        knowledge,
+        embedder,
+        &WhatlangNormalizer,
+        reranker,
+        fixture_config(fixture),
+    );
     let mut bm25_hits = 0usize;
     let mut vec_hits = 0usize;
+    let mut graph_hits = 0usize;
     let mut fused_reciprocal = 0.0f64;
     let mut fused_top5_reciprocal = 0.0f64;
     let mut reranked5_reciprocal = 0.0f64;
@@ -257,6 +315,29 @@ async fn run_eval(
             vec_hits += 1;
         }
 
+        // Graph path raw recall (§14): the query's entities -> their
+        // mentioning chunks. Mirrors the retriever's phrase-window alias pass.
+        let normalized = ohara::text::normalize_surface_form(&q.text);
+        let terms: Vec<&str> = normalized.split_whitespace().collect();
+        let mut entity_ids: Vec<String> = Vec::new();
+        for window in (1..=terms.len()).rev() {
+            for start in 0..=terms.len() - window {
+                entity_ids.extend(
+                    control::lookup_alias_all_types(&conn, &terms[start..start + window].join(" "))
+                        .unwrap(),
+                );
+            }
+        }
+        entity_ids.sort();
+        entity_ids.dedup();
+        if !entity_ids.is_empty() {
+            let ids: Vec<&str> = entity_ids.iter().map(String::as_str).collect();
+            let mentioned = knowledge.chunks_for_entities(&ids).await.unwrap();
+            if mentioned.contains(&q.relevant) {
+                graph_hits += 1;
+            }
+        }
+
         // Fused list via the retriever (identity reranker returns fusion order).
         let fused: Vec<ScoredChunk> = retriever
             .query(&q.text, ohara::pipeline::RETRIEVAL_POOL)
@@ -288,6 +369,7 @@ async fn run_eval(
     Metrics {
         bm25_recall20: f64::from(u32::try_from(bm25_hits).unwrap_or(u32::MAX)) / n,
         vector_recall20: f64::from(u32::try_from(vec_hits).unwrap_or(u32::MAX)) / n,
+        graph_recall20: f64::from(u32::try_from(graph_hits).unwrap_or(u32::MAX)) / n,
         fused_mrr: fused_reciprocal / n,
         fused_top5_mrr: fused_top5_reciprocal / n,
         reranked_top5_mrr: reranked5_reciprocal / n,
@@ -337,10 +419,10 @@ async fn eval_retrieval_baseline_machinery() {
     }
 
     let embedder = FakeEmbedder;
-    let (fixture, queries) = build_corpus(&embedder).await;
+    let (fixture, knowledge, queries) = build_corpus(&embedder).await;
     assert_eq!(queries.len(), 50, "§14: 50-query golden set");
 
-    let metrics = run_eval(&fixture, &embedder, &queries, &IdentityReranker).await;
+    let metrics = run_eval(&fixture, &knowledge, &embedder, &queries, &IdentityReranker).await;
     Metrics::report("machinery")(&metrics);
     assert!(
         metrics.bm25_recall20 >= 0.95,
@@ -349,6 +431,12 @@ async fn eval_retrieval_baseline_machinery() {
     assert!(
         metrics.vector_recall20 >= 0.9,
         "vector machinery floor: {metrics:?}"
+    );
+    // The graph path resolves the topic entity per query and returns all its
+    // mentioning chunks — the relevant one is always among them (§14).
+    assert!(
+        metrics.graph_recall20 >= 0.9,
+        "graph machinery floor: {metrics:?}"
     );
     assert!(metrics.fused_mrr >= 0.7, "fusion floor: {metrics:?}");
 }
@@ -380,8 +468,8 @@ async fn eval_retrieval_baseline_real_models() {
     let embedder = ohara::pipeline::LocalEmbedder::new(&models).unwrap();
     let reranker = ohara::pipeline::LocalReranker::new(&models).unwrap();
 
-    let (fixture, queries) = build_corpus(&embedder).await;
-    let metrics = run_eval(&fixture, &embedder, &queries, &reranker).await;
+    let (fixture, knowledge, queries) = build_corpus(&embedder).await;
+    let metrics = run_eval(&fixture, &knowledge, &embedder, &queries, &reranker).await;
     Metrics::report("real")(&metrics);
     // Floors from the baseline measurement — loosened deliberately; the report
     // line is the working number, these only catch catastrophic regressions.

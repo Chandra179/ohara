@@ -209,6 +209,7 @@ mod tests {
                     extractor: &NeverExtractor,
                     embedder: &NeverEmbedder,
                     knowledge: &NeverKnowledge,
+                    llm: &crate::pipeline::test_support::NeverLlm,
                 };
                 run(&ctx, &run_job)
             }
@@ -270,6 +271,7 @@ mod tests {
                     extractor: &NeverExtractor,
                     embedder: &NeverEmbedder,
                     knowledge: &NeverKnowledge,
+                    llm: &crate::pipeline::test_support::NeverLlm,
                 };
                 run(&ctx, &run_job)
             }
