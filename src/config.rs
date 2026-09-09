@@ -18,6 +18,10 @@ pub(crate) mod defaults {
     pub const BACKOFF_BASE_SECS: u64 = 60;
     /// `stage_events` retention before pruning (§5 note); 0 disables pruning.
     pub const STAGE_EVENTS_RETENTION_DAYS: u64 = 90;
+    /// Raw payload byte budget; omitted by default so pruning is opt-in.
+    pub const RAW_MAX_BYTES: Option<u64> = None;
+    /// Raw payload age budget; omitted by default so pruning is opt-in.
+    pub const RAW_MAX_AGE_DAYS: Option<u64> = None;
     /// Global politeness default: 1 request / 2 s (§8 Stage 1).
     pub const RATE_LIMIT_MS: u64 = 2_000;
     /// The Stage 4 graph path is enabled in the reference profile (§6).
@@ -63,6 +67,12 @@ pub(crate) mod defaults {
     pub const FETCH_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
     /// Maximum redirect hops (§12 SSRF posture).
     pub const FETCH_MAX_REDIRECTS: usize = 5;
+    /// Upper bound for site-configured re-crawl intervals (§7.5).
+    pub const MAX_RECRAWL_SECONDS: u64 = 30 * 24 * 60 * 60;
+    /// Exponential retry exponent cap (§6).
+    pub const RETRY_EXPONENT_CAP: u32 = 16;
+    /// Maximum retry jitter as a percentage of the computed delay (§6).
+    pub const RETRY_JITTER_PERCENT: u64 = 25;
     /// Minimum clean document size (§8 Stage 2 quality gate).
     pub const MIN_WORD_COUNT: i64 = 50;
     /// Embedder-token budget for one chunk (§4).
@@ -121,6 +131,7 @@ pub struct Config {
     lease_ttl: Duration,
     backoff_base: Duration,
     stage_events_retention: Duration,
+    retention: RetentionConfig,
     rate_limit: Duration,
     target_languages: Vec<String>,
     pipeline: PipelineConfig,
@@ -151,6 +162,14 @@ pub struct PipelineConfig {
     entity_candidate_k: usize,
 }
 
+/// Raw payload retention policy (§7.10). Both limits are optional so raw
+/// pruning is explicit and cannot remove payloads under the default config.
+#[derive(Debug, Clone)]
+pub struct RetentionConfig {
+    raw_max_bytes: Option<u64>,
+    raw_max_age_days: Option<u64>,
+}
+
 /// Knowledge-plane namespace pointers (§4): the read switch is atomic, the write
 /// model dual-writes during a migration.
 #[derive(Debug, Clone)]
@@ -176,6 +195,8 @@ pub struct FetcherConfig {
     max_body_bytes: usize,
     /// Maximum redirect hops, each revalidated for SSRF.
     max_redirects: usize,
+    /// Maximum site-configured re-crawl interval.
+    max_recrawl_seconds: u64,
 }
 
 /// LLM endpoint and pinned models (§2, §11.2, §12).
@@ -222,6 +243,7 @@ struct RawConfig {
     lease_secs: Option<u64>,
     backoff_base_secs: Option<u64>,
     stage_events_retention_days: Option<u64>,
+    retention: Option<RawRetention>,
     default_rate_limit_ms: Option<u64>,
     target_languages: Option<Vec<String>>,
     pipeline: Option<RawPipeline>,
@@ -235,6 +257,13 @@ struct RawConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawRetention {
+    raw_max_bytes: Option<u64>,
+    raw_max_age_days: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFetcher {
     robots: Option<bool>,
     timeout_secs: Option<u64>,
@@ -242,6 +271,7 @@ struct RawFetcher {
     allow_private_hosts: Option<bool>,
     max_body_bytes: Option<usize>,
     max_redirects: Option<usize>,
+    max_recrawl_seconds: Option<u64>,
 }
 
 fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
@@ -263,7 +293,23 @@ fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
         max_redirects: raw
             .and_then(|f| f.max_redirects)
             .unwrap_or(defaults::FETCH_MAX_REDIRECTS),
+        max_recrawl_seconds: raw
+            .and_then(|f| f.max_recrawl_seconds)
+            .unwrap_or(defaults::MAX_RECRAWL_SECONDS),
     }
+}
+
+fn build_retention(raw: Option<&RawRetention>) -> Result<RetentionConfig, ConfigError> {
+    let config = RetentionConfig {
+        raw_max_bytes: raw
+            .and_then(|retention| retention.raw_max_bytes)
+            .or(defaults::RAW_MAX_BYTES),
+        raw_max_age_days: raw
+            .and_then(|retention| retention.raw_max_age_days)
+            .or(defaults::RAW_MAX_AGE_DAYS),
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -480,6 +526,7 @@ impl Config {
                 * 24
                 * 3600,
         );
+        let retention = build_retention(raw.retention.as_ref())?;
         let rate_limit =
             Duration::from_millis(raw.default_rate_limit_ms.unwrap_or(defaults::RATE_LIMIT_MS));
 
@@ -502,6 +549,7 @@ impl Config {
             lease_ttl,
             backoff_base,
             stage_events_retention,
+            retention,
             rate_limit,
             target_languages,
             pipeline,
@@ -536,6 +584,7 @@ impl Config {
             "target_languages must not be empty (§8 Stage 2 gate)",
         )?;
         self.pipeline.validate()?;
+        self.retention.validate()?;
         self.fetcher.validate()?;
         self.embedder.validate()?;
         self.knowledge.validate()?;
@@ -578,6 +627,12 @@ impl Config {
     #[must_use]
     pub fn stage_events_retention(&self) -> Duration {
         self.stage_events_retention
+    }
+
+    /// Raw payload retention policy (§7.10).
+    #[must_use]
+    pub fn retention(&self) -> &RetentionConfig {
+        &self.retention
     }
 
     /// Global politeness floor between requests to one host (§8 Stage 1).
@@ -635,6 +690,30 @@ impl Config {
     }
 }
 
+impl RetentionConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(bytes) = self.raw_max_bytes {
+            check(bytes > 0, "retention.raw_max_bytes must be > 0")?;
+        }
+        if let Some(days) = self.raw_max_age_days {
+            check(days > 0, "retention.raw_max_age_days must be > 0")?;
+        }
+        Ok(())
+    }
+
+    /// Maximum eligible raw payload bytes; `None` disables the byte limit.
+    #[must_use]
+    pub fn raw_max_bytes(&self) -> Option<u64> {
+        self.raw_max_bytes
+    }
+
+    /// Maximum eligible raw payload age in days; `None` disables the age limit.
+    #[must_use]
+    pub fn raw_max_age_days(&self) -> Option<u64> {
+        self.raw_max_age_days
+    }
+}
+
 impl PipelineConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         check(
@@ -644,7 +723,10 @@ impl PipelineConfig {
         check(
             self.chunk_budget_tokens > 0
                 && self.chunk_budget_tokens <= defaults::CHUNK_BUDGET_TOKENS,
-            "pipeline.chunk_budget_tokens must be in 1..=512 for the pinned embedder",
+            format!(
+                "pipeline.chunk_budget_tokens must be in 1..={} for the pinned embedder",
+                defaults::CHUNK_BUDGET_TOKENS
+            ),
         )?;
         check(
             self.chunk_overlap_percent <= 100,
@@ -707,6 +789,10 @@ impl FetcherConfig {
         )?;
         check(self.max_redirects > 0, "fetcher.max_redirects must be > 0")?;
         check(
+            self.max_recrawl_seconds > 0,
+            "fetcher.max_recrawl_seconds must be > 0",
+        )?;
+        check(
             !self.user_agent.is_empty(),
             "fetcher.user_agent must be non-empty (§8: honest User-Agent)",
         )
@@ -746,6 +832,12 @@ impl FetcherConfig {
     #[must_use]
     pub fn max_redirects(&self) -> usize {
         self.max_redirects
+    }
+
+    /// Maximum site-configured re-crawl interval.
+    #[must_use]
+    pub fn max_recrawl_seconds(&self) -> u64 {
+        self.max_recrawl_seconds
     }
 }
 
@@ -994,6 +1086,8 @@ mod tests {
         assert_eq!(config.pipeline().chunk_overlap_percent(), 12);
         assert_eq!(config.pipeline().max_triplets_per_chunk(), 32);
         assert_eq!(config.pipeline().entity_candidate_k(), 8);
+        assert_eq!(config.retention().raw_max_bytes(), None);
+        assert_eq!(config.retention().raw_max_age_days(), None);
     }
 
     #[test]
@@ -1008,12 +1102,16 @@ mod tests {
         );
         assert_eq!(config.fetcher().max_body_bytes(), 10 * 1024 * 1024);
         assert_eq!(config.fetcher().max_redirects(), 5);
+        assert_eq!(
+            config.fetcher().max_recrawl_seconds(),
+            defaults::MAX_RECRAWL_SECONDS
+        );
     }
 
     #[test]
     fn fetcher_overrides_apply() {
         let config = Config::load_from_str(
-            "[fetcher]\nrobots = false\ntimeout_secs = 5\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\n",
+            "[fetcher]\nrobots = false\ntimeout_secs = 5\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\nmax_recrawl_seconds = 7200\n",
         )
         .expect("valid config");
         assert!(!config.fetcher().robots());
@@ -1021,6 +1119,22 @@ mod tests {
         assert!(config.fetcher().allow_private_hosts());
         assert_eq!(config.fetcher().max_body_bytes(), 2048);
         assert_eq!(config.fetcher().max_redirects(), 2);
+        assert_eq!(config.fetcher().max_recrawl_seconds(), 7200);
+    }
+
+    #[test]
+    fn raw_retention_overrides_apply_and_zero_is_rejected() {
+        let config =
+            Config::load_from_str("[retention]\nraw_max_bytes = 4096\nraw_max_age_days = 30\n")
+                .expect("valid retention policy");
+        assert_eq!(config.retention().raw_max_bytes(), Some(4096));
+        assert_eq!(config.retention().raw_max_age_days(), Some(30));
+
+        let err = Config::load_from_str("[retention]\nraw_max_bytes = 0\n")
+            .expect_err("zero byte budget must fail");
+        assert!(
+            matches!(err, ConfigError::Validation(message) if message.contains("raw_max_bytes"))
+        );
     }
 
     #[test]

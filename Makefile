@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 
 RUSTUP ?= rustup
-TOOLCHAIN ?= 1.98.1
+TOOLCHAIN ?= stable
 TOOLCHAIN_BIN := $(dir $(shell $(RUSTUP) which cargo --toolchain $(TOOLCHAIN) 2>/dev/null))
 HOST_PATH := $(PATH)
 RUST_ENV := env PATH="$(TOOLCHAIN_BIN):$(HOST_PATH)"

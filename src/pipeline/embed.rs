@@ -14,6 +14,7 @@ use crate::knowledge::{KnowledgeError, ModelId, VectorSpace};
 use super::StageError;
 use super::StageOutcome;
 use super::chunk;
+use super::execution::EmbedContext;
 
 /// The embedder port (§9): pinned model identity, order-preserving batch embedding.
 /// Sync by contract — CPU-bound batch; callers invoke it inside `spawn_blocking`
@@ -111,7 +112,7 @@ fn chunk_id(doc_id: &str, seq: usize) -> String {
 ///
 /// # Errors
 /// [`StageError`] classified per §10.
-pub(super) fn run(ctx: &super::StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
+pub(super) fn run(ctx: &EmbedContext<'_>, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
     let now = control::now();
     let attempt = attempt_of(job);
     let doc = control::get(ctx.conn, job.doc_id())?.ok_or_else(|| {
@@ -232,7 +233,7 @@ pub(super) fn run(ctx: &super::StageCtx<'_>, job: &ClaimedJob) -> Result<StageOu
 /// Stage 3's exact-dup skip: repeated boilerplate sections share one inference)
 /// and expanding the batch back out so every chunk id gets its vector.
 fn embed_unique(
-    ctx: &super::StageCtx<'_>,
+    ctx: &EmbedContext<'_>,
     chunks: &[&chunk::Chunk],
     doc_id: &str,
     attempt: u32,
@@ -388,16 +389,13 @@ impl Embedder for LocalEmbedder {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::runtime::Handle;
-
+    use super::super::execution::EmbedContext;
     use super::*;
     use crate::config::Config;
     use crate::control::testing::seed_doc;
     use crate::control::{self, ClaimedJob, ControlDb, Stage};
     use crate::knowledge::KnowledgeStore;
-    use crate::pipeline::test_support::{
-        FakeEmbedder, InMemoryKnowledge, NeverExtractor, NeverFetcher,
-    };
+    use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
 
     const NOW: &str = "2026-09-06 12:00:00";
 
@@ -486,16 +484,13 @@ write_model = \"fake-embedder\"\n",
         let knowledge = Arc::clone(knowledge);
         tokio::task::spawn_blocking(move || {
             let conn = control::connect(&store).unwrap();
-            let handle = Handle::current();
-            let ctx = super::super::StageCtx {
+            let handle = tokio::runtime::Handle::current();
+            let ctx = EmbedContext {
                 config: config.as_ref(),
                 conn: &conn,
                 handle: &handle,
-                fetcher: &NeverFetcher,
-                extractor: &NeverExtractor,
                 embedder: embedder.as_ref(),
                 knowledge: knowledge.as_ref(),
-                llm: &crate::pipeline::test_support::NeverLlm,
             };
             run(&ctx, &job)
         })

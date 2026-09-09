@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use crate::Class;
 use crate::control::{self, ClaimedJob};
-use crate::engine::{FetchError, FetchPolicy, NormalizedUrl};
+use crate::engine::{FetchError, FetchPolicy, FetchValidators, NormalizedUrl};
 
-use super::{StageCtx, StageError, StageOutcome};
+use super::execution::ScrapeContext;
+use super::{StageError, StageOutcome};
 
 /// Runs the stage for one claimed job.
 ///
@@ -17,7 +18,7 @@ use super::{StageCtx, StageError, StageOutcome};
 /// [`StageError`] classified per the §10 mapping: `NotFound` is permanent; every
 /// other fetch failure retries within the attempt budget; store failures are
 /// fatal.
-pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
+pub(super) fn run(ctx: &ScrapeContext<'_>, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
     let doc = control::get(ctx.conn, job.doc_id())?
         .ok_or_else(|| StageError::fatal("claimed job's document row is missing"))?;
     let now = control::now();
@@ -38,11 +39,56 @@ pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, 
         robots: ctx.config.fetcher().robots(),
     };
 
+    let validators = if std::path::Path::new(&doc.raw_file_path).is_file() {
+        FetchValidators {
+            etag: doc.etag.clone(),
+            last_modified: doc.last_modified.clone(),
+        }
+    } else {
+        FetchValidators::default()
+    };
     let fetched = ctx
         .handle
-        .block_on(ctx.fetcher.fetch_with_policy(&url, &policy))
+        .block_on(
+            ctx.fetcher
+                .fetch_with_validators(&url, &policy, &validators),
+        )
         .map_err(|e| map_fetch_error(e, job))?;
 
+    let recrawl_at = site
+        .as_ref()
+        .and_then(|policy| policy.recrawl_seconds)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| {
+            let interval = if fetched.status == 304 {
+                seconds.saturating_mul(2)
+            } else {
+                seconds
+            };
+            control::now_plus(
+                &now,
+                interval.min(ctx.config.fetcher().max_recrawl_seconds()),
+            )
+        })
+        .transpose()?;
+    if fetched.status == 304 {
+        if !std::path::Path::new(&doc.raw_file_path).is_file() {
+            return Err(StageError::Permanent {
+                reason: "server returned 304 but the stored raw payload is missing".to_string(),
+            });
+        }
+        control::update_fetch_result(
+            ctx.conn,
+            job.doc_id(),
+            i64::from(fetched.status),
+            fetched.etag.as_deref(),
+            fetched.last_modified.as_deref(),
+            recrawl_at.as_deref(),
+            &now,
+        )?;
+        return Ok(StageOutcome::Stop);
+    }
     write_gz(&doc.raw_file_path, fetched.html.as_bytes(), attempt_of(job))?;
     control::update_fetch_result(
         ctx.conn,
@@ -50,6 +96,7 @@ pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, 
         i64::from(fetched.status),
         fetched.etag.as_deref(),
         fetched.last_modified.as_deref(),
+        recrawl_at.as_deref(),
         &now,
     )?;
     Ok(StageOutcome::Advance)
@@ -104,13 +151,15 @@ mod tests {
         FetchCapabilities, FetchError, FetchPolicy, FetchedDoc, Fetcher, NormalizedUrl,
     };
 
-    use super::{StageCtx, StageError, StageOutcome, run};
+    use super::super::execution::ScrapeContext;
+    use super::{StageError, StageOutcome, run};
 
     const NOW: &str = "2026-09-06 12:00:00";
 
     /// The fetcher port fake (§14): serves a canned document or a canned error.
     enum Fake {
         Doc(FetchedDoc),
+        NotModified(FetchedDoc),
         NotFound,
     }
 
@@ -133,7 +182,7 @@ mod tests {
             _policy: &FetchPolicy,
         ) -> Result<FetchedDoc, FetchError> {
             match &self.result {
-                Fake::Doc(doc) => Ok(doc.clone()),
+                Fake::Doc(doc) | Fake::NotModified(doc) => Ok(doc.clone()),
                 Fake::NotFound => Err(FetchError::NotFound {
                     url: "https://example.com/a".to_string(),
                 }),
@@ -149,21 +198,6 @@ mod tests {
         )
         .unwrap();
         Arc::new(Config::load(Some(&toml_path)).unwrap())
-    }
-
-    use crate::pipeline::test_support::{NeverEmbedder, NeverKnowledge};
-
-    /// An extractor that must never be called by the scrape stage.
-    struct NeverExtractor;
-
-    impl crate::pipeline::Extractor for NeverExtractor {
-        fn extract(
-            &self,
-            _html: &str,
-            _base: &str,
-        ) -> Result<crate::pipeline::ExtractedArticle, crate::pipeline::ExtractError> {
-            unreachable!("the scrape stage must not extract")
-        }
     }
 
     fn fetched_doc() -> FetchedDoc {
@@ -201,15 +235,11 @@ mod tests {
             let config = Arc::clone(&config);
             move || {
                 let handle = tokio::runtime::Handle::current();
-                let ctx = StageCtx {
+                let ctx = ScrapeContext {
                     config: config.as_ref(),
                     conn: &conn,
                     handle: &handle,
                     fetcher: &fetcher,
-                    extractor: &NeverExtractor,
-                    embedder: &NeverEmbedder,
-                    knowledge: &NeverKnowledge,
-                    llm: &crate::pipeline::test_support::NeverLlm,
                 };
                 run(&ctx, &run_job)
             }
@@ -263,15 +293,11 @@ mod tests {
             let config = Arc::clone(&config);
             move || {
                 let handle = tokio::runtime::Handle::current();
-                let ctx = StageCtx {
+                let ctx = ScrapeContext {
                     config: config.as_ref(),
                     conn: &conn,
                     handle: &handle,
                     fetcher: &fetcher,
-                    extractor: &NeverExtractor,
-                    embedder: &NeverEmbedder,
-                    knowledge: &NeverKnowledge,
-                    llm: &crate::pipeline::test_support::NeverLlm,
                 };
                 run(&ctx, &run_job)
             }
@@ -288,5 +314,53 @@ mod tests {
             control::get(&conn, &doc_id).unwrap().unwrap().status,
             DocStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn not_modified_stops_the_chain_and_schedules_the_next_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fixture_config(dir.path());
+        let store = dir.path().join("store.db");
+        let conn = control::connect(&store).unwrap();
+        let doc_id = seed_doc(&conn, "a");
+        control::set_site_policy(&conn, "example.com", None, Some(3_600), None).unwrap();
+        let raw_path = control::get(&conn, &doc_id).unwrap().unwrap().raw_file_path;
+        let parent = std::path::Path::new(&raw_path).parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&raw_path, b"previous raw payload").unwrap();
+        let mut unchanged = fetched_doc();
+        unchanged.html.clear();
+        unchanged.status = 304;
+        let fetcher = FakeFetcher {
+            result: Fake::NotModified(unchanged),
+        };
+        let job = control::claim_next(&conn, Stage::Scrape, "w1", NOW, 60)
+            .unwrap()
+            .unwrap();
+        let run_job = job.clone();
+
+        let outcome = tokio::task::spawn_blocking({
+            let config = Arc::clone(&config);
+            move || {
+                let handle = tokio::runtime::Handle::current();
+                let ctx = ScrapeContext {
+                    config: config.as_ref(),
+                    conn: &conn,
+                    handle: &handle,
+                    fetcher: &fetcher,
+                };
+                run(&ctx, &run_job)
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let conn = control::connect(&store).unwrap();
+
+        assert_eq!(outcome, StageOutcome::Stop);
+        let doc = control::get(&conn, &doc_id).unwrap().unwrap();
+        assert_eq!(doc.http_status, Some(304));
+        assert!(doc.next_crawl_at.is_some());
+        assert_eq!(doc.status, DocStatus::New);
     }
 }

@@ -5,7 +5,6 @@
 
 #[cfg(feature = "ladybug")]
 mod graph;
-mod reconcile;
 #[cfg(feature = "ladybug")]
 mod vectors;
 

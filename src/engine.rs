@@ -177,6 +177,16 @@ impl Default for FetchPolicy {
     }
 }
 
+/// HTTP validators from the last successful fetch (§7.5). A fetcher applies
+/// these only to the first request; redirect targets are requested normally.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchValidators {
+    /// The server's entity tag, if it supplied one.
+    pub etag: Option<String>,
+    /// The server's last-modified timestamp, if it supplied one.
+    pub last_modified: Option<String>,
+}
+
 /// What was fetched, labeled (§8 Stage 1): the contract is "return what you
 /// fetched, labeled" — `js_executed` tells the pipeline whether rendering
 /// happened, and the pipeline escalates when the label says it didn't.
@@ -283,6 +293,20 @@ pub trait Fetcher: Send + Sync {
         url: &NormalizedUrl,
         policy: &FetchPolicy,
     ) -> Result<FetchedDoc, FetchError>;
+
+    /// Fetches `url` with conditional-request validators (§7.5). Implementations
+    /// that do not support conditional requests may use the default behavior.
+    ///
+    /// # Errors
+    /// [`FetchError`] per the §10 taxonomy and retry classes.
+    async fn fetch_with_validators(
+        &self,
+        url: &NormalizedUrl,
+        policy: &FetchPolicy,
+        _validators: &FetchValidators,
+    ) -> Result<FetchedDoc, FetchError> {
+        self.fetch_with_policy(url, policy).await
+    }
 
     /// Fetches `url` under the default policy ([`FetchPolicy::default`]).
     ///

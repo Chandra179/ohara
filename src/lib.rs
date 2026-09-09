@@ -42,15 +42,24 @@
 //!     "2026-09-06 12:00:00",
 //! )?;
 //!
-//! let job = control::claim_next(&conn, Stage::Scrape, "worker-1", "2026-09-06 12:00:01", 60)?
-//!     .expect("the fresh document's SCRAPE job is claimable");
+//! let Some(job) = control::claim_next(
+//!     &conn,
+//!     Stage::Scrape,
+//!     "worker-1",
+//!     "2026-09-06 12:00:01",
+//!     60,
+//! )? else {
+//!     return Ok(());
+//! };
 //! assert_eq!(job.doc_id(), outcome.doc_id());
 //!
 //! // DONE + milestone (SCRAPED) + the chained CLEAN job: one transaction (§6).
 //! control::complete(&conn, Stage::Scrape, &job, Completion::Chain, "2026-09-06 12:00:02")?;
 //! # Ok(())
 //! # }
-//! # example().unwrap();
+//! # fn main() -> Result<(), ohara::control::DbError> {
+//! #     example()
+//! # }
 //! ```
 
 pub mod config;

@@ -2,10 +2,11 @@
 name = "ohara"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.95.0"
 publish = false
 description = "Embedded, zero-daemon web scrape → clean → chunk/vectorize → graph extraction → GraphRAG pipeline."
 repository = "https://github.com/Chandra179/ohara"
+license = "MIT"
 keywords = ["graphrag", "scraping", "rag", "sqlite", "embeddings"]
 categories = ["database", "text-processing"]
 authors = ["Chandra"]

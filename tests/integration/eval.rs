@@ -629,8 +629,7 @@ async fn assert_delete_preserves_duplicate(
     // or graph mentions.
     knowledge.delete_doc(topic_doc).await.unwrap();
     control::request_deletion(conn, topic_doc, Some("acceptance test")).unwrap();
-    let report = control::reconcile(conn, NOW, std::time::Duration::ZERO).unwrap();
-    assert_eq!(report.deletions_executed, 1);
+    assert!(control::execute_deletion(conn, topic_doc).unwrap());
     let deleted_chunk = topic_chunks
         .iter()
         .next()

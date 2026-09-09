@@ -13,7 +13,7 @@ mod sites;
 pub use db::{ControlDb, DbError, backup_to, connect};
 pub use documents::{
     ChunkSignature, ChunkText, CleanResult, DeletionIntent, Document, EnqueueOutcome, NewChunkRow,
-    NewDocument,
+    NewDocument, RawRetentionCandidate,
 };
 pub use entities::{EntityDetails, EntityMerge, ErReview, NameCandidate, NewTriplet, TripletRow};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
@@ -67,6 +67,15 @@ pub fn get(db: &ControlDb, doc_id: &str) -> Result<Option<Document>, DbError> {
     documents::get(db.raw(), doc_id)
 }
 
+/// Lists documents eligible for the raw retention operator.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn raw_retention_candidates(db: &ControlDb) -> Result<Vec<RawRetentionCandidate>, DbError> {
+    documents::raw_retention_candidates(db.raw())
+}
+
 /// Records a Stage 2 quality rejection.
 ///
 /// # Errors
@@ -88,6 +97,11 @@ pub fn mark_quality_rejected(
 /// Returns [`DbError`] if the control-plane query fails.
 pub fn due_for_recrawl(db: &ControlDb, now_stamp: &str) -> Result<Vec<String>, DbError> {
     documents::due_for_recrawl(db.raw(), now_stamp)
+}
+
+/// Re-queues due SCRAPE jobs while preserving live work.
+pub(crate) fn schedule_due_recrawls(db: &ControlDb, now_stamp: &str) -> Result<usize, DbError> {
+    documents::schedule_due_recrawls(db.raw(), now_stamp)
 }
 
 /// Archives a document while leaving its chunks queryable.
@@ -116,7 +130,7 @@ pub fn pending_deletions(db: &ControlDb) -> Result<Vec<DeletionIntent>, DbError>
     documents::pending_deletions(db.raw())
 }
 
-/// Deletes the SQLite half of a deletion intent.
+/// Deletes the `SQLite` half of a deletion intent.
 ///
 /// # Errors
 ///
@@ -136,6 +150,7 @@ pub fn update_fetch_result(
     http_status: i64,
     etag: Option<&str>,
     last_modified: Option<&str>,
+    next_crawl_at: Option<&str>,
     now_stamp: &str,
 ) -> Result<(), DbError> {
     documents::update_fetch_result(
@@ -144,6 +159,7 @@ pub fn update_fetch_result(
         http_status,
         etag,
         last_modified,
+        next_crawl_at,
         now_stamp,
     )
 }
@@ -362,7 +378,7 @@ pub fn pending_er_reviews(db: &ControlDb) -> Result<Vec<ErReview>, DbError> {
     entities::pending_er_reviews(db.raw())
 }
 
-/// Records the SQLite half of an offline entity merge.
+/// Records the `SQLite` half of an offline entity merge.
 ///
 /// # Errors
 /// Returns [`DbError`] if the entities are invalid or the write fails.
@@ -422,6 +438,17 @@ pub fn complete(
     jobs::complete(db.raw(), stage, job, completion, now_stamp)
 }
 
+/// Completes a claimed job and records its `DONE` audit event atomically.
+pub(crate) fn complete_with_event(
+    db: &ControlDb,
+    stage: Stage,
+    job: &ClaimedJob,
+    completion: Completion,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    jobs::complete_with_event(db.raw(), stage, job, completion, now_stamp, "DONE", None)
+}
+
 /// Retries a job with a backoff deadline.
 ///
 /// # Errors
@@ -437,6 +464,19 @@ pub fn retry(
     jobs::retry(db.raw(), job_id, due, error, now_stamp)
 }
 
+/// Retries a job and records its `RETRY` audit event atomically.
+pub(crate) fn retry_with_event(
+    db: &ControlDb,
+    job_id: &str,
+    doc_id: &str,
+    stage: Stage,
+    due: &str,
+    error: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    jobs::retry_with_event(db.raw(), job_id, doc_id, stage, due, error, now_stamp)
+}
+
 /// Marks a job dead and its document failed.
 ///
 /// # Errors
@@ -450,6 +490,18 @@ pub fn dead(
     now_stamp: &str,
 ) -> Result<(), DbError> {
     jobs::dead(db.raw(), job_id, doc_id, error, now_stamp)
+}
+
+/// Marks a job dead and records its `DEAD` audit event atomically.
+pub(crate) fn dead_with_event(
+    db: &ControlDb,
+    job_id: &str,
+    doc_id: &str,
+    stage: Stage,
+    error: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    jobs::dead_with_event(db.raw(), job_id, doc_id, stage, error, now_stamp)
 }
 
 /// Requeues a document's non-DONE jobs.
@@ -503,23 +555,10 @@ pub fn enqueue(
     jobs::enqueue(db.raw(), job_id, doc_id, stage, priority, params, now_stamp)
 }
 
-/// Runs the boot reconciliation sweep.
-///
-/// # Errors
-///
-/// Returns [`DbError`] if the control-plane sweep fails.
-pub fn reconcile(
-    db: &ControlDb,
-    now_stamp: &str,
-    retention: std::time::Duration,
-) -> Result<ReconcileReport, DbError> {
-    reconcile::reconcile(db.raw(), now_stamp, retention)
-}
-
 /// Prunes retained audit events without executing deletion intents.
 ///
 /// This is crate-visible because the worker must first delete a document from
-/// the knowledge plane before it removes the SQLite row (§7.6).
+/// the knowledge plane before it removes the `SQLite` row (§7.6).
 pub(crate) fn reconcile_retention(
     db: &ControlDb,
     now_stamp: &str,

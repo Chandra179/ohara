@@ -108,6 +108,21 @@ pub fn complete(
     completion: Completion,
     now_stamp: &str,
 ) -> Result<(), DbError> {
+    complete_with_event(conn, stage, job, completion, now_stamp, "DONE", None)
+}
+
+/// Completes a job and appends its audit event in the same `SQLite` transaction.
+/// The worker uses this command so a successful state transition cannot commit
+/// without its corresponding audit row.
+pub(crate) fn complete_with_event(
+    conn: &Connection,
+    stage: Stage,
+    job: &ClaimedJob,
+    completion: Completion,
+    now_stamp: &str,
+    outcome: &str,
+    detail: Option<&str>,
+) -> Result<(), DbError> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE jobs
@@ -136,6 +151,11 @@ pub fn complete(
             ],
         )?;
     }
+    tx.execute(
+        "INSERT INTO stage_events (doc_id, job_id, stage, outcome, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![job.doc_id(), job.job_id(), stage.as_str(), outcome, detail],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -147,6 +167,44 @@ pub fn complete(
 /// # Errors
 /// [`DbError::Sqlite`] on statement failure.
 pub fn retry(
+    conn: &Connection,
+    job_id: &str,
+    due: &str,
+    error: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    retry_without_event(conn, job_id, due, error, now_stamp)
+}
+
+/// Retries a job and appends its audit event atomically.
+pub(crate) fn retry_with_event(
+    conn: &Connection,
+    job_id: &str,
+    doc_id: &str,
+    stage: Stage,
+    due: &str,
+    error: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE jobs
+            SET status = 'PENDING', attempts = attempts + 1, next_attempt_at = ?2,
+                last_error = ?3, lease_owner = NULL, lease_expires_at = NULL,
+                updated_at = ?4
+          WHERE job_id = ?1",
+        rusqlite::params![job_id, due, error, now_stamp],
+    )?;
+    tx.execute(
+        "INSERT INTO stage_events (doc_id, job_id, stage, outcome, detail)
+         VALUES (?1, ?2, ?3, 'RETRY', ?4)",
+        rusqlite::params![doc_id, job_id, stage.as_str(), error],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn retry_without_event(
     conn: &Connection,
     job_id: &str,
     due: &str,
@@ -170,6 +228,48 @@ pub fn retry(
 /// # Errors
 /// [`DbError::Sqlite`] on statement failure.
 pub fn dead(
+    conn: &Connection,
+    job_id: &str,
+    doc_id: &str,
+    error: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    dead_without_event(conn, job_id, doc_id, error, now_stamp)
+}
+
+/// Marks a job dead and appends the terminal audit event atomically.
+pub(crate) fn dead_with_event(
+    conn: &Connection,
+    job_id: &str,
+    doc_id: &str,
+    stage: Stage,
+    error: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE jobs
+            SET status = 'DEAD', last_error = ?2, lease_owner = NULL,
+                lease_expires_at = NULL, updated_at = ?3
+          WHERE job_id = ?1",
+        rusqlite::params![job_id, error, now_stamp],
+    )?;
+    tx.execute(
+        "UPDATE documents
+            SET status = 'FAILED', error = ?2, last_processed_at = ?3
+          WHERE doc_id = ?1",
+        rusqlite::params![doc_id, error, now_stamp],
+    )?;
+    tx.execute(
+        "INSERT INTO stage_events (doc_id, job_id, stage, outcome, detail)
+         VALUES (?1, ?2, ?3, 'DEAD', ?4)",
+        rusqlite::params![doc_id, job_id, stage.as_str(), error],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn dead_without_event(
     conn: &Connection,
     job_id: &str,
     doc_id: &str,
@@ -237,7 +337,7 @@ pub fn record_event(
 }
 
 /// Reads the retained audit trail for one document in insertion order (§13).
-/// The query stays in the control plane so callers never receive a SQLite
+/// The query stays in the control plane so callers never receive a `SQLite`
 /// connection or vendor row type.
 ///
 /// # Errors
@@ -355,6 +455,17 @@ mod tests {
         assert_eq!(
             priority, 5,
             "chained jobs inherit the completing job's priority"
+        );
+        let done_events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM stage_events WHERE job_id = ?1 AND outcome = 'DONE'",
+                [job.job_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            done_events, 1,
+            "state transition and audit row share one tx"
         );
     }
 

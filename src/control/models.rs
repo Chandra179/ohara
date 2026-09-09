@@ -2,6 +2,9 @@
 //! knowledge (stage order, milestones). The facade re-exports the public ones;
 //! fields stay `pub(crate)` — construction goes through `control` functions (§6).
 
+/// Priority used when a legacy document has no SCRAPE job row to inherit from.
+pub(crate) const DEFAULT_JOB_PRIORITY: i64 = 5;
+
 /// Pipeline stages — one job row per `(doc_id, stage)` (§6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Stage {
@@ -140,7 +143,7 @@ impl std::str::FromStr for DocStatus {
 /// One immutable audit record from `stage_events` (§5, §13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageEvent {
-    /// SQLite event id, ordered by insertion.
+    /// `SQLite` event id, ordered by insertion.
     pub event_id: i64,
     /// The document involved, when the event belongs to a document.
     pub doc_id: Option<String>,
@@ -153,7 +156,7 @@ pub struct StageEvent {
     pub outcome: String,
     /// Error chain or decision detail, when recorded.
     pub detail: Option<String>,
-    /// UTC timestamp in SQLite's native format (§5).
+    /// UTC timestamp in `SQLite`'s native format (§5).
     pub ts: String,
 }
 

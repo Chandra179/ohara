@@ -351,19 +351,21 @@ fn pack(
             continue;
         }
         if current_tokens + piece_tokens > budget && !current.is_empty() {
-            flush_window(&mut windows, &mut current, &mut current_tokens, header_path);
             // Overlap: carry the tail of the previous window (§8, 10–15%).
             let mut carried = 0usize;
             let mut overlap: Vec<String> = Vec::new();
             for prev in current.iter().rev() {
                 let t = tokens(prev);
-                if carried + t > overlap_budget {
+                if carried + t > overlap_budget
+                    || carried.saturating_add(t).saturating_add(piece_tokens) > budget
+                {
                     break;
                 }
                 carried += t;
                 overlap.push(prev.clone());
             }
             overlap.reverse();
+            flush_window(&mut windows, &mut current, &mut current_tokens, header_path);
             current = overlap;
             current_tokens = carried;
         }
@@ -457,8 +459,10 @@ mod tests {
 
     #[test]
     fn over_budget_section_recursively_splits_with_overlap() {
-        let para = |n: usize| format!("sentence {n} with some words to fill budget. ");
-        let md: String = std::iter::repeat_n(para(1), 40).collect();
+        let md: String = (0..40)
+            .map(|n| format!("sentence {n} contains distinct context words."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let chunks = chunk_document(&md, "T", 60, 12, &words);
         assert!(chunks.len() > 1, "expected multiple windows");
         // Budget respected on every chunk
@@ -470,9 +474,9 @@ mod tests {
         let first_tail = chunks[0]
             .text
             .rsplit_once('\n')
-            .map_or(&*chunks[0].text, |(_, t)| t);
+            .map_or_else(|| chunks[0].text.as_str(), |(_, tail)| tail.trim());
         assert!(
-            second.contains(first_tail),
+            second.starts_with(first_tail),
             "no overlap: {first_tail:?} vs {second:?}"
         );
     }

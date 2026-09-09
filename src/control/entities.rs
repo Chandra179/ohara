@@ -348,7 +348,7 @@ pub fn pending_er_reviews(conn: &Connection) -> Result<Vec<ErReview>, DbError> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Records the SQLite half of an offline entity merge.
+/// Records the `SQLite` half of an offline entity merge.
 ///
 /// Aliases are remapped before the audit row is inserted. If the winner already
 /// owns one of the loser's aliases, the loser mapping is discarded instead of

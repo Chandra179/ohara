@@ -84,7 +84,7 @@ pub enum DbError {
 
 /// Opaque control-plane database handle.
 ///
-/// SQLite stays an implementation detail of the control plane: callers use the
+/// `SQLite` stays an implementation detail of the control plane: callers use the
 /// domain operations re-exported from [`crate::control`] instead of receiving a
 /// vendor connection they can query directly.
 pub struct ControlDb {
@@ -98,7 +98,7 @@ impl std::fmt::Debug for ControlDb {
 }
 
 impl ControlDb {
-    /// Borrows the SQLite connection for control-plane implementation code.
+    /// Borrows the `SQLite` connection for control-plane implementation code.
     pub(crate) fn raw(&self) -> &Connection {
         &self.connection
     }
@@ -123,7 +123,7 @@ pub fn connect(path: &Path) -> Result<ControlDb, DbError> {
     Ok(ControlDb { connection: conn })
 }
 
-/// Captures a consistent SQLite snapshot into a new file.
+/// Captures a consistent `SQLite` snapshot into a new file.
 ///
 /// The caller must already have quiesced the worker and acquired the runtime
 /// lock. The checkpoint removes the WAL before `VACUUM INTO` writes the

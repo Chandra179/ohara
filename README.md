@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, vectorization, graph extraction, three-path retrieval baseline, `ohara query`, staged `ohara backup`, document lifecycle commands, and offline ER merge executor are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis, pruning, and metrics are tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, and raw retention pruning are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis and metrics remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -42,10 +42,11 @@ Every third-party engine sits behind a small trait so it can be swapped without 
 
 ## Building
 
-Rust 1.98.1 (edition 2024), selected by [`rust-toolchain.toml`](rust-toolchain.toml). Install it with `rustup`:
+Rust 1.95.0 (edition 2024), selected through the installed stable toolchain in
+[`rust-toolchain.toml`](rust-toolchain.toml). Verify it with `rustup`:
 
 ```text
-rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+rustup show active-toolchain
 ```
 
 Then use the repository commands:
@@ -103,6 +104,19 @@ The command replays recorded folds for crash recovery, then processes pending
 entity, then stable id, on ties), remaps typed aliases, records the
 `entity_merges` audit row, and folds the Ladybug graph node.
 
+Prune raw payloads while preserving SQLite metadata, clean text, vectors,
+graph data, and citations:
+
+```text
+make run ARGS='prune --dry-run'
+make run ARGS='prune'
+```
+
+Configure `[retention] raw_max_bytes` and/or `raw_max_age_days` to select the
+retention policy. Both knobs are disabled unless configured; `--dry-run` shows
+the selection without deleting files. Pruning requires the same runtime lock
+as the worker and other operator commands.
+
 Two native prerequisites are also required:
 
 - **OpenSSL development libraries** — the `lbug` crate's bundled engine links
@@ -126,7 +140,7 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── ARCHITECTURE.md        # system design (v2.6) — the source of truth
+│   ├── ARCHITECTURE.md        # system design (v2.7) — the source of truth
 │   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
@@ -138,13 +152,13 @@ ohara/
     ├── main.rs                # binary crate root — thin shell: parse args → library entry point
     ├── lib.rs                 # library crate root — declares the module tree
     ├── config.rs              # settings load + validation into an immutable struct
-    ├── control.rs             # CONTROL PLANE facade (SQLite) + SQLite reconciliation helpers
+    ├── control.rs             # CONTROL PLANE facade (SQLite)
     ├── control/
     │   ├── db.rs              #   connections, WAL pragmas, migrations, the one now()
     │   ├── documents.rs       #   document registry, lifecycle state, deletion intents
     │   ├── entities.rs        #   Stage 4 registry: triplets, entities/aliases, ER review + merge audit
     │   ├── jobs.rs            #   job queue: lease claim, stage chaining, requeue
-    │   ├── reconcile.rs       #   §7.3 sweep: interrupted deletions, audit retention
+    │   ├── reconcile.rs       #   §7.3 audit-retention portion of the boot sweep
     │   └── models.rs          #   row types + the §6 state machine's shape knowledge
     ├── engine.rs              # ENGINE PLANE facade — pub trait Fetcher (the port)
     ├── engine/
@@ -154,12 +168,13 @@ ohara/
     ├── knowledge/
     │   ├── vectors.rs         #   LadybugStore: vector collections (FLOAT[n] node tables,
     │   │                      #   exact in-engine cosine KNN), delete sweep, graph schema
-    │   ├── graph.rs           #   openCypher: entity upserts, :MENTIONS edges, the §7.8
-    │   │                      #   fold (one transaction), hop-wise fact traversals
-    │   └── reconcile.rs       #   knowledge-plane replay posture; worker owns the
-    │                          #   knowledge-first deletion ordering (§7.3)
-    ├── pipeline.rs            # worker loop: claim/dispatch/retry/audit + cross-store boot reconciliation
+    │   └── graph.rs           #   openCypher: entity upserts, :MENTIONS edges, the §7.8
+    │                          #   fold (one transaction), hop-wise fact traversals
+    ├── pipeline.rs            # scheduler: claims jobs and delegates lifecycle work to pipeline modules
     ├── pipeline/
+    │   ├── execution.rs      # stage dispatch, panic isolation, classification, and atomic audit transitions
+    │   ├── runtime.rs         # default provider assembly and shared boot-time compatibility checks
+    │   ├── recovery.rs        # cross-store deletion-intent replay and audit-retention ordering
     │   ├── scrape.rs          # Stage 1
     │   ├── clean.rs           # Stage 2 — declares the Extractor port
     │   ├── chunk.rs           # Stage 3a: pure §8 chunker — header-aware split, atomic
@@ -167,12 +182,16 @@ ohara/
     │   ├── embed.rs           # Stage 3b: pub trait Embedder (incl. tokenizer counting) +
     │   │                      #   LocalEmbedder (fastembed bge-small-en-v1.5) + the stage body
     │   │                      #   with the §7 replay/repair and delete-first protocol
-    │   ├── extract.rs         # Stage 4: LLM triplets → §8 matrix validation → entity
-    │   │                      #   resolution → :MENTIONS links + fact-edge aggregation
+    │   ├── extract.rs         # Stage 4 orchestration: triplets → entity resolution → graph
+    │   │                      #   links + fact-edge aggregation
+    │   ├── extraction_contract.rs # Stage 4 prompt/schema/parser/ontology contract
+    │   ├── query.rs           # operator retrieval startup and query error boundary
     │   └── retrieve.rs        # Stage 5: three-path retrieval + rerank + QueryNormalizer port
     ├── llm.rs                 # pub trait Llm + the local Ollama provider (structured
                                #   outputs, usage counters, boot health check)
-    ├── ops.rs                 # operator coordination: lock, backups, lifecycle + ER merge
+    ├── ops.rs                 # operator facade: lock, backups, lifecycle, and pruning
+    │   ├── entity_merge.rs    # offline ER merge orchestration
+    │   └── prune.rs           # raw-retention selection and safe unlinking
     └── text.rs                # pure text functions: language ID, normalization, tokenizer, unicode
 ```
 
@@ -182,8 +201,8 @@ ohara/
 - **`config.rs`** — Loads and validates every knob (paths, embedder model + version, per-domain rate limits, LLM keys) into an immutable struct at boot: fail fast at startup, never mid-stage.
 - **`control/` — the control plane.** Owns *all* SQLite access: documents, the job queue, and the audit trail. The queue lives inside the SQLite module because claiming a job must be an atomic SQL statement against a single-writer WAL database. One directory owns the schema; schema changes touch one place.
 - **`engine/` — the fetch engine.** The current implementation gets raw HTML through the plain HTTP leg and exposes capabilities honestly. Future impersonation and Obscura implementations must stay behind the same `Fetcher` port; downstream stages test against a canned fetcher and never require network access.
-- **`knowledge/` — the knowledge plane.** Owns *all* LadybugDB access (vectors + graph) plus the knowledge-side reconciliation posture in `reconcile.rs`. Because SQLite and LadybugDB cannot share a transaction, the worker in `pipeline.rs` owns the cross-store boot ordering while each plane keeps its datastore-specific operations testable.
-- **`pipeline.rs` + `pipeline/` — orchestration and stages.** The worker loop claims jobs, performs the knowledge-first boot reconciliation protocol, and dispatches stages; each stage is one file and one state-machine transition, so a change to chunking never touches graph extraction and every status is greppable. Stages take their dependencies as traits, which makes them unit-testable in isolation.
+- **`knowledge/` — the knowledge plane.** Owns *all* LadybugDB access (vectors + graph). Because SQLite and LadybugDB cannot share a transaction, `pipeline/recovery.rs` owns the cross-store boot ordering while each plane keeps its datastore-specific operations testable.
+- **`pipeline.rs` + `pipeline/` — orchestration and stages.** The scheduler claims jobs and `pipeline/execution.rs` centralizes dispatch, panic isolation, retry/dead-letter classification, and atomic audit transitions. Stage-specific context types expose only the ports each stage can use. `pipeline/runtime.rs` assembles default providers, `pipeline/recovery.rs` orders cross-store repair, and `pipeline/extraction_contract.rs` isolates Stage 4's provider-facing contract from graph side effects. Query startup lives in `pipeline/query.rs`; stages take their dependencies as traits, which makes them unit-testable in isolation.
 - **`llm.rs`** — The single LLM port: provider impls, retry/backoff, token/cost counters, prompt templates. Three stages call LLMs; without one port, cost accounting and the data-governance decision (what content leaves the machine) scatter everywhere.
 - **`text.rs`** — Pure functions (zero I/O, no async) shared by three stages: the cheapest code to test exhaustively, and it keeps algorithms out of orchestration files.
 
@@ -202,7 +221,7 @@ ohara/
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
-7. Stabilization: retrieval evaluation and the operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations, `ohara backup` creates consistent snapshots, `requeue`/`archive`/`delete` manage document lifecycle, and `er merge` closes the offline merge queue; pruning and metrics remain
+7. Stabilization: retrieval evaluation and the operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations, `ohara backup` creates consistent snapshots, `requeue`/`archive`/`delete` manage document lifecycle, `er merge` closes the offline merge queue, and `prune` enforces raw retention; metrics remain
 8. Obscura leg + full fetch ladder, LLM synthesis, and cost dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

@@ -14,6 +14,7 @@ USAGE:
     ohara requeue --doc <id> [--config <path.toml>]
     ohara archive <id> [--config <path.toml>]
     ohara delete <id> [--config <path.toml>]
+    ohara prune [--dry-run] [--config <path.toml>]
     ohara er merge [--config <path.toml>]
 
 OPTIONS:
@@ -24,6 +25,8 @@ OPTIONS:
     requeue --doc <id> Reset failed or interrupted jobs for a document
     archive <id>       Retain a document's chunks but stop future work
     delete <id>        Request knowledge-first document deletion
+    prune              Apply configured raw-payload retention policy
+    --dry-run          Show prune selection without deleting files
     er merge           Execute pending offline entity merges
     -h, --help         print this help";
 
@@ -52,6 +55,10 @@ enum CliCommand {
     Delete {
         config_path: Option<PathBuf>,
         doc_id: String,
+    },
+    Prune {
+        config_path: Option<PathBuf>,
+        dry_run: bool,
     },
     EntityMerge {
         config_path: Option<PathBuf>,
@@ -128,6 +135,10 @@ fn main() -> ExitCode {
             config_path,
             doc_id,
         } => delete_and_print(config_path.as_deref(), &doc_id),
+        CliCommand::Prune {
+            config_path,
+            dry_run,
+        } => prune_and_print(config_path.as_deref(), dry_run),
         CliCommand::EntityMerge { config_path } => runtime.block_on(merge_and_print(config_path)),
     };
 
@@ -148,6 +159,7 @@ enum CliMode {
     Query,
     Backup,
     Lifecycle(LifecycleAction),
+    Prune,
     EntityMerge,
 }
 
@@ -159,6 +171,7 @@ struct CliParser {
     backup_destination: Option<String>,
     lifecycle_doc: Option<String>,
     top_k: Option<usize>,
+    dry_run: bool,
     entity_group: bool,
 }
 
@@ -198,8 +211,10 @@ impl CliParser {
             "requeue" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Requeue))?,
             "archive" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Archive))?,
             "delete" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Delete))?,
+            "prune" => self.select_mode(CliMode::Prune)?,
             "er" => self.select_entity_group()?,
             "merge" => self.select_entity_merge()?,
+            "--dry-run" => self.parse_dry_run()?,
             value => self.parse_value(value)?,
         }
         Ok(())
@@ -249,6 +264,21 @@ impl CliParser {
         self.set_lifecycle_doc(doc_id)
     }
 
+    fn parse_dry_run(&mut self) -> Result<(), CliError> {
+        if self.mode != Some(CliMode::Prune) {
+            return Err(CliError::Argument(
+                "--dry-run is only valid with prune".to_string(),
+            ));
+        }
+        if self.dry_run {
+            return Err(CliError::Argument(
+                "prune accepts --dry-run at most once".to_string(),
+            ));
+        }
+        self.dry_run = true;
+        Ok(())
+    }
+
     fn parse_value(&mut self, value: &str) -> Result<(), CliError> {
         match self.mode {
             Some(CliMode::Query) => {
@@ -278,6 +308,11 @@ impl CliParser {
                     )));
                 }
                 self.set_lifecycle_doc(value.to_string())?;
+            }
+            Some(CliMode::Prune) => {
+                return Err(CliError::Argument(
+                    "prune does not accept positional arguments".to_string(),
+                ));
             }
             Some(CliMode::EntityMerge) => {
                 return Err(CliError::Argument(
@@ -313,6 +348,7 @@ impl CliParser {
             Some(CliMode::Query) => self.finish_query(),
             Some(CliMode::Backup) => self.finish_backup(),
             Some(CliMode::Lifecycle(action)) => self.finish_lifecycle(action),
+            Some(CliMode::Prune) => self.finish_prune(),
             Some(CliMode::EntityMerge) => self.finish_entity_merge(),
             None if self.entity_group => Err(CliError::Argument(
                 "expected `merge` after `er`".to_string(),
@@ -371,6 +407,19 @@ impl CliParser {
             },
         };
         Ok(Some(command))
+    }
+
+    fn finish_prune(self) -> Result<Option<CliCommand>, CliError> {
+        reject_top_k(self.top_k)?;
+        if self.lifecycle_doc.is_some() || self.backup_destination.is_some() {
+            return Err(CliError::Argument(
+                "prune does not accept a document id or destination".to_string(),
+            ));
+        }
+        Ok(Some(CliCommand::Prune {
+            config_path: self.config_path,
+            dry_run: self.dry_run,
+        }))
     }
 
     fn finish_entity_merge(self) -> Result<Option<CliCommand>, CliError> {
@@ -473,6 +522,34 @@ fn delete_and_print(config_path: Option<&Path>, doc_id: &str) -> Result<(), CliE
     let config = ohara::config::Config::load(config_path)?;
     let report = ohara::ops::delete_document(&config, doc_id)?;
     println!("deletion requested for {}", report.doc_id);
+    Ok(())
+}
+
+fn prune_and_print(config_path: Option<&Path>, dry_run: bool) -> Result<(), CliError> {
+    let config = ohara::config::Config::load(config_path)?;
+    let report = ohara::ops::prune(&config, dry_run)?;
+    let action = if report.dry_run {
+        "would prune"
+    } else {
+        "pruned"
+    };
+    let files = if report.dry_run {
+        report.selected
+    } else {
+        report.deleted
+    };
+    let bytes = if report.dry_run {
+        report.planned_bytes
+    } else {
+        report.reclaimed_bytes
+    };
+    println!(
+        "{action} {files} file(s), {bytes} byte(s); skipped {} live document(s) and {} missing payload(s)",
+        report.skipped_active, report.missing
+    );
+    if !report.policy_active {
+        println!("no raw retention limits configured; nothing selected");
+    }
     Ok(())
 }
 
@@ -591,6 +668,31 @@ mod tests {
             })
         );
         assert!(parse_args(["requeue"].into_iter().map(str::to_string)).is_err());
+    }
+
+    #[test]
+    fn parses_prune_and_dry_run() {
+        assert_eq!(
+            parse_args(
+                ["prune", "--dry-run", "--config", "x.toml"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap(),
+            Some(CliCommand::Prune {
+                config_path: Some(PathBuf::from("x.toml")),
+                dry_run: true,
+            })
+        );
+        assert!(parse_args(["--dry-run"].into_iter().map(str::to_string)).is_err());
+        assert!(
+            parse_args(
+                ["prune", "--dry-run", "--dry-run"]
+                    .into_iter()
+                    .map(str::to_string)
+            )
+            .is_err()
+        );
     }
 
     #[test]

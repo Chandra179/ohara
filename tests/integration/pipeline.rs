@@ -554,8 +554,8 @@ async fn retry_then_dead_letter_requeues_and_recovers() {
 }
 
 /// A restart acceptance case for the cross-store deletion protocol (§7.6): the
-/// SQLite intent survives the first process, and the next worker removes the
-/// `LadybugDB` index before completing the SQLite cascade.
+/// `SQLite` intent survives the first process, and the next worker removes the
+/// `LadybugDB` index before completing the `SQLite` cascade.
 #[tokio::test]
 async fn worker_restart_reconciles_deletion_across_stores() {
     let dir = tempfile::tempdir().unwrap();

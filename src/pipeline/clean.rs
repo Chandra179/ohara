@@ -7,7 +7,8 @@ use unicode_normalization::UnicodeNormalization;
 use crate::Class;
 use crate::control::{self, ClaimedJob, ControlDb};
 
-use super::{StageCtx, StageError, StageOutcome};
+use super::execution::CleanContext;
+use super::{StageError, StageOutcome};
 
 /// Extracted article (§8 Stage 2): boilerplate removed, structure preserved.
 #[derive(Debug, Clone)]
@@ -140,7 +141,7 @@ impl Extractor for ReadabilityExtractor {
 /// # Errors
 /// [`StageError::Transient`] for local I/O and extractor failures;
 /// [`StageError::Fatal`] for store failures (§10).
-pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
+pub(super) fn run(ctx: &CleanContext<'_>, job: &ClaimedJob) -> Result<StageOutcome, StageError> {
     let doc = control::get(ctx.conn, job.doc_id())?
         .ok_or_else(|| StageError::fatal("claimed job's document row is missing"))?;
     let now = control::now();
@@ -370,7 +371,6 @@ mod tests {
     use crate::config::Config;
     use crate::control::testing::{boot, seed_doc};
     use crate::control::{ClaimedJob, Completion, ControlDb, DocStatus, Stage};
-    use crate::engine::{FetchError, FetchedDoc, NormalizedUrl};
 
     const NOW: &str = "2026-09-06 12:00:00";
 
@@ -422,35 +422,11 @@ tables, indices, triggers, and views lives inside one portable file.";
         config: &'a Arc<Config>,
         conn: &'a ControlDb,
         extractor: &'a dyn Extractor,
-        handle: &'a tokio::runtime::Handle,
-    ) -> StageCtx<'a> {
-        StageCtx {
+    ) -> CleanContext<'a> {
+        CleanContext {
             config,
             conn,
-            handle,
-            fetcher: &NeverFetcher,
             extractor,
-            embedder: &crate::pipeline::test_support::NeverEmbedder,
-            knowledge: &crate::pipeline::test_support::NeverKnowledge,
-            llm: &crate::pipeline::test_support::NeverLlm,
-        }
-    }
-
-    /// A fetcher that is never called by the clean stage.
-    struct NeverFetcher;
-
-    #[async_trait::async_trait]
-    impl crate::engine::Fetcher for NeverFetcher {
-        fn capabilities(&self) -> crate::engine::FetchCapabilities {
-            unreachable!("the clean stage must not fetch")
-        }
-
-        async fn fetch_with_policy(
-            &self,
-            _url: &NormalizedUrl,
-            _policy: &crate::engine::FetchPolicy,
-        ) -> Result<FetchedDoc, FetchError> {
-            unreachable!("the clean stage must not fetch")
         }
     }
 
@@ -481,8 +457,7 @@ tables, indices, triggers, and views lives inside one portable file.";
                 markdown: ARTICLE.to_string(),
             },
         };
-        let handle = tokio::runtime::Handle::current();
-        let ctx = ctx_with(&config, &conn, &extractor, &handle);
+        let ctx = ctx_with(&config, &conn, &extractor);
         let job = claimed(&conn, &doc_id, Stage::Clean);
 
         let outcome = run(&ctx, &job).unwrap();
@@ -526,8 +501,7 @@ tables, indices, triggers, and views lives inside one portable file.";
                 markdown: "too short".to_string(),
             },
         };
-        let handle = tokio::runtime::Handle::current();
-        let ctx = ctx_with(&config, &conn, &extractor, &handle);
+        let ctx = ctx_with(&config, &conn, &extractor);
         let job = claimed(&conn, &doc_id, Stage::Clean);
 
         let outcome = run(&ctx, &job).unwrap();
@@ -583,8 +557,7 @@ tables, indices, triggers, and views lives inside one portable file.";
                 markdown: french.repeat(3),
             },
         };
-        let handle = tokio::runtime::Handle::current();
-        let ctx = ctx_with(&config, &conn, &extractor, &handle);
+        let ctx = ctx_with(&config, &conn, &extractor);
         let job = claimed(&conn, &doc_id, Stage::Clean);
 
         let outcome = run(&ctx, &job).unwrap();
@@ -623,8 +596,7 @@ tables, indices, triggers, and views lives inside one portable file.";
                 markdown: ARTICLE.to_string(),
             },
         };
-        let handle = tokio::runtime::Handle::current();
-        let ctx = ctx_with(&config, &conn, &extractor, &handle);
+        let ctx = ctx_with(&config, &conn, &extractor);
         let job = claimed(&conn, &duplicate, Stage::Clean);
         assert_eq!(job.doc_id(), duplicate);
 

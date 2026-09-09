@@ -5,18 +5,22 @@
 mod chunk;
 mod clean;
 mod embed;
+mod execution;
 mod extract;
+mod extraction_contract;
+mod query;
+mod recovery;
 mod retrieve;
+mod runtime;
 mod scrape;
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::Class;
 use crate::config::Config;
-use crate::control::{self, ClaimedJob, Completion, ControlDb, DbError, Stage};
+use crate::control::{self, ControlDb, DbError, Stage};
 use crate::engine::Fetcher;
-use crate::knowledge::{KnowledgeStore, ModelId};
+use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
 
 pub use crate::engine::HttpFetcher;
@@ -27,41 +31,13 @@ pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, Readabi
 #[cfg(feature = "onnx-embedder")]
 pub use embed::LocalEmbedder;
 pub use embed::{EmbedError, Embedder};
+pub use query::{QueryError, query};
 #[cfg(feature = "onnx-embedder")]
 pub use retrieve::LocalReranker;
 pub use retrieve::{
     IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer, RerankError, Reranker,
     RetrieveError, Retriever, ScoredChunk, WhatlangNormalizer, fts_match_expression,
 };
-
-/// Operator query failures. Provider construction failures are reported as boot
-/// errors so the CLI and the worker share the same startup diagnostics.
-#[derive(Debug, thiserror::Error)]
-pub enum QueryError {
-    /// The query must contain at least one non-whitespace character.
-    #[error("query must not be empty")]
-    Empty,
-    /// A zero result limit cannot produce a useful operator response.
-    #[error("query top_k must be greater than zero")]
-    InvalidTopK,
-    /// The requested result count exceeds the configured candidate pool.
-    #[error("query top_k {requested} exceeds retrieval.pool {pool}")]
-    TopKExceedsPool {
-        /// Requested result count.
-        requested: usize,
-        /// Configured retrieval candidate pool.
-        pool: usize,
-    },
-    /// The configured data or database parent directory could not be created.
-    #[error("query startup I/O: {0}")]
-    Io(#[from] std::io::Error),
-    /// A configured provider or store could not be opened.
-    #[error("query startup: {0}")]
-    Boot(#[from] crate::BootError),
-    /// The retrieval paths failed after startup.
-    #[error("query retrieval: {0}")]
-    Retrieve(#[from] RetrieveError),
-}
 
 /// What a stage body reports on success (§10: domain outcomes are values, not
 /// errors — they never route through [`StageError`]).
@@ -156,144 +132,16 @@ impl From<DbError> for StageError {
     }
 }
 
-/// What a stage needs for one claimed job (§1.3): validated config, the store
-/// connection (held by the tick), the async runtime handle for port calls, and
-/// the ports themselves — fakes substitute cleanly in tests (§14).
-pub(crate) struct StageCtx<'a> {
-    pub(crate) config: &'a Config,
-    pub(crate) conn: &'a ControlDb,
-    /// Handle for `block_on`-ing async port calls from the blocking thread.
-    pub(crate) handle: &'a tokio::runtime::Handle,
-    pub(crate) fetcher: &'a dyn Fetcher,
-    pub(crate) extractor: &'a dyn Extractor,
-    pub(crate) embedder: &'a dyn Embedder,
-    pub(crate) knowledge: &'a dyn KnowledgeStore,
-    pub(crate) llm: &'a dyn Llm,
-}
-
-/// What the loop does after one claimed job's outcome is recorded.
-enum Flow {
-    /// Keep scheduling.
-    Continue,
-    /// A `Fatal` classification (§6): stop scheduling, drain, reconcile at next boot.
-    Abort(Box<StageError>),
-}
-
 /// The worker: owns the control database, the validated configuration, and the
 /// ports. The database sits behind a [`Mutex`] because the embedded control
-/// implementation serializes SQLite writes internally.
+/// implementation serializes `SQLite` writes internally.
 pub struct Worker {
     config: Arc<Config>,
     conn: Mutex<ControlDb>,
     handle: tokio::runtime::Handle,
-    fetcher: Arc<dyn Fetcher>,
-    extractor: Arc<dyn Extractor>,
-    embedder: Arc<dyn Embedder>,
-    knowledge: Arc<dyn KnowledgeStore>,
-    llm: Arc<dyn Llm>,
+    ports: runtime::WorkerPorts,
     id: String,
     _runtime_lock: crate::ops::RuntimeLock,
-}
-
-/// The default [`Embedder`]: the pinned local ONNX model (§4). Requires the
-/// `onnx-embedder` feature — without it, inject a provider via
-/// [`Worker::with_ports`] (§9 provider swap).
-#[cfg(feature = "onnx-embedder")]
-fn default_embedder(config: &Config) -> Result<Arc<dyn Embedder>, crate::BootError> {
-    Ok(Arc::new(LocalEmbedder::new(
-        &config.data_dir().join("models"),
-    )?))
-}
-
-/// The default [`KnowledgeStore`]: the embedded `LadybugDB` engine (§3). Requires
-/// the `ladybug` feature — without it, inject an alternative backend via
-/// [`Worker::with_ports`] (§9 swap candidates).
-#[cfg(feature = "ladybug")]
-fn default_knowledge(config: &Config) -> Result<Arc<dyn KnowledgeStore>, crate::BootError> {
-    std::fs::create_dir_all(config.data_dir()).map_err(|e| {
-        crate::BootError::Worker(format!(
-            "cannot create data dir {}: {e}",
-            config.data_dir().display()
-        ))
-    })?;
-    Ok(Arc::new(LadybugStore::open(
-        &config.data_dir().join("ladybug"),
-        config.embedder().dim(),
-    )?))
-}
-
-#[cfg(not(feature = "onnx-embedder"))]
-fn default_embedder(_config: &Config) -> Result<Arc<dyn Embedder>, crate::BootError> {
-    Err(crate::BootError::Worker(
-        "ohara was built without the `onnx-embedder` feature; provide an Embedder via Worker::with_ports (§9 provider swap)".to_string(),
-    ))
-}
-
-#[cfg(not(feature = "ladybug"))]
-fn default_knowledge(_config: &Config) -> Result<Arc<dyn KnowledgeStore>, crate::BootError> {
-    Err(crate::BootError::Worker(
-        "ohara was built without the `ladybug` feature; provide a KnowledgeStore via Worker::with_ports (§9 swap candidates)".to_string(),
-    ))
-}
-
-/// Validates the model contract shared by the configured namespace and
-/// embedder (§4). The current runtime has one embedder and one vector write
-/// target; dual-write model migration remains a future feature.
-fn validate_embedder(config: &Config, embedder: &dyn Embedder) -> Result<(), crate::BootError> {
-    if embedder.model_id() != config.embedder().model_id() {
-        return Err(crate::BootError::Worker(format!(
-            "embedder model {:?} does not match configured embedder.model_id {:?}",
-            embedder.model_id(),
-            config.embedder().model_id()
-        )));
-    }
-    if embedder.dim() != config.embedder().dim() {
-        return Err(crate::BootError::Worker(format!(
-            "embedder dimension {} does not match configured embedder.dim {}",
-            embedder.dim(),
-            config.embedder().dim()
-        )));
-    }
-    if config.pipeline().chunk_budget_tokens() > embedder.max_input_tokens() {
-        return Err(crate::BootError::Worker(format!(
-            "pipeline chunk budget {} exceeds embedder max input tokens {}",
-            config.pipeline().chunk_budget_tokens(),
-            embedder.max_input_tokens()
-        )));
-    }
-    if embedder.model_id() != config.knowledge().write_model() {
-        return Err(crate::BootError::Worker(format!(
-            "embedder model {:?} does not match knowledge.write_model {:?}",
-            embedder.model_id(),
-            config.knowledge().write_model()
-        )));
-    }
-    Ok(())
-}
-
-/// The default [`Llm`]: the local Ollama provider (§2, §11.2), health-checked at
-/// boot (§2 fail-fast) when the graph is enabled — without the graph, no stage
-/// ever reaches the LLM, so deployments without a running Ollama stay bootable.
-fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, crate::BootError> {
-    if !config.pipeline().graph_enabled() {
-        return Ok(Arc::new(crate::llm::NoLlm));
-    }
-    let ollama = crate::llm::Ollama::new(
-        config.llm().base_url().clone(),
-        config.llm().health_timeout(),
-    )?;
-    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-        crate::BootError::Worker(
-            "ohara must run inside a tokio runtime to health-check the LLM endpoint".to_string(),
-        )
-    })?;
-    handle.block_on(ollama.verify_endpoint())?;
-    Ok(Arc::new(ollama))
-}
-
-fn runtime_lock(config: &Config) -> Result<crate::ops::RuntimeLock, crate::BootError> {
-    crate::ops::RuntimeLock::acquire(config.data_dir())
-        .map_err(|error| crate::BootError::Worker(error.to_string()))
 }
 
 impl Worker {
@@ -306,29 +154,9 @@ impl Worker {
     /// [`crate::BootError`] if the store cannot be opened/migrated, the runtime
     /// handle is unavailable, or any default port cannot be built.
     pub fn new(config: Arc<Config>) -> Result<Self, crate::BootError> {
-        let runtime_lock = runtime_lock(&config)?;
-        let fetcher = Arc::new(HttpFetcher::new(crate::engine::HttpFetcherParams {
-            user_agent: config.fetcher().user_agent().to_string(),
-            timeout: config.fetcher().timeout(),
-            rate_limit: config.rate_limit(),
-            allow_private_hosts: config.fetcher().allow_private_hosts(),
-            max_body_bytes: config.fetcher().max_body_bytes(),
-            max_redirects: config.fetcher().max_redirects(),
-        })?);
-        let extractor = Arc::new(ReadabilityExtractor);
-        let embedder = default_embedder(&config)?;
-        validate_embedder(&config, embedder.as_ref())?;
-        let knowledge = default_knowledge(&config)?;
-        let llm = default_llm(&config)?;
-        Self::with_ports_locked(
-            config,
-            fetcher,
-            extractor,
-            embedder,
-            knowledge,
-            llm,
-            runtime_lock,
-        )
+        let runtime_lock = runtime::acquire_lock(&config)?;
+        let ports = runtime::worker_ports(&config)?;
+        Self::with_ports_locked(config, ports, runtime_lock)
     }
 
     /// Boots a worker with explicit ports (§14 integration: canned fetcher, fake
@@ -347,28 +175,23 @@ impl Worker {
         knowledge: Arc<dyn KnowledgeStore>,
         llm: Arc<dyn Llm>,
     ) -> Result<Self, crate::BootError> {
-        let runtime_lock = runtime_lock(&config)?;
-        Self::with_ports_locked(
-            config,
+        let runtime_lock = runtime::acquire_lock(&config)?;
+        let ports = runtime::WorkerPorts {
             fetcher,
             extractor,
             embedder,
             knowledge,
             llm,
-            runtime_lock,
-        )
+        };
+        Self::with_ports_locked(config, ports, runtime_lock)
     }
 
     fn with_ports_locked(
         config: Arc<Config>,
-        fetcher: Arc<dyn Fetcher>,
-        extractor: Arc<dyn Extractor>,
-        embedder: Arc<dyn Embedder>,
-        knowledge: Arc<dyn KnowledgeStore>,
-        llm: Arc<dyn Llm>,
+        ports: runtime::WorkerPorts,
         runtime_lock: crate::ops::RuntimeLock,
     ) -> Result<Self, crate::BootError> {
-        validate_embedder(&config, embedder.as_ref())?;
+        runtime::validate_embedder(&config, ports.embedder.as_ref())?;
         let id = format!("worker-{}", std::process::id());
         let conn = control::connect(config.db_path())?;
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
@@ -378,11 +201,7 @@ impl Worker {
             config,
             conn: Mutex::new(conn),
             handle,
-            fetcher,
-            extractor,
-            embedder,
-            knowledge,
-            llm,
+            ports,
             id,
             _runtime_lock: runtime_lock,
         })
@@ -399,38 +218,20 @@ impl Worker {
 
     /// Runs the full §7.3 boot reconciliation sweep before the loop claims
     /// anything: interrupted §7.6 deletions are removed from `LadybugDB` first,
-    /// then from SQLite, and the §5 audit trail is pruned to retention. Expired
+    /// then from `SQLite`, and the §5 audit trail is pruned to retention. Expired
     /// leases are deliberately not swept — the §6 claim reclaims them with the
     /// correct accounting.
     ///
     /// # Errors
     /// [`crate::BootError`] on control- or knowledge-plane failure.
     pub async fn reconcile(&self) -> Result<control::ReconcileReport, crate::BootError> {
-        let now = control::now();
-        let intents = {
-            let conn = self.conn();
-            control::pending_deletions(&conn)?
-        };
-        let mut deletions_executed = 0;
-        for intent in intents {
-            // §7.6 intent-before-write: the intent survives a failure here, so
-            // the next boot can safely retry the knowledge cleanup.
-            self.knowledge.delete_doc(&intent.doc_id).await?;
-            let deleted = {
-                let conn = self.conn();
-                control::execute_deletion(&conn, &intent.doc_id)?
-            };
-            if deleted {
-                deletions_executed += 1;
-            }
-        }
-
-        let mut report = {
-            let conn = self.conn();
-            control::reconcile_retention(&conn, &now, self.config.stage_events_retention())?
-        };
-        report.deletions_executed = deletions_executed;
-        Ok(report)
+        recovery::Reconciler::new(
+            &self.conn,
+            self.ports.knowledge.as_ref(),
+            self.config.stage_events_retention(),
+        )
+        .run()
+        .await
     }
 
     /// One scheduling step: claim the next runnable job in pipeline order,
@@ -440,10 +241,11 @@ impl Worker {
     ///
     /// # Errors
     /// [`DbError`] on store failure; a `Fatal` stage error aborts scheduling (§6)
-    /// and is returned as the tick's [`Flow`].
-    fn tick(&self) -> Result<(usize, Flow), DbError> {
+    /// and is returned as the tick's internal execution flow.
+    fn tick(&self) -> Result<(usize, execution::Flow), DbError> {
         let conn = self.conn();
         let now = control::now();
+        control::schedule_due_recrawls(&conn, &now)?;
         for stage in Stage::ALL {
             let Some(job) = control::claim_next(
                 &conn,
@@ -455,10 +257,12 @@ impl Worker {
             else {
                 continue;
             };
-            let flow = self.execute(&conn, stage, &job)?;
+            let executor =
+                execution::StageExecutor::new(&self.config, &conn, &self.handle, &self.ports);
+            let flow = executor.execute(stage, &job)?;
             return Ok((1, flow));
         }
-        Ok((0, Flow::Continue))
+        Ok((0, execution::Flow::Continue))
     }
 
     /// Advances the loop by one claim → execute → record step (§6). Public for
@@ -470,224 +274,10 @@ impl Worker {
     /// failure.
     pub fn tick_once(&self) -> Result<usize, crate::BootError> {
         match self.tick().map_err(crate::BootError::Control)? {
-            (_, Flow::Abort(err)) => Err(crate::BootError::Fatal(err)),
-            (executed, Flow::Continue) => Ok(executed),
+            (_, execution::Flow::Abort(err)) => Err(crate::BootError::Fatal(err)),
+            (executed, execution::Flow::Continue) => Ok(executed),
         }
     }
-
-    /// Executes one claimed job and records the outcome (§6, §10). Panics are
-    /// caught: the `PANIC` audit row is written and the job is left `RUNNING` —
-    /// its lease expiry makes it reclaimable, punishing the run exactly once (§6).
-    ///
-    /// # Errors
-    /// [`DbError`] on store failure (transitions and audit writes).
-    fn execute(&self, conn: &ControlDb, stage: Stage, job: &ClaimedJob) -> Result<Flow, DbError> {
-        let now = control::now();
-        let ctx = StageCtx {
-            config: &self.config,
-            conn,
-            handle: &self.handle,
-            fetcher: self.fetcher.as_ref(),
-            extractor: self.extractor.as_ref(),
-            embedder: self.embedder.as_ref(),
-            knowledge: self.knowledge.as_ref(),
-            llm: self.llm.as_ref(),
-        };
-        let outcome = catch_unwind(AssertUnwindSafe(|| dispatch(stage, &ctx, job)));
-        match outcome {
-            Ok(Ok(outcome)) => {
-                // §6 stage chaining: milestone + successor job in one transaction,
-                // decided here (the worker owns config and the stage's outcome).
-                let completion = match (outcome, stage) {
-                    (StageOutcome::Stop, _) => Completion::Done,
-                    (StageOutcome::Advance, Stage::Vectorize)
-                        if !self.config.pipeline().graph_enabled() =>
-                    {
-                        Completion::Milestone
-                    }
-                    (StageOutcome::Advance, _) => Completion::Chain,
-                };
-                control::complete(conn, stage, job, completion, &now)?;
-                control::record_event(
-                    conn,
-                    Some(job.doc_id()),
-                    Some(job.job_id()),
-                    Some(stage.as_str()),
-                    "DONE",
-                    None,
-                )?;
-                Ok(Flow::Continue)
-            }
-            Ok(Err(err)) => match &err {
-                StageError::Transient { .. } => {
-                    let attempts_after = job.attempts() + 1;
-                    if attempts_after >= job.max_attempts() {
-                        Self::dead(conn, job, stage, &err.to_string(), &now)?;
-                    } else {
-                        let due = control::now_plus(&now, self.backoff_secs(attempts_after))?;
-                        control::retry(conn, job.job_id(), &due, &err.to_string(), &now)?;
-                        control::record_event(
-                            conn,
-                            Some(job.doc_id()),
-                            Some(job.job_id()),
-                            Some(stage.as_str()),
-                            "RETRY",
-                            Some(&err.to_string()),
-                        )?;
-                    }
-                    Ok(Flow::Continue)
-                }
-                StageError::Permanent { .. } => {
-                    Self::dead(conn, job, stage, &err.to_string(), &now)?;
-                    Ok(Flow::Continue)
-                }
-                StageError::Fatal { .. } => {
-                    control::record_event(
-                        conn,
-                        Some(job.doc_id()),
-                        Some(job.job_id()),
-                        Some(stage.as_str()),
-                        "FATAL",
-                        Some(&err.to_string()),
-                    )?;
-                    Ok(Flow::Abort(Box::new(err)))
-                }
-            },
-            Err(panic) => {
-                // §10 worker isolation: record and continue; no transition — the
-                // expired lease reclaims the job with `last_error = 'lease expired'`.
-                let detail = panic_detail(&panic);
-                control::record_event(
-                    conn,
-                    Some(job.doc_id()),
-                    Some(job.job_id()),
-                    Some(stage.as_str()),
-                    "PANIC",
-                    Some(&detail),
-                )?;
-                Ok(Flow::Continue)
-            }
-        }
-    }
-
-    /// Records the §6 terminal mapping: job `DEAD`, document `FAILED`.
-    fn dead(
-        conn: &ControlDb,
-        job: &ClaimedJob,
-        stage: Stage,
-        error: &str,
-        now: &str,
-    ) -> Result<(), DbError> {
-        control::dead(conn, job.job_id(), job.doc_id(), error, now)?;
-        control::record_event(
-            conn,
-            Some(job.doc_id()),
-            Some(job.job_id()),
-            Some(stage.as_str()),
-            "DEAD",
-            Some(error),
-        )
-    }
-
-    /// Jittered exponential backoff (§6): `base · 2^(attempts−1)`, jittered up to
-    /// +25% from the clock's sub-second nanos.
-    fn backoff_secs(&self, attempts_after: i64) -> u64 {
-        let base = self.config.backoff_base().as_secs();
-        let exp = u32::try_from(attempts_after.saturating_sub(1))
-            .unwrap_or(16)
-            .min(16);
-        let secs = base.saturating_mul(1 << exp);
-        let jitter_salt = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |t| u64::from(t.subsec_nanos()));
-        secs.saturating_add(jitter_salt % (secs / 4 + 1))
-    }
-}
-
-/// Dispatches one claimed job to its stage. Stage bodies take their dependencies
-/// through [`StageCtx`] (§1.3) — the ports are trait objects, so fakes substitute
-/// cleanly in tests (§14).
-fn dispatch(
-    stage: Stage,
-    ctx: &StageCtx<'_>,
-    job: &ClaimedJob,
-) -> Result<StageOutcome, StageError> {
-    match stage {
-        Stage::Scrape => scrape::run(ctx, job),
-        Stage::Clean => clean::run(ctx, job),
-        Stage::Vectorize => embed::run(ctx, job),
-        Stage::Extract => extract::run(ctx, job),
-    }
-}
-
-/// Best-effort panic payload extraction (§10: panics bypass normal audit — record
-/// what we can).
-fn panic_detail(panic: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = panic.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = panic.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
-}
-
-/// Runs the operator retrieval path with the configured local providers.
-///
-/// This is intentionally separate from [`run`]: querying does not boot the
-/// worker, claim jobs, or health-check the extraction LLM. The retrieval engine
-/// still uses the same control and knowledge stores and the same validated
-/// `[retrieval]` configuration as the worker.
-///
-/// # Errors
-/// [`QueryError::Empty`], [`QueryError::InvalidTopK`], or
-/// [`QueryError::TopKExceedsPool`] for invalid input;
-/// [`QueryError::Boot`] when a configured store/provider cannot be opened;
-/// [`QueryError::Retrieve`] when a retrieval path fails.
-pub async fn query(
-    config: Config,
-    query_text: &str,
-    top_k: usize,
-) -> Result<Vec<ScoredChunk>, QueryError> {
-    if query_text.trim().is_empty() {
-        return Err(QueryError::Empty);
-    }
-    if top_k == 0 {
-        return Err(QueryError::InvalidTopK);
-    }
-
-    let config = Arc::new(config);
-    if top_k > config.retrieval().pool() {
-        return Err(QueryError::TopKExceedsPool {
-            requested: top_k,
-            pool: config.retrieval().pool(),
-        });
-    }
-    std::fs::create_dir_all(config.data_dir())?;
-    if let Some(parent) = config.db_path().parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let embedder = default_embedder(&config)?;
-    validate_embedder(&config, embedder.as_ref())?;
-    let knowledge = default_knowledge(&config)?;
-    let conn = control::connect(config.db_path()).map_err(crate::BootError::from)?;
-    let normalizer = WhatlangNormalizer::new(config.retrieval().detection_confidence_floor());
-    let reranker = IdentityReranker;
-    let retriever = Retriever::new(
-        &conn,
-        knowledge.as_ref(),
-        embedder.as_ref(),
-        &normalizer,
-        &reranker,
-        ModelId::new(config.knowledge().read_model()),
-        config.retrieval().clone(),
-    );
-
-    retriever
-        .query(query_text, top_k)
-        .await
-        .map_err(QueryError::Retrieve)
 }
 
 /// In-crate test fakes for the pipeline ports (§14: fakes live next to the
@@ -741,157 +331,6 @@ pub(crate) mod test_support {
         ChunkFilter, EntityRecord, Fact, KnowledgeError, KnowledgeStore, Predicate, ScoredHit,
         VectorSpace,
     };
-
-    /// An extractor no stage under test may call.
-    pub struct NeverExtractor;
-
-    impl crate::pipeline::Extractor for NeverExtractor {
-        fn extract(
-            &self,
-            _html: &str,
-            _base: &str,
-        ) -> Result<crate::pipeline::ExtractedArticle, crate::pipeline::ExtractError> {
-            panic!("stage must not extract")
-        }
-    }
-
-    /// A fetcher no stage under test may call.
-    pub struct NeverFetcher;
-
-    #[async_trait::async_trait]
-    impl crate::engine::Fetcher for NeverFetcher {
-        fn capabilities(&self) -> crate::engine::FetchCapabilities {
-            panic!("stage must not fetch")
-        }
-
-        async fn fetch_with_policy(
-            &self,
-            _url: &crate::engine::NormalizedUrl,
-            _policy: &crate::engine::FetchPolicy,
-        ) -> Result<crate::engine::FetchedDoc, crate::engine::FetchError> {
-            panic!("stage must not fetch")
-        }
-    }
-
-    /// An embedder no stage under test may call.
-    pub struct NeverEmbedder;
-
-    impl crate::pipeline::Embedder for NeverEmbedder {
-        fn model_id(&self) -> &str {
-            panic!("stage must not embed")
-        }
-
-        fn dim(&self) -> usize {
-            panic!("stage must not embed")
-        }
-
-        fn max_input_tokens(&self) -> usize {
-            panic!("stage must not embed")
-        }
-
-        fn count_tokens(&self, _text: &str) -> usize {
-            panic!("stage must not count tokens")
-        }
-
-        fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, crate::pipeline::EmbedError> {
-            panic!("stage must not embed")
-        }
-    }
-
-    /// An LLM no stage under test may call.
-    pub struct NeverLlm;
-
-    #[async_trait::async_trait]
-    impl crate::llm::Llm for NeverLlm {
-        async fn complete(
-            &self,
-            _req: crate::llm::CompletionRequest,
-        ) -> Result<crate::llm::CompletionResponse, crate::llm::LlmError> {
-            panic!("stage must not call the LLM")
-        }
-
-        fn usage(&self) -> crate::llm::LlmUsage {
-            panic!("stage must not call the LLM")
-        }
-    }
-
-    /// A knowledge store no stage under test may call.
-    pub struct NeverKnowledge;
-
-    #[async_trait::async_trait]
-    impl KnowledgeStore for NeverKnowledge {
-        fn capabilities(&self) -> crate::knowledge::KsCapabilities {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn upsert_vectors(
-            &self,
-            _space: VectorSpace,
-            _doc_id: &str,
-            _ids: &[&str],
-            _vectors: &[Vec<f32>],
-        ) -> Result<(), KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn knn(
-            &self,
-            _space: VectorSpace,
-            _q: &[f32],
-            _k: usize,
-            _f: &ChunkFilter,
-        ) -> Result<Vec<ScoredHit>, KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn has_vector(&self, _space: VectorSpace, _id: &str) -> Result<bool, KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn upsert_entity(&self, _e: &EntityRecord) -> Result<(), KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn link_mention(
-            &self,
-            _chunk_id: &str,
-            _entity_id: &str,
-        ) -> Result<(), KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn fold_entity(&self, _loser: &str, _winner: &str) -> Result<(), KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn merge_fact(
-            &self,
-            _subject_id: &str,
-            _predicate: crate::knowledge::Predicate,
-            _object_id: &str,
-            _evidence_chunk: &str,
-            _properties: Option<&serde_json::Value>,
-            _caps: crate::knowledge::FactCaps,
-        ) -> Result<(), KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn delete_doc(&self, _doc_id: &str) -> Result<(), KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn chunks_for_entities(&self, _ids: &[&str]) -> Result<Vec<String>, KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-
-        async fn facts_within_hops(
-            &self,
-            _ids: &[&str],
-            _hops: u8,
-        ) -> Result<Vec<Fact>, KnowledgeError> {
-            panic!("stage must not touch the knowledge plane")
-        }
-    }
 
     /// Deterministic embedder fake (§14): whitespace token counting +2 for
     /// specials, vectors derived from a word hash — chunks sharing vocabulary
@@ -1104,7 +543,63 @@ pub(crate) mod test_support {
             Ok(())
         }
 
-        async fn fold_entity(&self, _loser: &str, _winner: &str) -> Result<(), KnowledgeError> {
+        async fn fold_entity(&self, loser: &str, winner: &str) -> Result<(), KnowledgeError> {
+            if loser == winner {
+                return Ok(());
+            }
+
+            self.entities.lock().unwrap().remove(loser);
+
+            let mut mentions = self.mentions.lock().unwrap();
+            let rewired: Vec<(String, String)> = mentions
+                .iter()
+                .filter(|(_, entity)| entity == loser)
+                .map(|(chunk, _)| (chunk.clone(), winner.to_string()))
+                .collect();
+            mentions.retain(|(_, entity)| entity != loser);
+            mentions.extend(rewired);
+            drop(mentions);
+
+            let mut facts = self.facts.lock().unwrap();
+            let existing = std::mem::take(&mut *facts);
+            for (_, (subject, predicate, object, support, evidence, occurrences)) in existing {
+                let subject = if subject == loser {
+                    winner.to_string()
+                } else {
+                    subject
+                };
+                let object = if object == loser {
+                    winner.to_string()
+                } else {
+                    object
+                };
+                let key = (
+                    subject.clone(),
+                    predicate.as_str().to_string(),
+                    object.clone(),
+                );
+                let entry = facts.entry(key).or_insert_with(|| {
+                    (
+                        subject.clone(),
+                        predicate,
+                        object.clone(),
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                });
+                entry.3 = entry.3.saturating_add(support);
+                for item in evidence {
+                    if !entry.4.iter().any(|existing| existing == &item) {
+                        entry.4.push(item);
+                    }
+                }
+                for item in occurrences {
+                    if !entry.5.iter().any(|existing| existing == &item) {
+                        entry.5.push(item);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -1165,7 +660,18 @@ pub(crate) mod test_support {
         }
 
         async fn delete_doc(&self, doc_id: &str) -> Result<(), KnowledgeError> {
-            self.vectors.lock().unwrap().retain(|_, (d, _)| d != doc_id);
+            let mut deleted_chunks = std::collections::HashSet::new();
+            self.vectors.lock().unwrap().retain(|(space, id), (d, _)| {
+                let keep = d != doc_id;
+                if !keep && space.starts_with("Chunks") {
+                    deleted_chunks.insert(id.clone());
+                }
+                keep
+            });
+            self.mentions
+                .lock()
+                .unwrap()
+                .retain(|(chunk, _)| !deleted_chunks.contains(chunk));
             Ok(())
         }
 

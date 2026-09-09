@@ -27,14 +27,17 @@ The following safeguards are implemented and covered before feature expansion:
   records an idempotent knowledge-first deletion intent.
 - `ohara er merge` replays recorded Ladybug folds, resolves pending review
   candidates by mention degree/age, remaps aliases, and records `entity_merges`.
+- Worker execution, provider assembly, extraction validation, and cross-store
+  recovery each have a focused module; the knowledge-port contract suite covers
+  vectors, graph links, folds, traversal, and deletion semantics.
+- Site policies now drive conditional re-crawls: due SCRAPE jobs are re-queued,
+  validators produce HTTP 304 outcomes, and adaptive intervals are capped by
+  fetcher configuration.
 
-## Next priority — operator slice
+## Next priority — metrics
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
-
-Next implementation priority is raw retention pruning (`ohara prune`) with a
-knowledge-first deletion policy and acceptance coverage.
 
 ## Embedding migration
 
@@ -67,10 +70,9 @@ outputs, usage counters, boot health check). Remaining:
 ## Ops tooling & CLI (§15 step 8)
 The query, backup, document lifecycle, and ER merge commands are implemented;
 these operator commands are missing:
-- `ohara prune` (raw retention budget, §7.9)
 - Cost / metrics dashboards (§13)
 
-Implementation order for this section: prune, then metrics.
+`ohara prune` is implemented. The next operator slice is metrics.
 Query/citations, backup/restore snapshot safety, document lifecycle, and ER
 merge are landed.
 

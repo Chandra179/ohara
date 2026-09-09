@@ -9,7 +9,7 @@ use crate::knowledge::{EntityRecord, Fact, FactCaps, KnowledgeError, Predicate};
 use lbug::Value;
 
 use super::vectors::{LadybugStore, schema};
-use schema::{backend, cypher_id_list, cypher_str, int_at, string_at};
+use schema::{backend, cypher_id_list, cypher_str, int_at, optional_string_at, string_at};
 
 pub(super) fn upsert_entity(store: &LadybugStore, e: &EntityRecord) -> Result<(), KnowledgeError> {
     let conn = store.conn()?;
@@ -84,7 +84,7 @@ pub(super) fn link_mention(
         )
         .map_err(|e| backend(&e))?
         .next()
-        .map_or(0, |row| int_at(&row, 0));
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
     if n == 0 {
         conn.query(&format!(
             "CREATE (c:Chunk {{chunk_id: {}, doc_id: ''}})",
@@ -110,7 +110,7 @@ pub(super) fn link_mention(
         )
         .map_err(|e| backend(&e))?
         .next()
-        .map_or(0, |row| int_at(&row, 0));
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
     if existing == 0 {
         conn.query(&format!(
             "MATCH (c:Chunk {{chunk_id: {}}}), (e:Entity {{entity_id: {}}}) \
@@ -133,7 +133,7 @@ fn ensure_entity_node(conn: &lbug::Connection<'_>, entity_id: &str) -> Result<()
         .execute(&mut find, vec![("id", Value::String(entity_id.into()))])
         .map_err(|e| backend(&e))?
         .next()
-        .map_or(0, |row| int_at(&row, 0));
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
     if n == 0 {
         conn.query(&format!(
             "CREATE (e:Entity {{entity_id: {}, canonical_name: '', entity_type: 'CONCEPT', subtype: ''}})",
@@ -152,43 +152,294 @@ pub(super) fn fold_entity(
     loser: &str,
     winner: &str,
 ) -> Result<(), KnowledgeError> {
+    if loser == winner {
+        return Ok(());
+    }
     let conn = store.conn()?;
+    let loser_exists = entity_exists(&conn, loser)?;
+    if !loser_exists {
+        return Ok(());
+    }
+    if !entity_exists(&conn, winner)? {
+        return Err(KnowledgeError::Backend(format!(
+            "fold_entity: winner {winner} does not exist"
+        )));
+    }
+
     let loser_lit = cypher_str(loser);
-    let winner_lit = cypher_str(winner);
     conn.query("BEGIN TRANSACTION").map_err(|e| backend(&e))?;
-    let steps = [
-        // MENTIONS (Chunk→Entity): one step — the loser is always the target.
-        format!(
-            "MATCH (src:Chunk)-[m:MENTIONS]->(loser:Entity {{entity_id: {loser_lit}}}) \
-             MATCH (winner:Entity {{entity_id: {winner_lit}}}) \
-             CREATE (src)-[:MENTIONS {{support: m.support, properties: m.properties}}]->(winner)"
-        ),
-        // FACT: loser as subject.
-        format!(
-            "MATCH (loser:Entity {{entity_id: {loser_lit}}})-[f:FACT]->(obj:Entity) \
-             MATCH (winner:Entity {{entity_id: {winner_lit}}}) \
-             CREATE (winner)-[:FACT {{predicate: f.predicate, support: f.support, properties: f.properties}}]->(obj)"
-        ),
-        // FACT: loser as object.
-        format!(
-            "MATCH (subj:Entity)-[f:FACT]->(loser:Entity {{entity_id: {loser_lit}}}) \
-             MATCH (winner:Entity {{entity_id: {winner_lit}}}) \
-             CREATE (subj)-[:FACT {{predicate: f.predicate, support: f.support, properties: f.properties}}]->(winner)"
-        ),
+    let result: Result<(), KnowledgeError> = (|| {
+        let mentions = read_mentions(&conn, loser)?;
+        let facts = read_fact_transfers(&conn, loser, winner)?;
+        for mention in &mentions {
+            rewire_mention(&conn, mention, winner)?;
+        }
+        for fact in &facts {
+            rewire_fact(&conn, fact)?;
+        }
+
         // Directed deletes both ways — the binder refuses undirected rel deletes.
-        format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})-[m:MENTIONS]->() DELETE m"),
-        format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})<-[m:MENTIONS]-() DELETE m"),
-        format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})-[f:FACT]->() DELETE f"),
-        format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})<-[f:FACT]-() DELETE f"),
-        format!("MATCH (loser:Entity {{entity_id: {loser_lit}}}) DELETE loser"),
-    ];
-    for step in &steps {
-        if let Err(e) = conn.query(step) {
-            let _ = conn.query("ROLLBACK");
-            return Err(backend(&e));
+        let steps = [
+            format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})-[m:MENTIONS]->() DELETE m"),
+            format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})<-[m:MENTIONS]-() DELETE m"),
+            format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})-[f:FACT]->() DELETE f"),
+            format!("MATCH (loser:Entity {{entity_id: {loser_lit}}})<-[f:FACT]-() DELETE f"),
+            format!("MATCH (loser:Entity {{entity_id: {loser_lit}}}) DELETE loser"),
+        ];
+        for step in &steps {
+            conn.query(step).map_err(|e| backend(&e))?;
+        }
+        Ok(())
+    })();
+    if result.is_ok() {
+        conn.query("COMMIT").map_err(|e| backend(&e))?;
+        Ok(())
+    } else {
+        let _ = conn.query("ROLLBACK");
+        result
+    }
+}
+
+#[derive(Debug)]
+struct MentionTransfer {
+    chunk_id: String,
+    support: i64,
+    properties: Option<String>,
+}
+
+#[derive(Debug)]
+struct FactTransfer {
+    subject_id: String,
+    predicate: String,
+    object_id: String,
+    support: i64,
+    properties: Option<String>,
+}
+
+fn entity_exists(conn: &lbug::Connection<'_>, entity_id: &str) -> Result<bool, KnowledgeError> {
+    let mut find = conn
+        .prepare("MATCH (e:Entity {entity_id: $id}) RETURN count(e)")
+        .map_err(|e| backend(&e))?;
+    let count = conn
+        .execute(&mut find, vec![("id", Value::String(entity_id.into()))])
+        .map_err(|e| backend(&e))?
+        .next()
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
+    Ok(count > 0)
+}
+
+fn read_mentions(
+    conn: &lbug::Connection<'_>,
+    loser: &str,
+) -> Result<Vec<MentionTransfer>, KnowledgeError> {
+    let rows = conn
+        .query(&format!(
+            "MATCH (src:Chunk)-[m:MENTIONS]->(loser:Entity {{entity_id: {}}}) \
+             RETURN src.chunk_id, m.support, m.properties",
+            cypher_str(loser)
+        ))
+        .map_err(|e| backend(&e))?;
+    rows.map(|row| {
+        Ok(MentionTransfer {
+            chunk_id: string_at(&row, 0)?,
+            support: int_at(&row, 1)?,
+            properties: optional_string_at(&row, 2)?,
+        })
+    })
+    .collect()
+}
+
+fn read_fact_transfers(
+    conn: &lbug::Connection<'_>,
+    loser: &str,
+    winner: &str,
+) -> Result<Vec<FactTransfer>, KnowledgeError> {
+    let mut transfers = std::collections::HashMap::<(String, String, String), FactTransfer>::new();
+    for (query, loser_is_subject) in [
+        (
+            format!(
+                "MATCH (loser:Entity {{entity_id: {}}})-[f:FACT]->(other:Entity) \
+                 RETURN other.entity_id, f.predicate, f.support, f.properties",
+                cypher_str(loser)
+            ),
+            true,
+        ),
+        (
+            format!(
+                "MATCH (other:Entity)-[f:FACT]->(loser:Entity {{entity_id: {}}}) \
+                 RETURN other.entity_id, f.predicate, f.support, f.properties",
+                cypher_str(loser)
+            ),
+            false,
+        ),
+    ] {
+        let rows = conn.query(&query).map_err(|e| backend(&e))?;
+        for row in rows {
+            let other = string_at(&row, 0)?;
+            let predicate = string_at(&row, 1)?;
+            let support = int_at(&row, 2)?;
+            let properties = optional_string_at(&row, 3)?;
+            let (subject_id, object_id) = if loser_is_subject {
+                (winner.to_string(), other)
+            } else {
+                (other, winner.to_string())
+            };
+            let key = (subject_id.clone(), predicate.clone(), object_id.clone());
+            if let Some(existing) = transfers.get_mut(&key) {
+                existing.support = existing.support.saturating_add(support);
+                existing.properties = Some(merge_edge_properties(
+                    existing.properties.as_deref(),
+                    properties.as_deref(),
+                ));
+            } else {
+                transfers.insert(
+                    key,
+                    FactTransfer {
+                        subject_id,
+                        predicate,
+                        object_id,
+                        support,
+                        properties,
+                    },
+                );
+            }
         }
     }
-    conn.query("COMMIT").map_err(|e| backend(&e))?;
+    let mut transfers: Vec<_> = transfers.into_values().collect();
+    transfers.sort_by(|a, b| {
+        (&a.subject_id, &a.predicate, &a.object_id).cmp(&(
+            &b.subject_id,
+            &b.predicate,
+            &b.object_id,
+        ))
+    });
+    Ok(transfers)
+}
+
+fn rewire_mention(
+    conn: &lbug::Connection<'_>,
+    mention: &MentionTransfer,
+    winner: &str,
+) -> Result<(), KnowledgeError> {
+    let mut find = conn
+        .prepare(
+            "MATCH (src:Chunk {chunk_id: $chunk})-[m:MENTIONS]->(winner:Entity {entity_id: $winner}) \
+             RETURN m.support, m.properties",
+        )
+        .map_err(|e| backend(&e))?;
+    let existing = conn
+        .execute(
+            &mut find,
+            vec![
+                ("chunk", Value::String(mention.chunk_id.clone())),
+                ("winner", Value::String(winner.into())),
+            ],
+        )
+        .map_err(|e| backend(&e))?
+        .next();
+    let has_existing = existing.is_some();
+    let (support, properties) = if let Some(row) = existing {
+        (
+            int_at(&row, 0)?.saturating_add(mention.support),
+            optional_string_at(&row, 1)?.or_else(|| mention.properties.clone()),
+        )
+    } else {
+        (mention.support, mention.properties.clone())
+    };
+    let properties_value = properties.as_deref().map_or_else(
+        || Value::Null(lbug::LogicalType::String),
+        |value| Value::String(value.into()),
+    );
+    if has_existing {
+        let mut set = conn
+            .prepare(
+                "MATCH (src:Chunk {chunk_id: $chunk})-[m:MENTIONS]->(winner:Entity {entity_id: $winner}) \
+                 SET m.support = $support, m.properties = $properties",
+            )
+            .map_err(|e| backend(&e))?;
+        conn.execute(
+            &mut set,
+            vec![
+                ("chunk", Value::String(mention.chunk_id.clone())),
+                ("winner", Value::String(winner.into())),
+                ("support", Value::Int64(support)),
+                ("properties", properties_value),
+            ],
+        )
+        .map_err(|e| backend(&e))?;
+    } else {
+        conn.query(&format!(
+            "MATCH (src:Chunk {{chunk_id: {}}}), (winner:Entity {{entity_id: {}}}) \
+             CREATE (src)-[:MENTIONS {{support: {}, properties: {}}}]->(winner)",
+            cypher_str(&mention.chunk_id),
+            cypher_str(winner),
+            support,
+            properties
+                .as_deref()
+                .map_or_else(|| "NULL".to_string(), cypher_str)
+        ))
+        .map_err(|e| backend(&e))?;
+    }
+    Ok(())
+}
+
+fn rewire_fact(conn: &lbug::Connection<'_>, fact: &FactTransfer) -> Result<(), KnowledgeError> {
+    let mut find = conn
+        .prepare(
+            "MATCH (subject:Entity {entity_id: $subject})-[f:FACT {predicate: $predicate}]->(object:Entity {entity_id: $object}) \
+             RETURN f.support, f.properties",
+        )
+        .map_err(|e| backend(&e))?;
+    let existing = conn
+        .execute(
+            &mut find,
+            vec![
+                ("subject", Value::String(fact.subject_id.clone())),
+                ("predicate", Value::String(fact.predicate.clone())),
+                ("object", Value::String(fact.object_id.clone())),
+            ],
+        )
+        .map_err(|e| backend(&e))?
+        .next();
+    let has_existing = existing.is_some();
+    let (support, properties) = if let Some(row) = existing {
+        (
+            int_at(&row, 0)?.saturating_add(fact.support),
+            Some(merge_edge_properties(
+                optional_string_at(&row, 1)?.as_deref(),
+                fact.properties.as_deref(),
+            )),
+        )
+    } else {
+        (
+            fact.support,
+            Some(merge_edge_properties(None, fact.properties.as_deref())),
+        )
+    };
+    let mut set_or_create = if has_existing {
+        conn.prepare(
+            "MATCH (subject:Entity {entity_id: $subject})-[f:FACT {predicate: $predicate}]->(object:Entity {entity_id: $object}) \
+             SET f.support = $support, f.properties = $properties",
+        )
+        .map_err(|e| backend(&e))?
+    } else {
+        conn.prepare(
+            "MATCH (subject:Entity {entity_id: $subject}), (object:Entity {entity_id: $object}) \
+             CREATE (subject)-[:FACT {predicate: $predicate, support: $support, properties: $properties}]->(object)",
+        )
+        .map_err(|e| backend(&e))?
+    };
+    conn.execute(
+        &mut set_or_create,
+        vec![
+            ("subject", Value::String(fact.subject_id.clone())),
+            ("predicate", Value::String(fact.predicate.clone())),
+            ("object", Value::String(fact.object_id.clone())),
+            ("support", Value::Int64(support)),
+            ("properties", Value::String(properties.unwrap_or_default())),
+        ],
+    )
+    .map_err(|e| backend(&e))?;
     Ok(())
 }
 
@@ -316,6 +567,38 @@ fn edge_json(evidence: &[String], occurrences: &[String], caller: &serde_json::V
     serde_json::Value::Object(object).to_string()
 }
 
+/// Unions two stored fact-property blobs while keeping the aggregation keys
+/// under the store's control. Folds have no per-call caps, so the existing
+/// bounded values are retained and newly discovered values are appended once.
+fn merge_edge_properties(left: Option<&str>, right: Option<&str>) -> String {
+    let (mut evidence, mut occurrences, mut caller) = edge_state(left.unwrap_or(""));
+    let (right_evidence, right_occurrences, right_caller) = edge_state(right.unwrap_or(""));
+    for item in right_evidence {
+        push_capped(&mut evidence, item, usize::MAX);
+    }
+    for item in right_occurrences {
+        push_capped(&mut occurrences, item, usize::MAX);
+    }
+    if let (serde_json::Value::Object(left), serde_json::Value::Object(right)) =
+        (&mut caller, right_caller)
+    {
+        for (key, value) in right {
+            if key == "as_of" {
+                let current = left
+                    .get(&key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if value.as_str().is_some_and(|candidate| candidate > current) {
+                    left.insert(key, value);
+                }
+            } else {
+                left.entry(key).or_insert(value);
+            }
+        }
+    }
+    edge_json(&evidence, &occurrences, &caller)
+}
+
 /// Merges one chunk's assertion into the fact edge `(subject, predicate, object)`
 /// (§8 Stage 4 aggregation): creates the edge if absent; otherwise increments
 /// `support_count` iff `evidence_chunk` is new, and unions `occurrences` — both
@@ -341,7 +624,7 @@ pub(super) fn merge_fact(
             .execute(&mut find, vec![("id", Value::String(id.into()))])
             .map_err(|e| backend(&e))?
             .next()
-            .map_or(0, |row| int_at(&row, 0));
+            .map_or(Ok(0), |row| int_at(&row, 0))?;
         if n == 0 {
             return Err(KnowledgeError::Backend(format!(
                 "merge_fact: entity {id} does not exist"
@@ -369,8 +652,10 @@ pub(super) fn merge_fact(
             .map_err(|e| backend(&e))?
             .next();
         if let Some(row) = row {
-            let support = u64::try_from(int_at(&row, 0)).unwrap_or(0);
-            let raw = string_at(&row, 1);
+            let support = u64::try_from(int_at(&row, 0)?).map_err(|_| {
+                KnowledgeError::Backend("FACT support count cannot be negative".to_string())
+            })?;
+            let raw = optional_string_at(&row, 1)?.unwrap_or_default();
             let (mut evidence, mut occurrences, mut caller) = edge_state(&raw);
             let gained = push_capped(&mut evidence, evidence_chunk.to_string(), caps.max_evidence);
             merge_properties(&mut occurrences, &mut caller, properties, caps);
@@ -446,7 +731,8 @@ pub(super) fn chunks_for_entities(
             cypher_id_list(ids)
         ))
         .map_err(|e| backend(&e))?;
-    Ok(res.map(|row| string_at(&row, 0)).collect())
+    res.map(|row| string_at(&row, 0))
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Expands the fact graph hop by hop in Rust using single-hop directed
@@ -516,9 +802,14 @@ fn directed_facts(
         )
     };
     let res = conn.query(&cypher).map_err(|e| backend(&e))?;
-    Ok(res
-        .map(|row| (string_at(&row, 0), string_at(&row, 1), string_at(&row, 2)))
-        .collect())
+    res.map(|row| {
+        Ok((
+            string_at(&row, 0)?,
+            string_at(&row, 1)?,
+            string_at(&row, 2)?,
+        ))
+    })
+    .collect::<Result<Vec<_>, KnowledgeError>>()
 }
 
 /// Reads the FACT edge between a known `(subject, predicate, object)` triple —
@@ -552,12 +843,16 @@ fn subject_and_object_to_fact(
             ))
         })?;
     let parsed_predicate: Predicate = predicate.parse()?;
-    let support = u64::try_from(int_at(&row, 0)).unwrap_or(0);
-    let raw = string_at(&row, 1);
+    let support = u64::try_from(int_at(&row, 0)?).map_err(|_| {
+        KnowledgeError::Backend("FACT support count cannot be negative".to_string())
+    })?;
+    let raw = optional_string_at(&row, 1)?.unwrap_or_default();
     let properties = if raw.is_empty() {
         None
     } else {
-        serde_json::from_str(&raw).ok()
+        Some(serde_json::from_str(&raw).map_err(|error| {
+            KnowledgeError::Backend(format!("invalid FACT properties JSON: {error}"))
+        })?)
     };
     Ok(Fact {
         subject_id: subject.to_string(),

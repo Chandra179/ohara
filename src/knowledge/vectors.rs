@@ -36,7 +36,8 @@ mod v {
                         }
                     })
                     .collect();
-                format!("ChunkVec_{sanitized}")
+                let digest = crate::text::sha256_hex(model_id.as_str());
+                format!("ChunkVec_{sanitized}_{digest}")
             }
             VectorSpace::EntityNames => "EntityNameVec".to_string(),
         }
@@ -97,29 +98,64 @@ pub(super) mod schema {
         format!("[{}]", inner.join(", "))
     }
 
+    fn value_at(tuple: &[lbug::Value], i: usize) -> Result<&lbug::Value, KnowledgeError> {
+        tuple.get(i).ok_or_else(|| {
+            KnowledgeError::Backend(format!("Ladybug result tuple is missing column {i}"))
+        })
+    }
+
     /// Extracts a `STRING` value from a result tuple.
-    pub(in crate::knowledge) fn string_at(tuple: &[lbug::Value], i: usize) -> String {
-        match &tuple[i] {
-            lbug::Value::String(s) => s.clone(),
-            other => other.to_string(),
+    pub(in crate::knowledge) fn string_at(
+        tuple: &[lbug::Value],
+        i: usize,
+    ) -> Result<String, KnowledgeError> {
+        match value_at(tuple, i)? {
+            lbug::Value::String(s) => Ok(s.clone()),
+            other => Err(KnowledgeError::Backend(format!(
+                "Ladybug result column {i} has unexpected value {other:?}; expected STRING"
+            ))),
+        }
+    }
+
+    /// Extracts an optional `STRING` value, preserving Ladybug `NULL` values.
+    pub(in crate::knowledge) fn optional_string_at(
+        tuple: &[lbug::Value],
+        i: usize,
+    ) -> Result<Option<String>, KnowledgeError> {
+        match value_at(tuple, i)? {
+            lbug::Value::String(s) => Ok(Some(s.clone())),
+            lbug::Value::Null(_) => Ok(None),
+            other => Err(KnowledgeError::Backend(format!(
+                "Ladybug result column {i} has unexpected value {other:?}; expected STRING or NULL"
+            ))),
         }
     }
 
     /// Extracts an `INT64`/count value from a result tuple.
-    pub(in crate::knowledge) fn int_at(tuple: &[lbug::Value], i: usize) -> i64 {
-        match &tuple[i] {
-            lbug::Value::Int64(n) => *n,
-            lbug::Value::Int32(n) => i64::from(*n),
-            other => other.to_string().parse().unwrap_or(0),
+    pub(in crate::knowledge) fn int_at(
+        tuple: &[lbug::Value],
+        i: usize,
+    ) -> Result<i64, KnowledgeError> {
+        match value_at(tuple, i)? {
+            lbug::Value::Int64(n) => Ok(*n),
+            lbug::Value::Int32(n) => Ok(i64::from(*n)),
+            other => Err(KnowledgeError::Backend(format!(
+                "Ladybug result column {i} has unexpected value {other:?}; expected INT"
+            ))),
         }
     }
 
     /// Extracts a `DOUBLE` value from a result tuple.
-    pub(in crate::knowledge) fn double_at(tuple: &[lbug::Value], i: usize) -> f64 {
-        match &tuple[i] {
-            lbug::Value::Double(d) => *d,
-            lbug::Value::Float(f) => f64::from(*f),
-            other => other.to_string().parse().unwrap_or(0.0),
+    pub(in crate::knowledge) fn double_at(
+        tuple: &[lbug::Value],
+        i: usize,
+    ) -> Result<f64, KnowledgeError> {
+        match value_at(tuple, i)? {
+            lbug::Value::Double(d) => Ok(*d),
+            lbug::Value::Float(f) => Ok(f64::from(*f)),
+            other => Err(KnowledgeError::Backend(format!(
+                "Ladybug result column {i} has unexpected value {other:?}; expected DOUBLE"
+            ))),
         }
     }
 }
@@ -203,9 +239,16 @@ impl LadybugStore {
             .get_column_names()
             .iter()
             .position(|c| c == "name")
-            .unwrap_or(0);
-        Ok(res
+            .ok_or_else(|| {
+                KnowledgeError::Backend(
+                    "Ladybug show_tables result has no `name` column".to_string(),
+                )
+            })?;
+        let names = res
             .map(move |tuple| string_at(&tuple, name_col))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names
+            .into_iter()
             .filter(|name| name.starts_with("ChunkVec_"))
             .collect())
     }
@@ -237,7 +280,7 @@ fn ensure_chunk_node(
         )
         .map_err(|e| backend(&e))?
         .next()
-        .map_or(0, |row| int_at(&row, 0));
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
     if exists == 0 {
         let mut insert = conn
             .prepare("CREATE (c:Chunk {chunk_id: $id, doc_id: $doc})")
@@ -362,14 +405,16 @@ impl KnowledgeStore for LadybugStore {
             .execute(&mut stmt, vec![("q", vec_to_value(q))])
             .map_err(|e| backend(&e))?;
         let hits = res
-            .map(|tuple| ScoredHit {
-                id: string_at(&tuple, 0),
-                // Engine returns DOUBLE; source data is f32 — precision loss is
-                // below any retrieval-relevant threshold (§11).
-                #[allow(clippy::cast_possible_truncation)]
-                score: double_at(&tuple, 1) as f32,
+            .map(|tuple| {
+                Ok(ScoredHit {
+                    id: string_at(&tuple, 0)?,
+                    // Engine returns DOUBLE; source data is f32 — precision loss is
+                    // below any retrieval-relevant threshold (§11).
+                    #[allow(clippy::cast_possible_truncation)]
+                    score: double_at(&tuple, 1)? as f32,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, KnowledgeError>>()?;
         Ok(hits)
     }
 
@@ -383,7 +428,7 @@ impl KnowledgeStore for LadybugStore {
         let mut res = conn
             .execute(&mut stmt, vec![("id", lbug::Value::String(id.into()))])
             .map_err(|e| backend(&e))?;
-        let n = res.next().map_or(0, |t| int_at(&t, 0));
+        let n = res.next().map_or(Ok(0), |t| int_at(&t, 0))?;
         Ok(n > 0)
     }
 
@@ -468,6 +513,22 @@ mod tests {
 
     fn v(scalar: f32) -> Vec<f32> {
         vec![scalar, 0.0, 0.0, 0.0]
+    }
+
+    #[test]
+    fn model_ids_with_colliding_identifier_forms_get_distinct_collections() {
+        assert_ne!(
+            table(&space("model-a")),
+            table(&space("model_a")),
+            "sanitization must not collapse distinct model identities"
+        );
+    }
+
+    #[test]
+    fn result_decoders_reject_missing_and_wrong_values() {
+        assert!(schema::string_at(&[], 0).is_err());
+        assert!(schema::int_at(&[lbug::Value::String("nope".into())], 0).is_err());
+        assert!(schema::double_at(&[lbug::Value::String("nope".into())], 0).is_err());
     }
 
     #[tokio::test]

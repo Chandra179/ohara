@@ -14,7 +14,9 @@ use reqwest::dns::{Name, Resolve, Resolving};
 use reqwest::{Client, StatusCode};
 
 use super::robots::Robots;
-use super::{FetchCapabilities, FetchError, FetchPolicy, FetchedDoc, Fetcher, NormalizedUrl};
+use super::{
+    FetchCapabilities, FetchError, FetchPolicy, FetchValidators, FetchedDoc, Fetcher, NormalizedUrl,
+};
 
 /// The user-agent token this crawler presents to `robots.txt` (§8: honest UA).
 const AGENT_TOKEN: &str = "ohara";
@@ -107,15 +109,23 @@ impl HttpFetcher {
     }
 
     /// One request to `url` with politeness enforced — no robots, no redirects.
-    async fn request_once(&self, url: &NormalizedUrl) -> Result<reqwest::Response, FetchError> {
+    async fn request_once(
+        &self,
+        url: &NormalizedUrl,
+        validators: Option<&FetchValidators>,
+    ) -> Result<reqwest::Response, FetchError> {
         self.politeness_wait(url).await;
-        let response = self
-            .client
-            .get(url.as_url().clone())
-            .header(
-                reqwest::header::ACCEPT,
-                "text/html,application/xhtml+xml,*/*;q=0.8",
-            )
+        let mut request = self.client.get(url.as_url().clone()).header(
+            reqwest::header::ACCEPT,
+            "text/html,application/xhtml+xml,*/*;q=0.8",
+        );
+        if let Some(etag) = validators.and_then(|v| v.etag.as_deref()) {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = validators.and_then(|v| v.last_modified.as_deref()) {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| map_request_error(&e, self.timeout_secs))?;
@@ -163,7 +173,7 @@ impl HttpFetcher {
         }
         let robots_url = format!("{key}/robots.txt");
         let decision = match NormalizedUrl::parse(&robots_url) {
-            Ok(robots_url) => match self.request_once(&robots_url).await {
+            Ok(robots_url) => match self.request_once(&robots_url, None).await {
                 Ok(response) => match response.status() {
                     StatusCode::NOT_FOUND | StatusCode::GONE => {
                         Arc::new(RobotsDecision::allow_all())
@@ -198,13 +208,16 @@ impl HttpFetcher {
     async fn follow(
         &self,
         url: &NormalizedUrl,
+        validators: Option<&FetchValidators>,
     ) -> Result<(reqwest::Response, NormalizedUrl), FetchError> {
         let mut current = url.clone();
+        let mut first_hop = validators;
         for _ in 0..=self.max_redirects {
-            let response = self.request_once(&current).await?;
+            let response = self.request_once(&current, first_hop).await?;
             if !response.status().is_redirection() {
                 return Ok((response, current));
             }
+            first_hop = None;
             let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
                 return Err(FetchError::Protocol(format!(
                     "redirect without Location on {current}"
@@ -244,6 +257,18 @@ impl HttpFetcher {
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(FetchedDoc {
+                html: String::new(),
+                js_executed: false,
+                final_url: url.to_string(),
+                status: status.as_u16(),
+                content_type,
+                etag,
+                last_modified,
+                fetched_at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
         if !is_fetchable_content(content_type.as_deref()) {
             return Err(FetchError::Protocol(format!(
                 "unsupported content-type {:?} on {url}",
@@ -301,6 +326,16 @@ impl Fetcher for HttpFetcher {
         url: &NormalizedUrl,
         policy: &FetchPolicy,
     ) -> Result<FetchedDoc, FetchError> {
+        self.fetch_with_validators(url, policy, &FetchValidators::default())
+            .await
+    }
+
+    async fn fetch_with_validators(
+        &self,
+        url: &NormalizedUrl,
+        policy: &FetchPolicy,
+        validators: &FetchValidators,
+    ) -> Result<FetchedDoc, FetchError> {
         if policy.robots {
             let decision = self.robots_decision(url).await?;
             let mut path_and_query = url.as_url().path().to_string();
@@ -312,7 +347,7 @@ impl Fetcher for HttpFetcher {
                 return Err(FetchError::Protocol(format!("robots.txt disallows {url}")));
             }
         }
-        let (response, final_url) = self.follow(url).await?;
+        let (response, final_url) = self.follow(url, Some(validators)).await?;
         self.finish(response, &final_url).await
     }
 }

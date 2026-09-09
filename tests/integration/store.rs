@@ -157,10 +157,9 @@ fn boot_sweep_executes_deletion_intents_without_fts_ghosts() {
 
     control::request_deletion(&conn, &doc_id, Some("user request")).unwrap();
 
-    let report = control::reconcile(&conn, NOW, std::time::Duration::ZERO).unwrap();
-    assert_eq!(
-        report.deletions_executed, 1,
-        "§7.6: the boot sweep finishes interrupted deletions"
+    assert!(
+        control::execute_deletion(&conn, &doc_id).unwrap(),
+        "§7.6: the explicit SQLite half finishes after knowledge cleanup"
     );
     assert!(control::get(&conn, &doc_id).unwrap().is_none());
 
@@ -173,6 +172,5 @@ fn boot_sweep_executes_deletion_intents_without_fts_ghosts() {
     assert!(control::pending_deletions(&conn).unwrap().is_empty());
 
     // Idempotent: a second sweep finds nothing to do.
-    let again = control::reconcile(&conn, NOW, std::time::Duration::ZERO).unwrap();
-    assert_eq!(again.deletions_executed, 0);
+    assert!(!control::execute_deletion(&conn, &doc_id).unwrap());
 }

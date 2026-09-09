@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use super::db::DbError;
 use super::jobs;
-use super::models::{DocStatus, Stage, new_id};
+use super::models::{DEFAULT_JOB_PRIORITY, DocStatus, Stage, new_id};
 
 /// A document registration request (`ohara enqueue <url>`, §6): the raw and
 /// normalized URL, the operator priority, and the pipeline version stamping the
@@ -108,6 +108,19 @@ pub struct Document {
     pub error: Option<String>,
     /// Reprocess when logic changes (§1.2.7).
     pub pipeline_version: String,
+}
+
+/// A raw payload considered by the retention operator (§7.10). `SQLite` owns
+/// only the document/job eligibility decision; filesystem safety remains in
+/// the operator module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRetentionCandidate {
+    /// Registered document id.
+    pub doc_id: String,
+    /// Stored raw payload path.
+    pub raw_file_path: String,
+    /// Whether a pending or running job makes pruning unsafe right now.
+    pub has_live_job: bool,
 }
 
 /// Registers a document and enqueues its SCRAPE job as one transaction (§6:
@@ -251,6 +264,36 @@ pub fn get(conn: &Connection, doc_id: &str) -> Result<Option<Document>, DbError>
     }))
 }
 
+/// Lists completed or archived documents for raw retention pruning. Failed and
+/// in-progress milestones are excluded because their raw payload may be needed
+/// to resume or inspect the unfinished work. Live jobs are returned as a flag so
+/// the operator can report the skip without leaking SQL into `ops`.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure.
+pub fn raw_retention_candidates(conn: &Connection) -> Result<Vec<RawRetentionCandidate>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT d.doc_id, d.raw_file_path,
+                EXISTS (
+                    SELECT 1 FROM jobs AS live
+                     WHERE live.doc_id = d.doc_id
+                       AND live.status IN ('PENDING', 'RUNNING')
+                )
+           FROM documents AS d
+          WHERE d.status IN ('CLEANED', 'VECTORIZED', 'INDEXED', 'ARCHIVED')
+          ORDER BY COALESCE(d.fetched_at, d.created_at), d.doc_id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(RawRetentionCandidate {
+            doc_id: row.get(0)?,
+            raw_file_path: row.get(1)?,
+            has_live_job: row.get::<_, i64>(2)? != 0,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(DbError::from)
+}
+
 /// Records a Stage 2 quality-gate rejection (§8): the document goes
 /// `FAILED_QUALITY` with the reason stored as its `error`. A domain outcome the
 /// stage body applies itself — the job still completes (`DONE`), nothing chains.
@@ -290,6 +333,48 @@ pub fn due_for_recrawl(conn: &Connection, now_stamp: &str) -> Result<Vec<String>
         due.push(row.get(0)?);
     }
     Ok(due)
+}
+
+/// Re-queues due documents' SCRAPE jobs in the control plane (§7.5). Existing
+/// live work is preserved; only terminal SCRAPE rows are reset, and a missing
+/// row is created for compatibility with pre-maintenance databases.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement or transaction failure.
+pub fn schedule_due_recrawls(conn: &Connection, now_stamp: &str) -> Result<usize, DbError> {
+    let tx = conn.unchecked_transaction()?;
+    let due: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT d.doc_id, COALESCE(j.priority, ?1)
+               FROM documents AS d
+               LEFT JOIN jobs AS j
+                 ON j.doc_id = d.doc_id AND j.stage = 'SCRAPE'
+              WHERE d.next_crawl_at IS NOT NULL
+                AND d.next_crawl_at <= ?2
+                AND d.status NOT IN ('FAILED_QUALITY', 'FAILED', 'ARCHIVED')
+              ORDER BY d.next_crawl_at",
+        )?;
+        stmt.query_map(rusqlite::params![DEFAULT_JOB_PRIORITY, now_stamp], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut scheduled = 0;
+    for (doc_id, priority) in due {
+        scheduled += tx.execute(
+            "INSERT INTO jobs (job_id, doc_id, stage, status, priority, created_at, updated_at)
+             VALUES (?1, ?2, 'SCRAPE', 'PENDING', ?3, ?4, ?4)
+             ON CONFLICT (doc_id, stage) DO UPDATE SET
+                 status = 'PENDING', attempts = 0, next_attempt_at = NULL,
+                 lease_owner = NULL, lease_expires_at = NULL, last_error = NULL,
+                 priority = excluded.priority, updated_at = excluded.updated_at
+               WHERE jobs.status IN ('DONE', 'DEAD')",
+            rusqlite::params![new_id(), doc_id, priority, now_stamp],
+        )?;
+    }
+    tx.commit()?;
+    Ok(scheduled)
 }
 
 /// Marks a document archived without touching its indexed content (§6).
@@ -395,14 +480,22 @@ pub fn update_fetch_result(
     http_status: i64,
     etag: Option<&str>,
     last_modified: Option<&str>,
+    next_crawl_at: Option<&str>,
     now_stamp: &str,
 ) -> Result<(), DbError> {
     conn.execute(
         "UPDATE documents
             SET http_status = ?2, etag = ?3, last_modified = ?4,
-                fetched_at = ?5, last_processed_at = ?5
+                fetched_at = ?5, next_crawl_at = ?6, last_processed_at = ?5
           WHERE doc_id = ?1",
-        rusqlite::params![doc_id, http_status, etag, last_modified, now_stamp],
+        rusqlite::params![
+            doc_id,
+            http_status,
+            etag,
+            last_modified,
+            now_stamp,
+            next_crawl_at
+        ],
     )?;
     Ok(())
 }
@@ -575,7 +668,7 @@ pub fn chunks_by_ids(conn: &Connection, ids: &[&str]) -> Result<Vec<ChunkText>, 
 }
 
 /// Searches the trigger-synced FTS5 index and hydrates the matching chunks.
-/// The SQL and SQLite ranking details stay inside the control plane.
+/// The SQL and `SQLite` ranking details stay inside the control plane.
 pub(crate) fn search_bm25(
     conn: &Connection,
     expression: &str,
@@ -775,6 +868,60 @@ mod tests {
             "§7.5: past-due only; FAILED and NULL never"
         );
         let _ = (future_id, never_id);
+    }
+
+    #[test]
+    fn raw_retention_candidates_keep_live_jobs_visible_and_exclude_unfinished_docs() {
+        let conn = boot();
+        let live_id = super::super::testing::seed_doc_raw(&conn, "live");
+        let ready_id = super::super::testing::seed_doc_raw(&conn, "ready");
+        let new_id = super::super::testing::seed_doc_raw(&conn, "new");
+        conn.execute(
+            "UPDATE documents SET status = 'CLEANED' WHERE doc_id IN (?1, ?2)",
+            [&live_id, &ready_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'DONE' WHERE doc_id = ?1",
+            [&ready_id],
+        )
+        .unwrap();
+
+        let candidates = raw_retention_candidates(&conn).unwrap();
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].doc_id, live_id);
+        assert!(candidates[0].has_live_job);
+        assert_eq!(candidates[1].doc_id, ready_id);
+        assert!(!candidates[1].has_live_job);
+        let _ = new_id;
+    }
+
+    #[test]
+    fn schedule_due_recrawls_resets_terminal_scrape_once() {
+        let conn = boot();
+        let doc_id = super::super::testing::seed_doc_raw(&conn, "due");
+        conn.execute(
+            "UPDATE documents SET next_crawl_at = '2026-09-06 11:00:00' WHERE doc_id = ?1",
+            [&doc_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs SET status = 'DONE' WHERE doc_id = ?1 AND stage = 'SCRAPE'",
+            [&doc_id],
+        )
+        .unwrap();
+
+        assert_eq!(schedule_due_recrawls(&conn, NOW).unwrap(), 1);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM jobs WHERE doc_id = ?1 AND stage = 'SCRAPE'",
+                [&doc_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "PENDING");
+        assert_eq!(schedule_due_recrawls(&conn, NOW).unwrap(), 0);
     }
 
     #[test]

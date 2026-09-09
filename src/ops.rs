@@ -2,7 +2,10 @@
 //!
 //! The backup path is deliberately here rather than in `control` or
 //! `knowledge`: it coordinates the runtime lock and artifact snapshot, while
-//! SQLite snapshot semantics remain owned by `control`.
+//! `SQLite` snapshot semantics remain owned by `control`.
+
+mod entity_merge;
+mod prune;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -13,13 +16,16 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::control;
-#[cfg(feature = "ladybug")]
-use crate::knowledge::KnowledgeStore;
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RUNTIME_LOCK_NAME: &str = ".ohara.lock";
 
-/// Operator backup failures.
+#[cfg(all(feature = "ladybug", test))]
+pub(super) use entity_merge::execute_entity_merges;
+pub use entity_merge::merge_entities;
+pub use prune::{PruneReport, prune};
+
+/// Operator failures.
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
     /// The worker or another operator process currently owns the runtime lock.
@@ -37,7 +43,7 @@ pub enum OpsError {
         #[source]
         source: std::io::Error,
     },
-    /// SQLite could not produce the consistent control-plane snapshot.
+    /// `SQLite` could not produce the consistent control-plane snapshot.
     #[error("control snapshot: {0}")]
     Control(#[from] control::DbError),
     /// The knowledge plane could not complete an operator mutation.
@@ -69,6 +75,22 @@ pub enum OpsError {
     UnsupportedEntry {
         /// Unsupported source path.
         path: PathBuf,
+    },
+    /// A registered raw payload points outside the configured `data/raw` root.
+    #[error("raw payload path {path:?} is outside the raw root {root:?}")]
+    RawPathOutsideRoot {
+        /// Unsafe stored path.
+        path: PathBuf,
+        /// Allowed raw payload root.
+        root: PathBuf,
+    },
+    /// A registered raw payload is not a regular file below the raw root.
+    #[error("raw payload path is not a regular file below {root:?}: {path:?}")]
+    RawPathUnsafe {
+        /// Stored payload path.
+        path: PathBuf,
+        /// Allowed raw payload root.
+        root: PathBuf,
     },
     /// The manifest could not be encoded.
     #[error("backup manifest: {0}")]
@@ -117,7 +139,7 @@ pub struct DeleteReport {
 pub struct EntityMergeReport {
     /// Pending review rows examined.
     pub reviews_examined: usize,
-    /// New SQLite merge audit rows recorded.
+    /// New `SQLite` merge audit rows recorded.
     pub merges_recorded: usize,
     /// Knowledge-plane folds replayed, including repair folds.
     pub folds_replayed: usize,
@@ -166,7 +188,7 @@ impl Drop for RuntimeLock {
 ///
 /// The worker and all operator mutations use the same runtime lock. The
 /// snapshot is assembled in a sibling staging directory and renamed into place
-/// only after SQLite and every runtime artifact have been copied successfully.
+/// only after `SQLite` and every runtime artifact have been copied successfully.
 ///
 /// # Errors
 /// [`OpsError::RuntimeBusy`] if the worker is active; [`OpsError::DestinationExists`]
@@ -255,7 +277,7 @@ pub fn archive(config: &Config, doc_id: &str) -> Result<ArchiveReport, OpsError>
 /// Records a knowledge-first deletion intent for a document.
 ///
 /// The command is intentionally asynchronous: the worker or next boot removes
-/// the document from every knowledge collection before the SQLite cascade runs.
+/// the document from every knowledge collection before the `SQLite` cascade runs.
 /// Repeating the command is idempotent.
 ///
 /// # Errors
@@ -269,107 +291,6 @@ pub fn delete_document(config: &Config, doc_id: &str) -> Result<DeleteReport, Op
         doc_id: doc_id.to_string(),
     })
 }
-
-/// Executes the offline entity-resolution merge queue.
-///
-/// The runtime lock makes the operator mutation exclusive with the worker. The
-/// control-plane audit is written before each Ladybug fold, and every existing
-/// audit row is replayed first so an interrupted cross-store operation heals on
-/// the next invocation. Pending candidates choose the entity with the higher
-/// `:MENTIONS` degree; ties use the older control-plane row and finally the
-/// stable id for deterministic ordering.
-///
-/// # Errors
-/// [`OpsError::RuntimeBusy`] if the worker is active, [`OpsError::Control`] for
-/// invalid control-plane state, [`OpsError::Knowledge`] for a fold failure, or
-/// [`OpsError::KnowledgeFeatureDisabled`] without the embedded store feature.
-pub async fn merge_entities(config: &Config) -> Result<EntityMergeReport, OpsError> {
-    let (_runtime_lock, db) = open_control(config)?;
-    #[cfg(feature = "ladybug")]
-    {
-        let store = crate::knowledge::LadybugStore::open(
-            &config.data_dir().join("ladybug"),
-            config.embedder().dim(),
-        )?;
-        execute_entity_merges(&db, &store).await
-    }
-    #[cfg(not(feature = "ladybug"))]
-    {
-        let _ = db;
-        Err(OpsError::KnowledgeFeatureDisabled)
-    }
-}
-
-#[cfg(feature = "ladybug")]
-async fn execute_entity_merges(
-    db: &control::ControlDb,
-    store: &dyn KnowledgeStore,
-) -> Result<EntityMergeReport, OpsError> {
-    let mut report = EntityMergeReport::default();
-
-    for merge in control::entity_merges(db)? {
-        store.fold_entity(&merge.loser_id, &merge.winner_id).await?;
-        report.folds_replayed += 1;
-    }
-
-    for review in control::pending_er_reviews(db)? {
-        report.reviews_examined += 1;
-        let entity_a = control::resolve_entity(db, &review.entity_a)?;
-        let entity_b = control::resolve_entity(db, &review.entity_b)?;
-        if entity_a == entity_b {
-            control::mark_er_review_merged(db, review.id)?;
-            continue;
-        }
-
-        let details_a = required_entity(db, &entity_a)?;
-        let details_b = required_entity(db, &entity_b)?;
-        let mentions_a = store.chunks_for_entities(&[entity_a.as_str()]).await?.len();
-        let mentions_b = store.chunks_for_entities(&[entity_b.as_str()]).await?.len();
-        let (winner, loser) =
-            choose_merge_direction(&details_a, mentions_a, &details_b, mentions_b);
-
-        if control::record_entity_merge(db, loser, winner, ER_MERGE_REASON)? {
-            report.merges_recorded += 1;
-        }
-        store.fold_entity(loser, winner).await?;
-        report.folds_replayed += 1;
-    }
-
-    Ok(report)
-}
-
-#[cfg(feature = "ladybug")]
-fn required_entity(
-    db: &control::ControlDb,
-    entity_id: &str,
-) -> Result<control::EntityDetails, OpsError> {
-    control::entity_details(db, entity_id)?.ok_or_else(|| {
-        OpsError::Control(control::DbError::EntityNotFound {
-            entity_id: entity_id.to_string(),
-        })
-    })
-}
-
-#[cfg(feature = "ladybug")]
-fn choose_merge_direction<'a>(
-    a: &'a control::EntityDetails,
-    mentions_a: usize,
-    b: &'a control::EntityDetails,
-    mentions_b: usize,
-) -> (&'a str, &'a str) {
-    if mentions_a > mentions_b
-        || (mentions_a == mentions_b
-            && (a.created_at.as_str(), a.entity_id.as_str())
-                <= (b.created_at.as_str(), b.entity_id.as_str()))
-    {
-        (&a.entity_id, &b.entity_id)
-    } else {
-        (&b.entity_id, &a.entity_id)
-    }
-}
-
-#[cfg(feature = "ladybug")]
-const ER_MERGE_REASON: &str = "offline er merge";
 
 const OPERATOR_DELETE_REASON: &str = "operator request";
 
@@ -495,10 +416,11 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
     use std::fs;
+    use std::path::Path;
 
-    use super::{
-        OpsError, RuntimeLock, archive, backup, delete_document, execute_entity_merges, requeue,
-    };
+    #[cfg(feature = "ladybug")]
+    use super::execute_entity_merges;
+    use super::{OpsError, RuntimeLock, archive, backup, delete_document, prune, requeue};
     use crate::config::Config;
     use crate::control::{self, NewDocument, Stage};
     #[cfg(feature = "ladybug")]
@@ -620,6 +542,148 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn prune_is_dry_run_safe_idempotent_and_skips_live_jobs() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let data = dir.path().join("data");
+        let config_path = dir.path().join("ohara.toml");
+        fs::create_dir_all(&data).expect("data directory");
+        fs::write(
+            &config_path,
+            format!("data_dir = {data:?}\n[retention]\nraw_max_bytes = 3\n"),
+        )
+        .expect("config file");
+        let config = Config::load(Some(&config_path)).expect("valid config");
+        let db = control::connect(config.db_path()).expect("control store");
+
+        let ready_a = control::insert_new(
+            &db,
+            config.data_dir(),
+            &NewDocument {
+                source_url: "https://example.com/ready-a".to_string(),
+                source_url_normalized: "https://example.com/ready-a".to_string(),
+                priority: 5,
+                pipeline_version: "test".to_string(),
+            },
+            "2026-09-06 12:00:00",
+        )
+        .expect("ready a")
+        .doc_id()
+        .to_string();
+        let ready_b = control::insert_new(
+            &db,
+            config.data_dir(),
+            &NewDocument {
+                source_url: "https://example.com/ready-b".to_string(),
+                source_url_normalized: "https://example.com/ready-b".to_string(),
+                priority: 5,
+                pipeline_version: "test".to_string(),
+            },
+            "2026-09-06 12:00:00",
+        )
+        .expect("ready b")
+        .doc_id()
+        .to_string();
+        let live = control::insert_new(
+            &db,
+            config.data_dir(),
+            &NewDocument {
+                source_url: "https://example.com/live".to_string(),
+                source_url_normalized: "https://example.com/live".to_string(),
+                priority: 5,
+                pipeline_version: "test".to_string(),
+            },
+            "2026-09-06 12:00:00",
+        )
+        .expect("live")
+        .doc_id()
+        .to_string();
+        for doc_id in [&ready_a, &ready_b, &live] {
+            db.raw()
+                .execute(
+                    "UPDATE documents SET status = 'CLEANED' WHERE doc_id = ?1",
+                    [doc_id],
+                )
+                .expect("mark clean");
+        }
+        for doc_id in [&ready_a, &ready_b] {
+            db.raw()
+                .execute(
+                    "UPDATE jobs SET status = 'DONE' WHERE doc_id = ?1",
+                    [doc_id],
+                )
+                .expect("finish scrape");
+        }
+        let paths = [&ready_a, &ready_b, &live].map(|doc_id| {
+            control::get(&db, doc_id)
+                .expect("lookup")
+                .expect("document")
+                .raw_file_path
+        });
+        drop(db);
+        for path in &paths {
+            fs::create_dir_all(Path::new(path).parent().expect("raw parent"))
+                .expect("raw directory");
+            fs::write(path, b"abc").expect("raw payload");
+        }
+
+        let dry_run = prune(&config, true).expect("dry run");
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.selected, 1);
+        assert_eq!(dry_run.deleted, 0);
+        assert_eq!(dry_run.skipped_active, 1);
+        assert!(paths.iter().all(|path| Path::new(path).is_file()));
+
+        let run = prune(&config, false).expect("prune");
+        assert_eq!(run.deleted, 1);
+        assert_eq!(run.reclaimed_bytes, 3);
+        assert!(
+            paths
+                .iter()
+                .filter(|path| Path::new(path).is_file())
+                .count()
+                >= 2
+        );
+
+        let repeat = prune(&config, false).expect("repeat prune");
+        assert_eq!(repeat.deleted, 0);
+        assert_eq!(repeat.missing, 1);
+    }
+
+    #[test]
+    fn prune_rejects_a_registered_raw_path_outside_the_raw_root() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let data = dir.path().join("data");
+        let config_path = dir.path().join("ohara.toml");
+        fs::create_dir_all(&data).expect("data directory");
+        fs::write(
+            &config_path,
+            format!("data_dir = {data:?}\n[retention]\nraw_max_bytes = 1\n"),
+        )
+        .expect("config file");
+        let config = Config::load(Some(&config_path)).expect("valid config");
+        let db = control::connect(config.db_path()).expect("control store");
+        let doc_id = control::testing::seed_doc(&db, "unsafe");
+        db.raw()
+            .execute(
+                "UPDATE documents SET status = 'CLEANED', raw_file_path = ?2 WHERE doc_id = ?1",
+                rusqlite::params![doc_id, dir.path().join("outside.html.gz").to_string_lossy()],
+            )
+            .expect("unsafe path");
+        db.raw()
+            .execute(
+                "UPDATE jobs SET status = 'DONE' WHERE doc_id = ?1",
+                [&doc_id],
+            )
+            .expect("finish scrape");
+        drop(db);
+
+        assert!(matches!(
+            prune(&config, false),
+            Err(OpsError::RawPathOutsideRoot { .. })
+        ));
     }
 
     #[cfg(feature = "ladybug")]
