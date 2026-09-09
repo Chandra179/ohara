@@ -28,7 +28,7 @@ pub struct NewDocument {
     pub pipeline_version: String,
 }
 
-/// The outcome of [`insert_new`] — URL-level dedup is a domain *value*, not an
+/// The outcome of [`crate::control::insert_new`] — URL-level dedup is a domain *value*, not an
 /// error (§10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueOutcome {

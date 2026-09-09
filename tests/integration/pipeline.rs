@@ -359,7 +359,7 @@ async fn worker_drives_a_document_from_new_to_vectorized() {
     let chunk_id = signature.chunk_id;
     let model = "fake-embedder";
     let space = VectorSpace::Chunks {
-        model_id: ohara::knowledge::ModelId::new(model.clone()),
+        model_id: ohara::knowledge::ModelId::new(model),
     };
     assert!(
         knowledge
@@ -454,7 +454,7 @@ async fn worker_drives_a_document_from_new_to_indexed() {
         1
     );
     assert_eq!(
-        control::lookup_alias_all_types(&conn, "d richard hipp")
+        control::lookup_alias_all_types(&conn, "d. richard hipp")
             .unwrap()
             .len(),
         1
@@ -462,7 +462,14 @@ async fn worker_drives_a_document_from_new_to_indexed() {
 
     // The knowledge plane: the MENTIONS edge and the fact edge (§8 Stage 4).
     let mut entity_ids = Vec::new();
-    for entity_type in ["PERSON", "PRODUCT", "CONCEPT", "EVENT", "LOCATION", "ORGANIZATION"] {
+    for entity_type in [
+        "PERSON",
+        "PRODUCT",
+        "CONCEPT",
+        "EVENT",
+        "LOCATION",
+        "ORGANIZATION",
+    ] {
         entity_ids.extend(
             control::canonical_names(&conn, entity_type)
                 .unwrap()
@@ -550,9 +557,8 @@ async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
     // The Stage 5 read side over the Stage 4 write side (§15 step 6): a query
     // naming the entity resolves it via the typed alias, and the graph path
     // surfaces the mentioning chunk.
-    let normalizer = ohara::pipeline::WhatlangNormalizer::new(
-        config.retrieval().detection_confidence_floor(),
-    );
+    let normalizer =
+        ohara::pipeline::WhatlangNormalizer::new(config.retrieval().detection_confidence_floor());
     let retriever = ohara::pipeline::Retriever::new(
         &conn,
         knowledge.as_ref(),
@@ -638,5 +644,9 @@ async fn live_worker_drives_a_document_to_vectorized() {
     );
     assert!(doc.chunk_count >= 1);
     // FTS sees the live-cleaned text (§5 trigger sync).
-    assert!(!control::search_bm25(&conn, "database", 5).unwrap().is_empty());
+    assert!(
+        !control::search_bm25(&conn, "database", 5)
+            .unwrap()
+            .is_empty()
+    );
 }

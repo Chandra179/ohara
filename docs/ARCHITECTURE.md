@@ -1,6 +1,6 @@
-# ohara — System Architecture (v2.1)
+# ohara — System Architecture (v2.2)
 
-> **Status:** design of record. v2.1 supersedes v2 and folds in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening. Appendix B lists the v1 → v2 and v2 → v2.1 change logs.
+> **Status:** design of record and implementation status. v2.2 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval is implemented, while the remaining fetch legs, synthesis, and operator tooling are explicitly planned. v2.1 superseded v2 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -13,12 +13,12 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Plane | Implementation | Responsibility |
 | :--- | :--- | :--- |
 | **Control** | SQLite (WAL) | Document state machine, job queue, dedup hashes, BM25 index, audit trail |
-| **Engine** | Fetch ladder (HTTP → impersonation → Obscura) | Network fetching, JS rendering, anti-bot handling |
-| **Knowledge** | LadybugDB | HNSW vector collections + property graph with openCypher |
+| **Engine** | HTTP fetcher (ladder leg 1); future legs behind the same port | Network fetching, SSRF/robots/politeness policy, and future JS rendering |
+| **Knowledge** | LadybugDB | Exact in-engine cosine KNN plus property graph with openCypher; HNSW remains a future implementation |
 
 ### 1.2 Design principles
 
-1. **Embedded first.** One process plus the Obscura subprocess. ohara itself starts no services; the only optional external dependency is the user's own Ollama endpoint (§2).
+1. **Embedded first.** One process with an optional user-run Ollama endpoint. Future Obscura support may add a subprocess, but it is not part of the current runtime.
 2. **One owner per datastore.** `control/` owns SQLite, `knowledge/` owns LadybugDB, `engine/` owns the network. All schema and vendor knowledge lives in exactly one module.
 3. **Ports at plane boundaries.** The pipeline depends only on traits. Contracts are behavioral (LSP), not just type-level.
 4. **Identity discipline.** Content-derived hashes for *immutable derived rows* (`chunk_id`, `triplet_id`) make replay a no-op. Evolving *first-class entities* get stable surrogate IDs (uuidv7) and merge via an explicit protocol (§7.8) — a canonical name is data, not identity.
@@ -37,7 +37,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
           control.rs          engine.rs        knowledge.rs        llm.rs
           (SQLite)      ports▶(Fetcher)  ports▶(KnowledgeStore) ports▶(Llm)
                  │                  │                │
-              SQLite          HTTP/Obscura      LadybugDB
+              SQLite          HTTP fetcher      LadybugDB
 
    text.rs, config.rs: shared, dependency-free (text) / leaf (config)
 ```
@@ -50,14 +50,14 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 
 | Component | Choice | Pinning / risk posture |
 | :--- | :--- | :--- |
-| Scraper | Obscura (Rust, native rendering, no Chromium) | **Very young project.** Behind `Fetcher` port; degradation ladder provides fallbacks; versioned JSON subprocess protocol; pinned binary version |
+| Scraper | `reqwest` HTTP client | Implemented ladder leg 1 behind `Fetcher`; robots, politeness, redirects, and SSRF checks are in place. Impersonation and Obscura are planned port implementations |
 | Control store | SQLite via `rusqlite` (bundled), WAL | Stable; migrations versioned in `migrations/` |
 | Cleaning | `readability` (Rust) + `html2md` | Behind `Extractor` port; swap = alternate impl |
-| Text utils | `whatlang`, `symspell` | Pure functions in `text.rs`; symspell gets a domain dictionary |
+| Text utils | `whatlang`, Unicode normalization | Pure language detection and surface-form normalization; domain-dictionary correction is planned |
 | Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher) via the `lbug` crate (pinned 0.20.2) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port. **§2 build gates verified empirically against lbug 0.20.2 (2026-09-06):** (a) *transaction model* — MVCC snapshot reads run concurrently with the single write transaction; a second concurrent writer is refused (maps to `KnowledgeError::Unavailable`, Retry) — the single-worker default already serializes writers, so the actor-task contingency is not needed; (b) *edge-rewire/fold (§7.8)* — `CREATE`+`DELETE`+node deletion in one `BEGIN`/`COMMIT` verified. The bundled engine ships **no HNSW** (`query_hnsw_index` is absent); Phase 4 ships exact KNN via the in-engine `array_cosine_similarity` scalar — the HNSW index is a drop-in swap behind the same port (§11). Note: `lbug` links OpenSSL at link time (`libssl-dev` is a build prerequisite) |
 | Embedder | BAAI `bge-small-en-v1.5` via ONNX (`fastembed` 6.0.2 + `ort`, fp32; tokenizer via `tokenizers`/`hf-hub` — rustls-only features, never native-tls) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1. Model + tokenizer files fetched once from the HF hub into `data/models/` (fail-fast at boot), offline afterwards. Behind the `Embedder` port; the port also exposes `count_tokens` so chunk budgets are measured in the model's own tokenizer (§4) |
-| Reranker | `bge-reranker-base` ONNX **int8** (Xenova export, ~280 MB) via fastembed's user-defined loader; FlashRank tiny models as a later swap; identity impl as baseline | Behind `Reranker` port; CPU-optimized models only — never fp32 (§11.1); model + tokenizer cached under `data/models` like the embedder |
-| LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned on the reference profile: `phi4-mini:latest` on GPU (§11.2); cloud Haiku class **opt-in** | Behind `Llm` port; cost counters mandatory; endpoint health-checked at boot (config fail-fast) — mid-run unavailability maps to `LlmError::Unavailable` (Transient, backoff); §12 governs egress |
+| Reranker | `bge-reranker-base` ONNX **int8** (Xenova export, ~280 MB) plus the identity baseline | Behind `Reranker`; the local model is feature-gated and cached under `data/models`; identity is the deterministic fallback |
+| LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned extraction model `phi4-mini:latest` (§11.2) | Behind `Llm`; graph extraction, usage counters, and boot health checks are implemented. Synthesis and cloud providers remain planned; §12 governs egress |
 
 **Rule:** any dependency whose API is not its own standard (Obscura, LadybugDB, embedder runtime) must be reachable only through its port facade. No other module may name the vendor's types.
 
@@ -95,7 +95,7 @@ The same logical row in both stores is always the same row, because every cross-
 
 ---
 
-## 5. Control-plane schema (SQLite, v2.1)
+## 5. Control-plane schema (SQLite, v2.2)
 
 **Connection pragmas** — set on *every* connection in `control/db.rs`: `foreign_keys = ON` (SQLite defaults it **off**; without it the CASCADEs below are inert), `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`.
 
@@ -349,7 +349,7 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 ### Stage 1 — Scrape
 
-- **Fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → impersonated client → Obscura (JS + stealth). Escalation triggers: `FetchError::AntiBot`, JS-shell heuristic (tiny content + script-heavy raw HTML), or `sites.fetch_hint`.
+- **Target fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → impersonated client → Obscura (JS + stealth). The current implementation ships only plain HTTP; escalation triggers and `sites.fetch_hint` are reserved for the remaining ladder legs.
 - **URL normalization** (load-bearing for `source_url_normalized` dedup — specified, not folklore): lowercase scheme/host, punycode IDN, drop default ports and fragments, sort query parameters, strip configurable tracking params (`utm_*`, `fbclid`, `gclid`, …), absolutize relative URLs against `final_url`. Implemented once in the `NormalizedUrl` newtype with fixture tests.
 - `FetchedDoc { html, js_executed, final_url, status, content_type, etag, last_modified, fetched_at }` — the contract is "return what you fetched, labeled" (§9), and the pipeline escalates when the label says rendering didn't happen. The validators ride along for §7.5 conditional re-crawl.
 - **Per-fetch policy:** the port takes `fetch_with_policy(url, &FetchPolicy)` — the stage reads the control plane (`sites.rate_limit_ms`, the robots toggle) and the fetcher enforces (§8 politeness floor is `max(impl default, policy)`); plain `fetch(url)` applies the default. Robots rules use a per-host cache; an unreadable robots.txt is cached as disallow-all (conservative RFC 9309).
@@ -360,7 +360,7 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 1. `Extractor` port: boilerplate removal → primary-content HTML → Markdown (structure preserved: headings, lists, tables).
 2. Sanitize: resolve relative URLs, strip inline base64/SVG, Unicode NFC, collapse whitespace.
-3. **Quality gate is a value, not an error:** `CleanOutcome::Accepted | Rejected(reason)`. Rejections → `FAILED_QUALITY` with the reason recorded: word count < 50, paywall markers, boilerplate-only, **and language outside `target_languages` (default `["en"]`)** — the embedder is English-only and the symspell dictionary is English; embedding non-English text would poison the vector space. Duplicates (by `clean_content_hash`) → `Ok(SkippedDuplicate)`; `Err` is reserved for "the operation couldn't do its job" (§10).
+3. **Quality gate is a value, not an error:** `CleanOutcome::Accepted | Rejected(reason)`. Rejections → `FAILED_QUALITY` with the reason recorded: word count < 50, paywall markers, boilerplate-only, **and language outside `target_languages` (default `["en"]`)** — the embedder is English-only; embedding non-English text would poison the vector space. Duplicates (by `clean_content_hash`) → `Ok(SkippedDuplicate)`; `Err` is reserved for "the operation couldn't do its job" (§10).
 4. Optional LLM enrichment (summary, taxonomy tags): cloud opt-in per §12.
 
 ### Stage 3 — Chunk & vectorize
@@ -389,9 +389,9 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 ### Stage 5 — Retrieval (GraphRAG)
 
-*Full three-path form landed (§15 steps 5–6): steps 1 (language detect only), 2 (query entities: typed aliases over phrase windows + `EntityNames` KNN above the `[retrieval]` floor), 3 (BM25 + vector + graph paths — the graph path is capability-gated on `graph_traversal`), 4 (RRF), 5 (rerank with degradation), and 7 (the golden-set harness, now with per-path graph recall). Symspell, HyDE, and Llm synthesis land with steps 7–8. Measured on the real-model golden set: all three paths recall@20 = 1.000, fused MRR = 1.000.*
+*The three-path baseline is implemented (§15 steps 5–6): language detection, query entities from typed aliases and `EntityNames` KNN, BM25 + vector + capability-gated graph paths, RRF, degradation-aware reranking, and the golden-set harness. Symspell, HyDE, and LLM synthesis are not implemented yet. The current reproducible machinery baseline reports recall@20 = 1.000 for each path and fused MRR = 0.723; broader acceptance coverage is a stabilization task.*
 
-1. **Query preprocessing:** language detect, symspell with a domain dictionary (it "corrects" jargon otherwise), optional HyDE (flag; +300–500 ms). *Landed: whatlang detection is confidence-gated at 0.5 — measured, short technical queries sit at 0.02–0.10 confidence and mislabel; below the floor the query is treated as English (the Stage 2 gate bounds corpus languages anyway).*
+1. **Query preprocessing:** whatlang language detection is implemented and confidence-gated at 0.5 — short technical queries that fall below the floor are treated as English. Symspell domain correction and optional HyDE remain planned because they need evaluation before changing query text or latency.
 2. **Query entities:** typed alias match against `entity_aliases` — a homograph alias returns **all** its type-variants and lets rerank/graph context disambiguate — plus embedding KNN over the `EntityNames` collection above a threshold.
 3. **Three paths:** BM25 via `chunks_fts` (embeddings are weak on exact identifiers like "SQLite"):
 
@@ -404,9 +404,9 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
    vector KNN over `VectorSpace::Chunks { read_model }` (`k=50`); graph path (`facts_within_hops` + `chunks_for_entities` via `:MENTIONS`).
 4. **Fusion:** Reciprocal Rank Fusion (k=60) across the three lists → top-50 candidates.
-5. **Rerank:** `Reranker` port over the 50-candidate pool → top-5. Reranking is **fallible and degrades, never fails the query**: on `RerankError` the fusion order is returned as-is and the failure is counted. FlashRank tiny models for local latency; identity reranker as benchmarking baseline and fallback.
-6. **Synthesis:** `Llm` port; context = top chunks + graph facts rendered as a labeled fact list; citations = `chunk_id`s; synthesized answer cites inline.
-7. **Evaluation:** 50-query golden set in `tests/` fixtures; metrics: recall@20 per path, MRR of the fused list, rerank delta. The vector-path recall@20 is also the acceptance gate for the HNSW knobs (§11). Run before/after any retrieval change — "high precision" is a measured claim, not an aspiration.
+5. **Rerank:** `Reranker` port over the 50-candidate pool → top-5. Reranking is **fallible and degrades, never fails the query**: on `RerankError` the fusion order is returned as-is and the failure is counted. The local ONNX reranker is available behind the feature flag; the identity reranker is the deterministic baseline and fallback.
+6. **Synthesis (planned):** `Llm` port; context = top chunks + graph facts rendered as a labeled fact list; citations = `chunk_id`s. The current library returns ranked chunks and does not synthesize an answer.
+7. **Evaluation:** the current machinery harness measures recall@20 per path, fused MRR, and rerank delta. Expand it with entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases before changing thresholds. If an HNSW implementation is introduced later, its recall becomes an additional acceptance gate.
 
 ---
 
@@ -420,13 +420,13 @@ The trait keyword gives *signature* substitutability; LSP requires *behavioral* 
 
 | Port | Hides | Key contract (postconditions) | Swap candidates |
 | :--- | :--- | :--- | :--- |
-| `Fetcher` (`engine.rs`) | Obscura | Rendered-or-labeled HTML; unified `FetchError` taxonomy; `capabilities()` | HTTP ↔ impersonation ↔ chromiumoxide ↔ Obscura |
+| `Fetcher` (`engine.rs`) | HTTP client; future ladder implementations | Fetched-or-labeled HTML; unified `FetchError` taxonomy; honest `capabilities()` | HTTP ↔ impersonation ↔ chromiumoxide ↔ Obscura |
 | `KnowledgeStore` (`knowledge.rs`) | LadybugDB | All vector ops are `VectorSpace`-scoped; deterministic upserts; delete→KNN postcondition across every collection; filtered KNN results satisfy the filter (impl may over-fetch) | LadybugDB ↔ Kùzu ↔ vector-lib + SQLite edges |
 | `Embedder` (`pipeline/embed.rs`) | ONNX runtime | Order-preserving batch; `model_id()`/`dim()` are instance state; provider swap ≠ model swap | fastembed ↔ raw ONNX ↔ API (equal model) |
-| `Reranker` (`pipeline/retrieve.rs`) | FlashRank | Returns all candidates sorted by relevance, descending; **fallible** | FlashRank ↔ ONNX bge ↔ API ↔ identity |
+| `Reranker` (`pipeline/retrieve.rs`) | Local ONNX bge reranker or identity baseline | Returns all candidates sorted by relevance, descending; **fallible** | ONNX bge ↔ API ↔ identity |
 | `Llm` (`llm.rs`) | provider SDKs | Completion + schema-validated JSON (schema-constrained where the provider supports it, e.g. Ollama structured outputs); temperature-0 determinism for extraction; cost counters | Ollama (default) ↔ Haiku (opt-in) ↔ other OpenAI-compatible endpoints |
 | `Extractor` (`pipeline/clean.rs`) | readability/html2md | HTML → (title, byline, markdown); pure; URLs absolutized; scripts stripped | alternate extractors |
-| `QueryNormalizer` (`pipeline/retrieve.rs`) | whatlang/symspell | Pure; `normalize(q) -> (lang, q')` | lingua, cld, HyDE-as-strategy |
+| `QueryNormalizer` (`pipeline/retrieve.rs`) | whatlang; future domain correction | Pure; `normalize(q) -> (lang, q')` | lingua, cld, symspell, HyDE-as-strategy |
 | `ControlStore` (`control.rs`) | SQLite | Queue semantics: atomic claim, lease, at-least-once | SQLite ↔ Postgres (later). *One impl ships; the trait is a cheap seam, module isolation does most of the work* |
 
 Sketch (note: `async fn` in traits is not dyn-compatible — ports use `#[async_trait]`/boxed futures and stay object-safe; no generic methods on `dyn` ports):
@@ -484,7 +484,7 @@ pub trait Reranker: Send + Sync {
 }
 ```
 
-**Verification — contract tests.** One golden suite per port in `tests/ports/<port>/`, run against *every* impl *including fakes* (in-memory `KnowledgeStore`, identity `Reranker`, canned-HTML `Fetcher`). Suites include the **error-mapping tests** (each impl must collapse native failures into the port's taxonomy) and the **collection-isolation test** (a vector written to `Chunks{m1}` is invisible to `Chunks{m2}` and `EntityNames`). LSP becomes a CI-checked property, not an aspiration.
+**Verification — contract tests.** One golden suite per port in `tests/ports/<port>/`, run against *every* impl *including fakes* (in-memory `KnowledgeStore`, identity `Reranker`, canned-HTML `Fetcher`). Suites include the **error-mapping tests** (each impl must collapse native failures into the port's taxonomy) and the **collection-isolation test** (a vector written to `Chunks{m1}` is invisible to `Chunks{m2}` and `EntityNames`). The Makefile gates these checks today; CI wiring remains a repository task.
 
 ---
 
@@ -550,16 +550,16 @@ The performance story is **LLM-dominated**; everything else is rounding error. I
 | Summaries | 1k calls | — | ~$0.5–1 |
 | **Triplet extraction** | **15k calls** (~700 in / 150 out tok) | Ollama `phi4-mini`: **GPU ≈ 4–7 h**; all-CPU fallback ≈ 1 day with parallelism (§11.2) | **~$5–8** |
 | Entity resolution | in-process | ms-scale | — |
-| Retrieval (per query) | 3 paths + rerank | ~50–300 ms | synthesis only |
+| Retrieval (per query) | 3 paths + rerank | ~50–300 ms | future synthesis only |
 
-- Rerank realism: bge-reranker on CPU over 50 × 400-token pairs is 100–500 ms — hence FlashRank tiny models as the default.
+- Rerank realism: the local int8 bge reranker over 50 × 400-token pairs is expected to be 100–500 ms on the reference CPU; the identity implementation remains available as a deterministic baseline and fallback.
 - Levers: extraction batch size, per-stage concurrency, local Ollama extraction (free, no data egress — wall-clock bound; parallel requests/batched prompts help), prompt versioning to avoid re-paying extraction after prompt tweaks (`triplets.model` guards this). Pin the chosen Ollama model by name + version like any other model (§1.2.7); a model change is an extraction migration, not a config flip.
 - **HNSW params:** `M=16`, `ef_construction=64`, and `ef_search = max(128, 2·k)` — 128 at the k=50 rerank pool (an `ef` below `k` cannot return `k` candidates with sane recall). The knobs are gated by vector-path recall@20 on the golden set (§8.5), not by folklore; revisit at >1M chunks. **Current posture:** the bundled `lbug` engine ships no HNSW, so retrieval runs *exact* KNN in-engine (`array_cosine_similarity`, order-limited) — correct, sub-10ms at personal-corpus scale, and the parameterized index becomes a drop-in port impl swap when it ships.
 
 ### 11.1 Quantization policy
 
 - **Embedder: fp32 by default.** Its vectors feed retrieval *and* ER name matching, so quantization loss is systemic risk; the CPU cost is already rounding error (~130 MB, 5–15 ms/chunk). int8 dynamic quantization is an optional lever for low-power targets (2–4× CPU speedup), **gated by vector-path recall@20 on the golden set** (§8.5).
-- **Reranker: int8 by default.** Query-time only — nothing stored to contaminate, and the degradation policy (§8.5) caps the risk. FlashRank's bundled models ship CPU-optimized (int8) ONNX — the default path gets quantization for free. The optional bge-reranker-base path uses an int8 ONNX export (~280 MB, 30–150 ms/query on the reference CPU, gated by the rerank-delta metric). Never run it fp32 (~1.1 GB).
+- **Reranker: int8 by default when enabled.** Query-time only — nothing stored to contaminate, and the degradation policy (§8.5) caps the risk. The bge-reranker-base path uses an int8 ONNX export (~280 MB, 30–150 ms/query on the reference CPU, gated by the rerank-delta metric). The identity implementation remains the no-model fallback. Never run the bge model fp32 (~1.1 GB).
 - **Variant is part of model identity.** Quantization goes into the `model_id` string (`bge-small-en-v1.5` vs `bge-small-en-v1.5:int8`) and is recorded per row in `chunks.embedding_model`; one collection per variant (§4) makes mixing structurally impossible.
 - **fp16 is out of scope:** it's a GPU-only win on most CPUs, and no CUDA execution path ships — CPU int8 is the sweet spot for an embedded tool.
 
@@ -569,7 +569,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 - **Device:** i5-13420H (8C/12T, AVX2 + AVX_VNNI, no AVX-512/AMX), 15 GB RAM, RTX 4050 Mobile 6 GB VRAM (proprietary 595 driver, Ubuntu prebuilt signed kernel modules — no DKMS), ~565 GB free disk, Ollama local.
 - **Accelerator split — LLM on GPU, everything else on CPU.** The GPU belongs to the LLM (Ollama) and to nothing else: ohara itself contains no GPU code — knowledge plane, embedder, and reranker stay CPU/int8, because a CUDA EP adds hundreds of MB of dependency weight to an embedded tool for wins the cost model doesn't need. The all-CPU fallback profile remains valid for driver-less machines: extraction ≈ 1 day per 15k chunks with parallelism.
-- **Pinned on this profile:** embedder `bge-small-en-v1.5` fp32 in-process (~130 MB; 15k chunks ≈ 2–4 min on 12 threads); reranker FlashRank tiny default / bge-reranker-base **int8** (~280 MB, VNNI-accelerated); extraction LLM **`phi4-mini:latest`** via Ollama on GPU — fits 6 GB VRAM with headroom, tolerates `OLLAMA_NUM_PARALLEL = 2–4`, 15k calls ≈ **4–7 h**. Quality fallback `llama3.1:8b-instruct-q4_K_M` (~4.9 GB VRAM, ~4k context, parallel ≤ 2) ≈ 8–12 h. Cloud Haiku (~$5–8) stays the same-day option when no GPU is available (§12).
+- **Pinned on this profile:** embedder `bge-small-en-v1.5` fp32 in-process (~130 MB; 15k chunks ≈ 2–4 min on 12 threads); optional bge-reranker-base **int8** (~280 MB, VNNI-accelerated); extraction LLM **`phi4-mini:latest`** via Ollama on GPU — fits 6 GB VRAM with headroom, tolerates `OLLAMA_NUM_PARALLEL = 2–4`, 15k calls ≈ **4–7 h**. Retrieval currently stops at ranked chunks and does not call the LLM; synthesis, quality fallback, and cloud LLM remain future work (§12).
 - **Knowledge-plane RAM envelope:** 10⁴ chunks ≈ 15–30 MB; 10⁵ ≈ 150–300 MB; 10⁶ ≈ 1.5–2.5 GB. On 15 GB total, the practical ceiling is ~10⁶ chunks with Ollama loaded — well past the realistic personal-corpus range.
 - **Disk:** worst case at 10⁵ docs (raw + clean + both stores + models) ≈ 20–30 GB.
 - **Driver hygiene (learned the hard way):** prefer Ubuntu's prebuilt signed module packages (`linux-modules-nvidia-*`) over DKMS on stock kernels, keep `linux-headers-$(uname -r)` installed with the HWE meta aligned, and know that the one observed failure mode was a kernel update outrunning the NVIDIA module package. The proprietary stack is pinned away and reinstalled deliberately — never left half-present.
@@ -592,7 +592,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 - `tracing` spans per job/stage with `doc_id`; `RUST_LOG` filtered by module.
 - `stage_events` is the audit table of record (transitions, retries, errors, panics).
-- Counters exported via a metrics handle: docs/sec per stage, tokens in/out, cost estimate per doc, HNSW tombstone ratio, queue depth per stage, `er_review` pending count, documents due for re-crawl, `data/raw` disk usage (against the retention budget, §7.9).
+- Counters exported via a metrics handle: docs/sec per stage, tokens in/out, cost estimate per doc, queue depth per stage, `er_review` pending count, documents due for re-crawl, `data/raw` disk usage (against the retention budget, §7.9), and an HNSW tombstone ratio if an HNSW implementation is introduced.
 
 ---
 
@@ -602,8 +602,8 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 | :--- | :--- | :--- |
 | Unit | in-module `#[cfg(test)]` | `text.rs` exhaustive; chunker golden-file tests; **URL normalization fixtures** |
 | Port contract | `tests/ports/<port>/` | Same suite against every impl + fakes; error-mapping tests; **vector-collection isolation**; `fold_entity` fixture graphs |
-| Integration | `tests/integration/` | End-to-end via the public API only — canned fetcher, local embedder, tiny fixture corpus; also validates that module boundaries hold; includes the **FTS trigger-sync** and **deletion-intent** flows |
-| Eval | golden set | 50 queries; recall@20/MRR per path; rerank delta; gate for retrieval changes *and* HNSW knobs |
+| Integration | `tests/integration/` | End-to-end via the public API only — canned fetcher, deterministic injected embedder, real knowledge store, tiny fixture corpus; also validates **FTS trigger-sync** and **deletion-intent** flows |
+| Eval | golden set | Current machinery metrics are recall@20/MRR per path and rerank delta; broader acceptance cases are the next stabilization task |
 
 ---
 
@@ -613,12 +613,10 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 2. Control store: documents + jobs with lease claiming + stage chaining
 3. Fetch ladder leg 1 (HTTP) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
-5. Retrieval baseline: FTS5 + vector + rerank (no graph) — **landed, measured on the golden set** (50 queries, synthetic 48-chunk corpus, relevance true by construction): BM25 recall@20 = 1.000, vector recall@20 = 1.000, fused MRR = 1.000 with the real pinned models (rerank delta +0.000 — fusion order was already perfect on this set; the harness is the deliverable, the numbers the baseline to beat). Not yet built: the graph path and query entities (step 6), symspell correction, `HyDE`, `Llm` synthesis
-6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities (typed aliases over phrase windows + `EntityNames` KNN, §8 Stage 5.2) and the graph path (`:MENTIONS` chunks via `chunks_for_entities`) as the third fusion list. Measured on the real-model golden set: graph recall@20 = 1.000, fused MRR = 1.000. Not yet built: the offline `ohara er merge` executor, cloud LLM opt-in
-7. Obscura leg + full ladder
-8. Eval expansion + ops tooling (`ohara backup` / `prune` / `requeue` / `er merge`) + cost dashboards
-
-Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage 4 adds.
+5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
+6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor and cloud LLM opt-in remain planned
+7. Stabilization and operator slice: expand evaluation, add restart/deletion/retry acceptance coverage, and ship query/citation plus backup/requeue/archive/delete commands
+8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, entity-merge executor, and cost dashboards
 
 ---
 
@@ -626,8 +624,7 @@ Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage
 
 - `lib.rs` declares `pub mod` planes (backyard style); leaves are private (`mod jobs;`) with `pub(crate)`/`pub(super)` internals (Rust Reference visibility) and facade re-exports (`pub use models::{Document, Job};`).
 - Absolute `crate::` paths (the book's stated preference); `super::` only for parent-sibling access.
-- `src/bin/*` for extra binaries (`ohara backup`, `ohara er merge`, the re-embed tool); `[features]` gate heavy deps (`obscura`, `onnx-embedder`).
-- **Workspace graduation (ch14):** each facade file is the future `lib.rs` of `crates/{control,engine,knowledge,pipeline,…}`; the day-one visibility discipline makes the split mechanical.
+- `src/bin/*` for future extra binaries (`ohara backup`, `ohara er merge`, the re-embed tool); `[features]` gate heavy deps (`ladybug`, `onnx-embedder`).
 - Code style, API design, and lint policy live in [CODE_GUIDE.md](CODE_GUIDE.md) — the Rust API Guidelines and Rust Style Guide applied to ohara.
 
 ## Appendix B — Change log
@@ -693,5 +690,5 @@ Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage
 2. **Query entities are deliberately not type-filtered.** The `EntityNames` collection spans supertypes (§9: one collection) and a query names no type — §8 Stage 5.2's homograph rule returns *all* type-variants (`lookup_alias_all_types`) and disambiguation moves downstream (rerank scores the chunks; graph context weighs the facts).
 3. **The graph path is a capability-gated third fusion list.** `query` checks `KsCapabilities::graph_traversal`: on, the `:MENTIONS` chunks of the query entities join BM25 + vector in RRF (deterministic chunk-id order — the store returns an unordered set); off, the two-path baseline answers without failing the query (§9 honest capabilities). `rrf_fuse` generalized from a 2-tuple to N lists.
 4. **`Retriever::new` now takes the `[retrieval]` config section**: `entity_embedding_threshold` (0.75), `max_query_entities` (8), `fact_hops` (1..=2, validated) — the store stays config-free; `facts_within_hops` context for synthesis (Stage 5.6, not yet built) will read `fact_hops` when it lands.
-5. **Eval harness grew per-path graph recall** (`graph_recall20` in the golden-set report) and its corpus seeds the §8 Stage 4 write shape (CONCEPT entities, typed aliases, name vectors, `:MENTIONS` edges). Measured: real-model run at all-path recall@20 = 1.000, fused MRR = 1.000, rerank delta 0.000 — the graph path lifts the fused MRR floor of the hermetic run (0.508 → 0.712) without hurting the real-model ceiling.
+5. **Eval harness grew per-path graph recall** (`graph_recall20` in the golden-set report) and its corpus seeds the §8 Stage 4 write shape (CONCEPT entities, typed aliases, name vectors, `:MENTIONS` edges). The reproducible machinery run currently reports all-path recall@20 = 1.000, fused MRR = 0.723, and rerank delta 0.000. The ignored real-model run remains a separate, network/model-dependent benchmark.
 6. **`InMemoryKnowledge` (test fake) now declares `graph_traversal: true`** — its reads mirror the real store (§14), so the fake was under-declaring. `without_graph()` is the explicit capability-off variant for degradation tests.

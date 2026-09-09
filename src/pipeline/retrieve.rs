@@ -3,7 +3,7 @@
 //! rerank with degradation. Its two ports, [`QueryNormalizer`] and
 //! [`Reranker`] (§1.3), plus the baseline implementations.
 //!
-//! §8 Stage 5 items that land with later steps: symspell domain-dictionary
+//! §8 Stage 5 items that remain for later steps: symspell domain-dictionary
 //! correction, optional `HyDE`, and synthesis via the `Llm` port (§15 step 8).
 //!
 //! The graph path (§8 Stage 5.2–5.3) runs whenever the knowledge store declares
@@ -181,6 +181,7 @@ impl Reranker for IdentityReranker {
         candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
+                .then_with(|| a.text.cmp(&b.text))
                 .then_with(|| a.chunk_id.cmp(&b.chunk_id))
         });
         Ok(candidates)
@@ -277,6 +278,7 @@ impl Reranker for LocalReranker {
         reranked.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
+                .then_with(|| a.text.cmp(&b.text))
                 .then_with(|| a.chunk_id.cmp(&b.chunk_id))
         });
         Ok(reranked)
@@ -307,6 +309,7 @@ fn rrf_fuse(lists: Vec<Vec<(String, String)>>, rrf_k: f32) -> Vec<ScoredChunk> {
     fused.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
+            .then_with(|| a.text.cmp(&b.text))
             .then_with(|| a.chunk_id.cmp(&b.chunk_id))
     });
     fused
@@ -515,19 +518,23 @@ impl<'a> Retriever<'a> {
         if chunk_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Deterministic order (RRF ranks by position): sort by chunk id, then
-        // hydrate. The store's set semantics make the ordering arbitrary, so
-        // any deterministic total order preserves the contract.
+        // Deterministic order (RRF ranks by position): hydrate and sort by
+        // stable content first, then identity. The store's set semantics make
+        // its output order arbitrary, and UUID-derived chunk ids are not stable
+        // between fresh evaluation fixtures.
         let mut sorted_ids = chunk_ids;
         sorted_ids.sort();
         sorted_ids.dedup();
         let ids: Vec<&str> = sorted_ids.iter().map(String::as_str).collect();
-        let hydrated = control::chunks_by_ids(self.conn, &ids)?;
-        let by_id: std::collections::HashMap<String, String> =
-            hydrated.into_iter().map(|c| (c.chunk_id, c.text)).collect();
-        Ok(sorted_ids
+        let mut hydrated = control::chunks_by_ids(self.conn, &ids)?;
+        hydrated.sort_by(|a, b| {
+            a.text
+                .cmp(&b.text)
+                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+        });
+        Ok(hydrated
             .into_iter()
-            .filter_map(|id| by_id.get(&id).map(|text| (id.clone(), text.clone())))
+            .map(|chunk| (chunk.chunk_id, chunk.text))
             .collect())
     }
 
@@ -537,10 +544,12 @@ impl<'a> Retriever<'a> {
         if expression.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(control::search_bm25(self.conn, &expression, self.retrieval.pool())?
-            .into_iter()
-            .map(|chunk| (chunk.chunk_id, chunk.text))
-            .collect())
+        Ok(
+            control::search_bm25(self.conn, &expression, self.retrieval.pool())?
+                .into_iter()
+                .map(|chunk| (chunk.chunk_id, chunk.text))
+                .collect(),
+        )
     }
 
     /// Vector path (§8 Stage 5.3): embed the query, KNN the read-model
@@ -569,11 +578,25 @@ impl<'a> Retriever<'a> {
         let hydrated = control::chunks_by_ids(self.conn, &ids)?;
         let by_id: std::collections::HashMap<String, String> =
             hydrated.into_iter().map(|c| (c.chunk_id, c.text)).collect();
-        // KNN order is the ranking; chunks missing from the registry (a
-        // deletion race) drop out here.
-        Ok(hits
+        // KNN score is the ranking; stable content breaks equal-score ties
+        // before the cross-store identity. This prevents backend iteration
+        // order from changing evaluation results between fresh fixtures.
+        let mut ranked: Vec<(String, String, f32)> = hits
             .into_iter()
-            .filter_map(|h| by_id.get(&h.id).map(|text| (h.id, text.clone())))
+            .filter_map(|hit| {
+                by_id
+                    .get(&hit.id)
+                    .map(|text| (hit.id, text.clone(), hit.score))
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.2.total_cmp(&a.2)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Ok(ranked
+            .into_iter()
+            .map(|(chunk_id, text, _score)| (chunk_id, text))
             .collect())
     }
 }
@@ -590,7 +613,7 @@ mod tests {
 
     use crate::config::Config;
     use crate::control::testing::seed_doc;
-    use crate::control::{self, NewChunkRow};
+    use crate::control::{self, ControlDb, NewChunkRow};
     use crate::knowledge::VectorSpace;
     use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
     use crate::text::sha256_hex;
@@ -822,12 +845,7 @@ mod tests {
     /// The graph-path fixture: the §8 Stage 4 write shape, seeded directly —
     /// registry entities + aliases in `SQLite`, nodes + name vectors +
     /// `:MENTIONS` edges in the knowledge store.
-    async fn graph_fixture() -> (
-        Fixture,
-        ControlDb,
-        FakeEmbedder,
-        InMemoryKnowledge,
-    ) {
+    async fn graph_fixture() -> (Fixture, ControlDb, FakeEmbedder, InMemoryKnowledge) {
         let fx = fixture();
         let conn = control::connect(&fx.store).unwrap();
         let embedder = FakeEmbedder::new();

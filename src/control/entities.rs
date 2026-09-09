@@ -525,7 +525,7 @@ mod tests {
         let a = new_entity_id();
         let b = new_entity_id();
         assert_ne!(a, b);
-        assert!(uuid::Uuid::parse_str(&a).unwrap().get_version_num() == 7);
+        assert_eq!(uuid::Uuid::parse_str(&a).unwrap().get_version_num(), 7);
         // `Stage::Extract` exists so the stage's job type is real (§6).
         assert_eq!(Stage::Extract.as_str(), "EXTRACT");
     }

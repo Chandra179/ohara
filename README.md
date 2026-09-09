@@ -1,14 +1,14 @@
 # ohara
 
-**ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite as the control plane, LadybugDB (vectors + graph) as the knowledge plane, and an external fetcher engine as the only moving part.
+**ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** build order §15 in progress — **Phases 1–6 landed**: crate scaffold; the **control store** (documents, §6 lease queue with transactional stage chaining, boot reconciliation); fetch ladder leg 1 (plain HTTP with §12 SSRF guard, robots.txt, politeness); **Stages 1–2** (scrape → readability clean → dedup → quality + language gate); the `LadybugDB` knowledge store behind its port (§2 build gates verified empirically), the tokenizer-aligned **chunker**, the pinned `bge-small-en-v1.5` **local embedder**, vector collections, the trigger-synced `chunks_fts` index — Stage 3 end to end (`NEW` → `VECTORIZED`); the **retrieval baseline** (BM25 + vector + RRF + rerank) with the golden-set eval harness; the **local Ollama `Llm` provider** (JSON-schema structured outputs, usage counters, boot health check); **Stage 4 graph extraction** (`VECTORIZED` → `INDEXED`): per-chunk LLM triplets validated against the §8 type-compatibility matrix, staged as the §7.7 cost cache, conservative type-consistent entity resolution (typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties), `:MENTIONS` links and capped fact-edge aggregation in Ladybug; and the **Stage 5 graph retrieval path** — query entities (typed aliases over phrase windows + `EntityNames` embedding KNN) feeding `:MENTIONS`-linked chunks into three-path RRF fusion, capability-gated on the knowledge store. The full system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, vectorization, graph extraction, and three-path retrieval baseline are implemented. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. Retrieval currently returns ranked chunks; LLM synthesis, the query CLI, and operational subcommands remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
 ```
  [ Stage 1: Scrape ] ──► raw HTML (gz) ──► SQLite 'SCRAPED'
-         │          Fetcher ladder: plain HTTP → impersonation → Obscura
+         │          HTTP fetcher (ladder leg 1; later legs are planned)
          ▼
  [ Stage 2: Clean ] ──► normalized Markdown ──► SQLite 'CLEANED'
          │          readability → html2md → sanitize → hash/dedup → quality gate
@@ -21,27 +21,41 @@
          ▼                                                          'INDEXED'
  [ Stage 5: Retrieve (GraphRAG) ]
             query normalize → BM25 + vector KNN + graph hops → RRF fusion
-            → cross-encoder rerank (top-50 → top-5) → LLM synthesis with citations
+            → cross-encoder rerank (top-50 → top-5)
+            → ranked chunks; LLM synthesis with citations is planned
 ```
 
 ## Tech stack
 
 | Component | Choice | Role |
 | :--- | :--- | :--- |
-| Scraper engine | [Obscura](https://github.com/h4ckf0r0day/obscura) (Rust) | JS rendering + anti-bot fetching — third leg of the fetch ladder, behind the `Fetcher` port |
+| Scraper engine | `reqwest` HTTP fetcher | Implemented ladder leg 1 with robots, politeness, redirects, and SSRF protection; impersonation and Obscura are planned behind the same `Fetcher` port |
 | Control plane | SQLite (WAL, via `rusqlite`) | Job queue, document state machine, dedup hashes, audit log |
 | Cleaning | `readability` + `html2md` | Boilerplate removal, HTML → Markdown |
-| Text utilities | `whatlang`, `symspell` | Language ID, algorithmic typo correction |
-| Knowledge store | [LadybugDB](https://github.com/LadybugDB/ladybug) | Embedded property graph (openCypher) + native HNSW vector index — behind the `KnowledgeStore` port |
+| Text utilities | `whatlang`, Unicode normalization | Language ID and deterministic surface-form normalization; domain-dictionary correction is planned |
+| Knowledge store | [LadybugDB](https://github.com/LadybugDB/ladybug) | Embedded property graph plus exact in-engine cosine KNN; HNSW is a future port implementation |
 | Embedder | BAAI `bge-small-en-v1.5` via ONNX (pinned, fp32) | 384-dim local embeddings — behind the `Embedder` port |
-| Reranker | FlashRank (default), ONNX bge-reranker **int8** (optional) | Local cross-encoder reranking — behind the `Reranker` port |
-| LLM | [Ollama](https://ollama.com) (local, GPU; pinned: `phi4-mini`) — cloud Haiku opt-in | Extraction + synthesis — behind the `Llm` port; nothing leaves the machine by default |
+| Reranker | ONNX `bge-reranker-base` **int8** plus identity baseline | Local cross-encoder reranking behind the `Reranker` port; the identity implementation is the deterministic fallback |
+| LLM | [Ollama](https://ollama.com) (local, pinned: `phi4-mini`) | Graph extraction is implemented; synthesis and cloud providers are planned. Nothing leaves the machine by default |
 
 Every third-party engine sits behind a small trait so it can be swapped without touching pipeline logic — see [Ports & substitution](docs/ARCHITECTURE.md#9-ports--substitution-lsp) in the architecture doc.
 
 ## Building
 
-Rust 1.85+ (edition 2024). Two native prerequisites:
+Rust 1.98.1 (edition 2024), selected by [`rust-toolchain.toml`](rust-toolchain.toml). Install it with `rustup`:
+
+```text
+rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+```
+
+Then use the repository commands:
+
+```text
+make verify
+make build
+```
+
+Two native prerequisites are also required:
 
 - **OpenSSL development libraries** — the `lbug` crate's bundled engine links
   OpenSSL at link time: `sudo apt install libssl-dev` (Ubuntu/Debian). Without
@@ -64,7 +78,7 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── ARCHITECTURE.md        # system design (v2.1) — the source of truth
+│   ├── ARCHITECTURE.md        # system design (v2.2) — the source of truth
 │   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
@@ -86,8 +100,8 @@ ohara/
     │   └── models.rs          #   row types + the §6 state machine's shape knowledge
     ├── engine.rs              # ENGINE PLANE facade — pub trait Fetcher (the port)
     ├── engine/
-    │   ├── http.rs            #   ladder leg 1–2: plain HTTP / impersonation
-    │   └── obscura.rs         #   ladder leg 3: Obscura process, versioned JSON protocol
+    │   ├── http.rs            #   implemented ladder leg 1: plain HTTP
+    │   └── obscura.rs         #   reserved placeholder for a future ladder leg
     ├── knowledge.rs           # KNOWLEDGE PLANE facade — pub trait KnowledgeStore (the port)
     ├── knowledge/
     │   ├── vectors.rs         #   LadybugStore: vector collections (FLOAT[n] node tables,
@@ -110,7 +124,7 @@ ohara/
     │   └── retrieve.rs        # Stage 5: three-path retrieval + rerank + QueryNormalizer port
     ├── llm.rs                 # pub trait Llm + the local Ollama provider (structured
                                #   outputs, usage counters, boot health check)
-    └── text.rs                # pure text functions: langid, symspell, tokenizer, unicode
+    └── text.rs                # pure text functions: language ID, normalization, tokenizer, unicode
 ```
 
 ## What each module does, and why
@@ -118,7 +132,7 @@ ohara/
 - **`main.rs` / `lib.rs` (two crates, one package).** The library holds all logic; the binary only parses args and calls `ohara::run()`. Everything becomes testable without spawning a CLI, and future entry points (standalone worker, re-embed tool) come free under `src/bin/`.
 - **`config.rs`** — Loads and validates every knob (paths, embedder model + version, per-domain rate limits, LLM keys) into an immutable struct at boot: fail fast at startup, never mid-stage.
 - **`control/` — the control plane.** Owns *all* SQLite access: documents, the job queue, and the audit trail. The queue lives inside the SQLite module because claiming a job must be an atomic SQL statement against a single-writer WAL database. One directory owns the schema; schema changes touch one place.
-- **`engine/` — the fetch engine.** Gets raw HTML via a *degradation ladder* (plain HTTP → impersonated client → Obscura). Obscura is young, so only one file knows its CLI protocol, and every downstream stage tests against a canned-HTML `Fetcher` — no unit test ever touches the network.
+- **`engine/` — the fetch engine.** The current implementation gets raw HTML through the plain HTTP leg and exposes capabilities honestly. Future impersonation and Obscura implementations must stay behind the same `Fetcher` port; downstream stages test against a canned fetcher and never require network access.
 - **`knowledge/` — the knowledge plane.** Owns *all* LadybugDB access (vectors + graph) plus `reconcile.rs`, because SQLite and LadybugDB cannot share a transaction: consistency is an explicit protocol (deterministic IDs, idempotent upserts, boot-time reconciliation), and that protocol needs a home it can be tested in.
 - **`pipeline.rs` + `pipeline/` — orchestration and stages.** The worker loop claims jobs and dispatches; each stage is one file and one state-machine transition, so a change to chunking never touches graph extraction and every status is greppable. Stages take their dependencies as traits, which makes them unit-testable in isolation.
 - **`llm.rs`** — The single LLM port: provider impls, retry/backoff, token/cost counters, prompt templates. Three stages call LLMs; without one port, cost accounting and the data-governance decision (what content leaves the machine) scatter everywhere.
@@ -136,10 +150,10 @@ ohara/
 1. Scaffold the crate: module tree, config, migrations, worker-loop skeleton
 2. Control store: documents + jobs (lease claiming)
 3. Fetch ladder leg 1 (HTTP) + Stages 1–2 (clean, dedup, quality gate)
-4. Chunker + local embedder + vector collections + `chunks_fts` — landed with the `LadybugDB` build gates passing (exact KNN; HNSW stays a drop-in port swap)
+4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
-6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, measured at recall@20 = 1.000 on the real-model golden set)
-7. Obscura leg + full ladder
-8. Eval harness expansion + cost dashboards
+6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
+7. Stabilization: broader retrieval evaluation, restart/deletion/retry acceptance coverage, and the first operator CLI slice
+8. Obscura leg + full fetch ladder, LLM synthesis, entity-merge tooling, and cost dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

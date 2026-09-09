@@ -21,6 +21,10 @@ pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
 
 /// Registers a document and its initial SCRAPE job.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn insert_new(
     db: &ControlDb,
     data_dir: &std::path::Path,
@@ -31,6 +35,10 @@ pub fn insert_new(
 }
 
 /// Looks up a document by normalized URL.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn find_id_by_url(
     db: &ControlDb,
     source_url_normalized: &str,
@@ -39,6 +47,10 @@ pub fn find_id_by_url(
 }
 
 /// Looks up a document by clean-content hash.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn find_id_by_content_hash(
     db: &ControlDb,
     clean_content_hash: &str,
@@ -47,11 +59,19 @@ pub fn find_id_by_content_hash(
 }
 
 /// Loads one document row.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn get(db: &ControlDb, doc_id: &str) -> Result<Option<Document>, DbError> {
     documents::get(db.raw(), doc_id)
 }
 
 /// Records a Stage 2 quality rejection.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn mark_quality_rejected(
     db: &ControlDb,
     doc_id: &str,
@@ -62,30 +82,46 @@ pub fn mark_quality_rejected(
 }
 
 /// Returns documents due for re-crawl.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn due_for_recrawl(db: &ControlDb, now_stamp: &str) -> Result<Vec<String>, DbError> {
     documents::due_for_recrawl(db.raw(), now_stamp)
 }
 
 /// Records deletion intent.
-pub fn request_deletion(
-    db: &ControlDb,
-    doc_id: &str,
-    reason: Option<&str>,
-) -> Result<(), DbError> {
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn request_deletion(db: &ControlDb, doc_id: &str, reason: Option<&str>) -> Result<(), DbError> {
     documents::request_deletion(db.raw(), doc_id, reason)
 }
 
 /// Reads pending deletion intents.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn pending_deletions(db: &ControlDb) -> Result<Vec<DeletionIntent>, DbError> {
     documents::pending_deletions(db.raw())
 }
 
 /// Deletes the SQLite half of a deletion intent.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn execute_deletion(db: &ControlDb, doc_id: &str) -> Result<bool, DbError> {
     documents::execute_deletion(db.raw(), doc_id)
 }
 
 /// Records a Stage 1 fetch result.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn update_fetch_result(
     db: &ControlDb,
     doc_id: &str,
@@ -94,10 +130,21 @@ pub fn update_fetch_result(
     last_modified: Option<&str>,
     now_stamp: &str,
 ) -> Result<(), DbError> {
-    documents::update_fetch_result(db.raw(), doc_id, http_status, etag, last_modified, now_stamp)
+    documents::update_fetch_result(
+        db.raw(),
+        doc_id,
+        http_status,
+        etag,
+        last_modified,
+        now_stamp,
+    )
 }
 
 /// Records a Stage 2 clean result.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn update_clean_result(
     db: &ControlDb,
     doc_id: &str,
@@ -108,25 +155,37 @@ pub fn update_clean_result(
 }
 
 /// Reads chunk replay signatures.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn chunk_signatures(db: &ControlDb, doc_id: &str) -> Result<Vec<ChunkSignature>, DbError> {
     documents::chunk_signatures(db.raw(), doc_id)
 }
 
 /// Replaces all chunks for a document.
-pub fn replace_chunks(
-    db: &ControlDb,
-    doc_id: &str,
-    chunks: &[NewChunkRow],
-) -> Result<(), DbError> {
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn replace_chunks(db: &ControlDb, doc_id: &str, chunks: &[NewChunkRow]) -> Result<(), DbError> {
     documents::replace_chunks(db.raw(), doc_id, chunks)
 }
 
 /// Hydrates chunk display text by cross-store ids.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn chunks_by_ids(db: &ControlDb, ids: &[&str]) -> Result<Vec<ChunkText>, DbError> {
     documents::chunks_by_ids(db.raw(), ids)
 }
 
 /// Searches the trigger-synced FTS5 index and returns hydrated chunks.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn search_bm25(
     db: &ControlDb,
     expression: &str,
@@ -136,6 +195,10 @@ pub fn search_bm25(
 }
 
 /// Records Stage 3 aggregate counts.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn update_vectorize_result(
     db: &ControlDb,
     doc_id: &str,
@@ -147,6 +210,10 @@ pub fn update_vectorize_result(
 }
 
 /// Stages extraction triplets and returns only newly inserted rows.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn stage_triplets(
     db: &ControlDb,
     triplets: Vec<NewTriplet>,
@@ -155,14 +222,19 @@ pub fn stage_triplets(
 }
 
 /// Returns chunks without staged triplets.
-pub fn chunks_without_triplets(
-    db: &ControlDb,
-    doc_id: &str,
-) -> Result<Vec<ChunkText>, DbError> {
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn chunks_without_triplets(db: &ControlDb, doc_id: &str) -> Result<Vec<ChunkText>, DbError> {
     entities::chunks_without_triplets(db.raw(), doc_id)
 }
 
 /// Looks up an alias for one entity type.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn lookup_alias(
     db: &ControlDb,
     alias: &str,
@@ -172,11 +244,19 @@ pub fn lookup_alias(
 }
 
 /// Looks up all entity ids for an alias.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn lookup_alias_all_types(db: &ControlDb, alias: &str) -> Result<Vec<String>, DbError> {
     entities::lookup_alias_all_types(db.raw(), alias)
 }
 
 /// Registers an entity alias.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn upsert_alias(
     db: &ControlDb,
     alias: &str,
@@ -187,6 +267,10 @@ pub fn upsert_alias(
 }
 
 /// Ensures an entity exists and returns its stable id.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn ensure_entity(
     db: &ControlDb,
     entity_id: &str,
@@ -198,21 +282,37 @@ pub fn ensure_entity(
 }
 
 /// Reads an entity's supertype.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn entity_type_of(db: &ControlDb, entity_id: &str) -> Result<Option<String>, DbError> {
     entities::entity_type_of(db.raw(), entity_id)
 }
 
 /// Reads an entity's canonical name.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn canonical_name(db: &ControlDb, entity_id: &str) -> Result<Option<String>, DbError> {
     entities::canonical_name(db.raw(), entity_id)
 }
 
 /// Reads canonical names for one entity supertype.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn canonical_names(db: &ControlDb, entity_type: &str) -> Result<Vec<NameCandidate>, DbError> {
     entities::canonical_names(db.raw(), entity_type)
 }
 
 /// Files a cross-document entity-resolution review candidate.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn er_review_candidate(
     db: &ControlDb,
     entity_a: &str,
@@ -223,11 +323,19 @@ pub fn er_review_candidate(
 }
 
 /// Reads staged triplets for a document.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn triplets_of_doc(db: &ControlDb, doc_id: &str) -> Result<Vec<TripletRow>, DbError> {
     entities::triplets_of_doc(db.raw(), doc_id)
 }
 
 /// Claims the next runnable job.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane transaction fails.
 pub fn claim_next(
     db: &ControlDb,
     stage: Stage,
@@ -239,6 +347,10 @@ pub fn claim_next(
 }
 
 /// Completes a claimed job and applies its milestone/chaining decision.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane transaction fails.
 pub fn complete(
     db: &ControlDb,
     stage: Stage,
@@ -250,6 +362,10 @@ pub fn complete(
 }
 
 /// Retries a job with a backoff deadline.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn retry(
     db: &ControlDb,
     job_id: &str,
@@ -261,6 +377,10 @@ pub fn retry(
 }
 
 /// Marks a job dead and its document failed.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane transaction fails.
 pub fn dead(
     db: &ControlDb,
     job_id: &str,
@@ -272,11 +392,19 @@ pub fn dead(
 }
 
 /// Requeues a document's non-DONE jobs.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn requeue(db: &ControlDb, doc_id: &str, now_stamp: &str) -> Result<usize, DbError> {
     jobs::requeue(db.raw(), doc_id, now_stamp)
 }
 
 /// Appends an audit event.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn record_event(
     db: &ControlDb,
     doc_id: Option<&str>,
@@ -289,6 +417,10 @@ pub fn record_event(
 }
 
 /// Enqueues a job.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn enqueue(
     db: &ControlDb,
     job_id: &str,
@@ -302,6 +434,10 @@ pub fn enqueue(
 }
 
 /// Runs the boot reconciliation sweep.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane sweep fails.
 pub fn reconcile(
     db: &ControlDb,
     now_stamp: &str,
@@ -311,11 +447,19 @@ pub fn reconcile(
 }
 
 /// Reads one host policy.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
 pub fn site_policy(db: &ControlDb, host: &str) -> Result<Option<SitePolicy>, DbError> {
     sites::get(db.raw(), host)
 }
 
 /// Upserts one host policy.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane write fails.
 pub fn set_site_policy(
     db: &ControlDb,
     host: &str,

@@ -111,10 +111,7 @@ impl Ollama {
     ///
     /// # Errors
     /// [`LlmError::Unavailable`] if the HTTP client cannot be built.
-    pub fn new(
-        base_url: url::Url,
-        health_timeout: std::time::Duration,
-    ) -> Result<Self, LlmError> {
+    pub fn new(base_url: url::Url, health_timeout: std::time::Duration) -> Result<Self, LlmError> {
         let client = reqwest::Client::builder().build().map_err(|e| {
             LlmError::Unavailable(format!("cannot build http client for {base_url}: {e}"))
         })?;

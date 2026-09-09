@@ -48,16 +48,7 @@ async fn vector_space_isolation_replay_and_delete_contract() {
     );
 
     port.delete_doc("doc-a").await.unwrap();
-    assert!(!port
-        .has_vector(model_a, "chunk-a")
-        .await
-        .unwrap());
-    assert!(port
-        .has_vector(model_b, "chunk-b")
-        .await
-        .unwrap());
-    assert!(port
-        .has_vector(entity_names, "entity-a")
-        .await
-        .unwrap());
+    assert!(!port.has_vector(model_a, "chunk-a").await.unwrap());
+    assert!(port.has_vector(model_b, "chunk-b").await.unwrap());
+    assert!(port.has_vector(entity_names, "entity-a").await.unwrap());
 }

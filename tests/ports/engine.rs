@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use ohara::engine::{
-    FetchCapabilities, Fetcher, HttpFetcher, HttpFetcherParams, NormalizedUrl,
-};
+use ohara::engine::{FetchCapabilities, Fetcher, HttpFetcher, HttpFetcherParams, NormalizedUrl};
 
 #[test]
 fn normalized_urls_are_stable_dedup_keys() {

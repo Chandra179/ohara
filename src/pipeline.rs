@@ -30,9 +30,8 @@ pub use embed::{EmbedError, Embedder};
 #[cfg(feature = "onnx-embedder")]
 pub use retrieve::LocalReranker;
 pub use retrieve::{
-    IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer,
-    RerankError, Reranker, RetrieveError, Retriever, ScoredChunk, WhatlangNormalizer,
-    fts_match_expression,
+    IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer, RerankError, Reranker,
+    RetrieveError, Retriever, ScoredChunk, WhatlangNormalizer, fts_match_expression,
 };
 
 /// What a stage body reports on success (§10: domain outcomes are values, not
@@ -357,12 +356,7 @@ impl Worker {
     ///
     /// # Errors
     /// [`DbError`] on store failure (transitions and audit writes).
-    fn execute(
-        &self,
-        conn: &ControlDb,
-        stage: Stage,
-        job: &ClaimedJob,
-    ) -> Result<Flow, DbError> {
+    fn execute(&self, conn: &ControlDb, stage: Stage, job: &ClaimedJob) -> Result<Flow, DbError> {
         let now = control::now();
         let ctx = StageCtx {
             config: &self.config,

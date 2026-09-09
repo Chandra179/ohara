@@ -250,12 +250,7 @@ pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, 
 }
 
 /// Records a §8 quality rejection (`FAILED_QUALITY` + reason) and stops.
-fn reject(
-    conn: &ControlDb,
-    doc_id: &str,
-    reason: &str,
-    now: &str,
-) -> Result<(), control::DbError> {
+fn reject(conn: &ControlDb, doc_id: &str, reason: &str, now: &str) -> Result<(), control::DbError> {
     control::mark_quality_rejected(conn, doc_id, reason, now)
 }
 
@@ -473,11 +468,12 @@ tables, indices, triggers, and views lives inside one portable file.";
         let conn = boot();
         let doc_id = seed_doc(&conn, "a");
         let raw_path = write_raw(&config, &doc_id, "<html><body>raw</body></html>");
-        conn.raw().execute(
-            "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
-            rusqlite::params![raw_path, doc_id],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
+                rusqlite::params![raw_path, doc_id],
+            )
+            .unwrap();
         let extractor = FakeExtractor {
             article: ExtractedArticle {
                 title: Some("A title".to_string()),
@@ -517,11 +513,12 @@ tables, indices, triggers, and views lives inside one portable file.";
         let conn = boot();
         let doc_id = seed_doc(&conn, "a");
         let raw_path = write_raw(&config, &doc_id, "<html></html>");
-        conn.raw().execute(
-            "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
-            rusqlite::params![raw_path, doc_id],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
+                rusqlite::params![raw_path, doc_id],
+            )
+            .unwrap();
         let extractor = FakeExtractor {
             article: ExtractedArticle {
                 title: None,
@@ -569,11 +566,12 @@ tables, indices, triggers, and views lives inside one portable file.";
         let conn = boot();
         let doc_id = seed_doc(&conn, "a");
         let raw_path = write_raw(&config, &doc_id, "<html></html>");
-        conn.raw().execute(
-            "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
-            rusqlite::params![raw_path, doc_id],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
+                rusqlite::params![raw_path, doc_id],
+            )
+            .unwrap();
         // Long French text: passes word count, fails the language gate.
         let french = "Le système de gestion de base de données relationnelle permet de stocker \
                       des informations structurées dans des tables reliées entre elles par des \\
@@ -605,17 +603,19 @@ tables, indices, triggers, and views lives inside one portable file.";
         let original = seed_doc(&conn, "original");
         let duplicate = seed_doc(&conn, "dup");
         let dup_raw = write_raw(&config, &duplicate, "<html></html>");
-        conn.raw().execute(
-            "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
-            rusqlite::params![dup_raw, duplicate],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
+                rusqlite::params![dup_raw, duplicate],
+            )
+            .unwrap();
         // The original already carries this exact content hash.
-        conn.raw().execute(
-            "UPDATE documents SET clean_content_hash = ?1 WHERE doc_id = ?2",
-            rusqlite::params![content_hash(&sanitize(ARTICLE)), original],
-        )
-        .unwrap();
+        conn.raw()
+            .execute(
+                "UPDATE documents SET clean_content_hash = ?1 WHERE doc_id = ?2",
+                rusqlite::params![content_hash(&sanitize(ARTICLE)), original],
+            )
+            .unwrap();
         let extractor = FakeExtractor {
             article: ExtractedArticle {
                 title: None,

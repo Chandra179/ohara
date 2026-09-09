@@ -352,6 +352,86 @@ fn build_retrieval(raw: Option<&RawRetrieval>) -> RetrievalConfig {
     }
 }
 
+fn build_pipeline(raw: Option<&RawPipeline>) -> PipelineConfig {
+    let default_raw = RawPipeline::default();
+    let raw = raw.unwrap_or(&default_raw);
+    PipelineConfig {
+        graph_enabled: raw.graph_enabled.unwrap_or(defaults::GRAPH_ENABLED),
+        min_word_count: raw.min_word_count.unwrap_or(defaults::MIN_WORD_COUNT),
+        chunk_budget_tokens: raw
+            .chunk_budget_tokens
+            .unwrap_or(defaults::CHUNK_BUDGET_TOKENS),
+        chunk_overlap_percent: raw
+            .chunk_overlap_percent
+            .unwrap_or(defaults::CHUNK_OVERLAP_PERCENT),
+        max_triplets_per_chunk: raw
+            .max_triplets_per_chunk
+            .unwrap_or(defaults::MAX_TRIPLETS_PER_CHUNK),
+        entity_candidate_k: raw.entity_candidate_k.unwrap_or(defaults::ER_CANDIDATE_K),
+    }
+}
+
+fn build_embedder(raw: Option<&RawEmbedder>) -> EmbedderConfig {
+    let default_raw = RawEmbedder::default();
+    let raw = raw.unwrap_or(&default_raw);
+    EmbedderConfig {
+        model_id: raw
+            .model_id
+            .clone()
+            .unwrap_or_else(|| defaults::EMBEDDER_MODEL.to_string()),
+        dim: raw.dim.unwrap_or(defaults::EMBEDDER_DIM),
+    }
+}
+
+fn build_knowledge(raw: Option<&RawKnowledge>, default_model: &str) -> KnowledgeConfig {
+    let default_raw = RawKnowledge::default();
+    let raw = raw.unwrap_or(&default_raw);
+    KnowledgeConfig {
+        read_model: raw
+            .read_model
+            .clone()
+            .unwrap_or_else(|| default_model.to_string()),
+        write_model: raw
+            .write_model
+            .clone()
+            .unwrap_or_else(|| default_model.to_string()),
+    }
+}
+
+fn build_llm(raw: Option<&RawLlm>) -> Result<LlmConfig, ConfigError> {
+    let default_raw = RawLlm::default();
+    let raw = raw.unwrap_or(&default_raw);
+    let base_url = match raw.base_url.as_deref() {
+        Some(value) => url::Url::parse(value).map_err(|_| {
+            ConfigError::Validation(format!("llm.base_url {value:?} is not a valid URL"))
+        })?,
+        None => url::Url::parse(defaults::LLM_BASE_URL).map_err(|_| {
+            ConfigError::Validation("built-in llm.base_url default is invalid".into())
+        })?,
+    };
+    Ok(LlmConfig {
+        base_url,
+        extraction_model: raw
+            .extraction_model
+            .clone()
+            .unwrap_or_else(|| defaults::LLM_EXTRACTION_MODEL.to_string()),
+        fallback_model: raw.fallback_model.clone(),
+        cloud_llm_enabled: raw.cloud_llm_enabled.unwrap_or(defaults::LLM_CLOUD_ENABLED),
+        health_timeout: Duration::from_secs(
+            raw.health_timeout_secs
+                .unwrap_or(defaults::LLM_HEALTH_TIMEOUT_SECS),
+        ),
+    })
+}
+
+fn check(condition: bool, message: impl Into<String>) -> Result<(), ConfigError> {
+    if condition {
+        Ok(())
+    } else {
+        Err(ConfigError::Validation(message.into()))
+    }
+}
+
 impl Config {
     /// Loads configuration from `path` (TOML), with built-in defaults for every
     /// unset knob; `None` means pure defaults. Pure function — no filesystem
@@ -402,93 +482,11 @@ impl Config {
             .target_languages
             .unwrap_or_else(|| vec![defaults::TARGET_LANGUAGE.to_string()]);
 
-        let pipeline = PipelineConfig {
-            graph_enabled: raw
-                .pipeline
-                .as_ref()
-                .and_then(|p| p.graph_enabled)
-                .unwrap_or(defaults::GRAPH_ENABLED),
-            min_word_count: raw
-                .pipeline
-                .as_ref()
-                .and_then(|p| p.min_word_count)
-                .unwrap_or(defaults::MIN_WORD_COUNT),
-            chunk_budget_tokens: raw
-                .pipeline
-                .as_ref()
-                .and_then(|p| p.chunk_budget_tokens)
-                .unwrap_or(defaults::CHUNK_BUDGET_TOKENS),
-            chunk_overlap_percent: raw
-                .pipeline
-                .as_ref()
-                .and_then(|p| p.chunk_overlap_percent)
-                .unwrap_or(defaults::CHUNK_OVERLAP_PERCENT),
-            max_triplets_per_chunk: raw
-                .pipeline
-                .as_ref()
-                .and_then(|p| p.max_triplets_per_chunk)
-                .unwrap_or(defaults::MAX_TRIPLETS_PER_CHUNK),
-            entity_candidate_k: raw
-                .pipeline
-                .as_ref()
-                .and_then(|p| p.entity_candidate_k)
-                .unwrap_or(defaults::ER_CANDIDATE_K),
-        };
-
+        let pipeline = build_pipeline(raw.pipeline.as_ref());
         let fetcher = build_fetcher(raw.fetcher.as_ref());
-
-        let embedder = raw.embedder.as_ref();
-        let embedder = EmbedderConfig {
-            model_id: embedder
-                .and_then(|e| e.model_id.clone())
-                .unwrap_or_else(|| defaults::EMBEDDER_MODEL.to_string()),
-            dim: embedder
-                .and_then(|e| e.dim)
-                .unwrap_or(defaults::EMBEDDER_DIM),
-        };
-
-        let knowledge = KnowledgeConfig {
-            read_model: raw
-                .knowledge
-                .as_ref()
-                .and_then(|k| k.read_model.clone())
-                .unwrap_or_else(|| embedder.model_id.clone()),
-            write_model: raw
-                .knowledge
-                .and_then(|k| k.write_model)
-                .unwrap_or_else(|| embedder.model_id.clone()),
-        };
-
-        let base_url = raw.llm.as_ref().and_then(|l| l.base_url.as_deref());
-        let base_url = match base_url {
-            Some(s) => url::Url::parse(s).map_err(|_| {
-                ConfigError::Validation(format!("llm.base_url {s:?} is not a valid URL"))
-            })?,
-            None => url::Url::parse(defaults::LLM_BASE_URL).map_err(|_| {
-                ConfigError::Validation("built-in llm.base_url default is invalid".to_string())
-            })?,
-        };
-        let llm = LlmConfig {
-            base_url,
-            extraction_model: raw
-                .llm
-                .as_ref()
-                .and_then(|l| l.extraction_model.clone())
-                .unwrap_or_else(|| defaults::LLM_EXTRACTION_MODEL.to_string()),
-            fallback_model: raw.llm.as_ref().and_then(|l| l.fallback_model.clone()),
-            cloud_llm_enabled: raw
-                .llm
-                .as_ref()
-                .and_then(|l| l.cloud_llm_enabled)
-                .unwrap_or(defaults::LLM_CLOUD_ENABLED),
-            health_timeout: Duration::from_secs(
-                raw.llm
-                    .as_ref()
-                    .and_then(|l| l.health_timeout_secs)
-                    .unwrap_or(defaults::LLM_HEALTH_TIMEOUT_SECS),
-            ),
-        };
-
+        let embedder = build_embedder(raw.embedder.as_ref());
+        let knowledge = build_knowledge(raw.knowledge.as_ref(), &embedder.model_id);
+        let llm = build_llm(raw.llm.as_ref())?;
         let er = build_er(raw.er.as_ref());
         let retrieval = build_retrieval(raw.retrieval.as_ref());
 
@@ -515,129 +513,30 @@ impl Config {
 
     /// Fails fast on any knob violating its invariant, naming the knob (§10).
     fn validate(&self) -> Result<(), ConfigError> {
-        let checked = |ok: bool, message: &str| -> Result<(), ConfigError> {
-            if ok {
-                Ok(())
-            } else {
-                Err(ConfigError::Validation(message.to_string()))
-            }
-        };
-        checked(
+        check(
             !self.poll_interval.is_zero(),
             "poll_interval_ms must be > 0",
         )?;
-        checked(!self.lease_ttl.is_zero(), "lease_secs must be > 0")?;
-        checked(
+        check(!self.lease_ttl.is_zero(), "lease_secs must be > 0")?;
+        check(
             !self.backoff_base.is_zero(),
             "backoff_base_secs must be > 0",
         )?;
-        checked(
+        check(
             !self.rate_limit.is_zero(),
             "default_rate_limit_ms must be > 0",
         )?;
-        checked(
-            self.pipeline.min_word_count > 0,
-            "pipeline.min_word_count must be > 0",
-        )?;
-        checked(
-            self.pipeline.chunk_budget_tokens > 0
-                && self.pipeline.chunk_budget_tokens <= defaults::CHUNK_BUDGET_TOKENS,
-            "pipeline.chunk_budget_tokens must be in 1..=512 for the pinned embedder",
-        )?;
-        checked(
-            self.pipeline.chunk_overlap_percent <= 100,
-            "pipeline.chunk_overlap_percent must be <= 100",
-        )?;
-        checked(
-            self.pipeline.max_triplets_per_chunk > 0,
-            "pipeline.max_triplets_per_chunk must be > 0",
-        )?;
-        checked(
-            self.pipeline.entity_candidate_k > 0,
-            "pipeline.entity_candidate_k must be > 0",
-        )?;
-        checked(self.embedder.dim > 0, "embedder.dim must be > 0")?;
-        checked(
-            !self.embedder.model_id.is_empty(),
-            "embedder.model_id must be non-empty",
-        )?;
-        checked(
-            !self.knowledge.read_model.is_empty() && !self.knowledge.write_model.is_empty(),
-            "knowledge.read_model / knowledge.write_model must be non-empty",
-        )?;
-        checked(
+        check(
             !self.target_languages.is_empty(),
             "target_languages must not be empty (§8 Stage 2 gate)",
         )?;
-        checked(
-            !self.llm.extraction_model.is_empty(),
-            "llm.extraction_model must be non-empty",
-        )?;
-        checked(
-            !self.llm.health_timeout.is_zero(),
-            "llm.health_timeout_secs must be > 0",
-        )?;
-        checked(
-            !self.fetcher.timeout.is_zero(),
-            "fetcher.timeout_secs must be > 0",
-        )?;
-        checked(
-            self.fetcher.max_body_bytes > 0,
-            "fetcher.max_body_bytes must be > 0",
-        )?;
-        checked(
-            self.fetcher.max_redirects > 0,
-            "fetcher.max_redirects must be > 0",
-        )?;
-        checked(
-            !self.fetcher.user_agent.is_empty(),
-            "fetcher.user_agent must be non-empty (§8: honest User-Agent)",
-        )?;
-        checked(
-            matches!(self.llm.base_url.scheme(), "http" | "https"),
-            format!(
-                "llm.base_url must be http/https, got {:?}",
-                self.llm.base_url.scheme()
-            )
-            .as_str(),
-        )?;
-        checked(
-            self.er.name_sim_threshold > 0.0 && self.er.name_sim_threshold <= 1.0,
-            "er.name_similarity_threshold must be in (0, 1]",
-        )?;
-        checked(
-            self.er.embedding_sim_threshold > 0.0 && self.er.embedding_sim_threshold <= 1.0,
-            "er.embedding_similarity_threshold must be in (0, 1]",
-        )?;
-        checked(
-            self.er.max_evidence > 0 && self.er.max_occurrences > 0,
-            "er.max_evidence / er.max_occurrences must be > 0 (§8 Stage 4 caps)",
-        )?;
-        checked(
-            self.retrieval.entity_embedding_threshold > 0.0
-                && self.retrieval.entity_embedding_threshold <= 1.0,
-            "retrieval.entity_embedding_threshold must be in (0, 1]",
-        )?;
-        checked(
-            self.retrieval.max_query_entities > 0,
-            "retrieval.max_query_entities must be > 0 (§8 Stage 5.2)",
-        )?;
-        checked(
-            self.retrieval.fact_hops > 0 && self.retrieval.fact_hops <= 2,
-            "retrieval.fact_hops must be in 1..=2 (§8 Stage 5.3 precision-first)",
-        )?;
-        checked(self.retrieval.pool > 0, "retrieval.pool must be > 0")?;
-        checked(
-            self.retrieval.rrf_k.is_finite() && self.retrieval.rrf_k > 0.0,
-            "retrieval.rrf_k must be finite and > 0",
-        )?;
-        checked(
-            self.retrieval.detection_confidence_floor.is_finite()
-                && self.retrieval.detection_confidence_floor >= 0.0
-                && self.retrieval.detection_confidence_floor <= 1.0,
-            "retrieval.detection_confidence_floor must be in [0, 1]",
-        )?;
-        Ok(())
+        self.pipeline.validate()?;
+        self.fetcher.validate()?;
+        self.embedder.validate()?;
+        self.knowledge.validate()?;
+        self.llm.validate()?;
+        self.er.validate()?;
+        self.retrieval.validate()
     }
 
     /// `SQLite` control-store location (default `data/ohara.db`).
@@ -732,6 +631,30 @@ impl Config {
 }
 
 impl PipelineConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(
+            self.min_word_count > 0,
+            "pipeline.min_word_count must be > 0",
+        )?;
+        check(
+            self.chunk_budget_tokens > 0
+                && self.chunk_budget_tokens <= defaults::CHUNK_BUDGET_TOKENS,
+            "pipeline.chunk_budget_tokens must be in 1..=512 for the pinned embedder",
+        )?;
+        check(
+            self.chunk_overlap_percent <= 100,
+            "pipeline.chunk_overlap_percent must be <= 100",
+        )?;
+        check(
+            self.max_triplets_per_chunk > 0,
+            "pipeline.max_triplets_per_chunk must be > 0",
+        )?;
+        check(
+            self.entity_candidate_k > 0,
+            "pipeline.entity_candidate_k must be > 0",
+        )
+    }
+
     /// Whether the chain runs into EXTRACT (§6): `false` ends it at VECTORIZE —
     /// documents stay `VECTORIZED` and remain retrievable via BM25 + vector.
     #[must_use]
@@ -771,6 +694,19 @@ impl PipelineConfig {
 }
 
 impl FetcherConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(!self.timeout.is_zero(), "fetcher.timeout_secs must be > 0")?;
+        check(
+            self.max_body_bytes > 0,
+            "fetcher.max_body_bytes must be > 0",
+        )?;
+        check(self.max_redirects > 0, "fetcher.max_redirects must be > 0")?;
+        check(
+            !self.user_agent.is_empty(),
+            "fetcher.user_agent must be non-empty (§8: honest User-Agent)",
+        )
+    }
+
     /// Whether `robots.txt` is honored (§8, default on).
     #[must_use]
     pub fn robots(&self) -> bool {
@@ -809,6 +745,14 @@ impl FetcherConfig {
 }
 
 impl EmbedderConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(self.dim > 0, "embedder.dim must be > 0")?;
+        check(
+            !self.model_id.is_empty(),
+            "embedder.model_id must be non-empty",
+        )
+    }
+
     /// Model id — variant (incl. quantization) is part of the identity (§11.1).
     #[must_use]
     pub fn model_id(&self) -> &str {
@@ -823,6 +767,13 @@ impl EmbedderConfig {
 }
 
 impl KnowledgeConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(
+            !self.read_model.is_empty() && !self.write_model.is_empty(),
+            "knowledge.read_model / knowledge.write_model must be non-empty",
+        )
+    }
+
     /// Model whose collection serves reads (the §4 atomic read switch).
     #[must_use]
     pub fn read_model(&self) -> &str {
@@ -837,6 +788,24 @@ impl KnowledgeConfig {
 }
 
 impl LlmConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(
+            !self.extraction_model.is_empty(),
+            "llm.extraction_model must be non-empty",
+        )?;
+        check(
+            !self.health_timeout.is_zero(),
+            "llm.health_timeout_secs must be > 0",
+        )?;
+        check(
+            matches!(self.base_url.scheme(), "http" | "https"),
+            format!(
+                "llm.base_url must be http/https, got {:?}",
+                self.base_url.scheme()
+            ),
+        )
+    }
+
     /// Local Ollama base URL (§2).
     #[must_use]
     pub fn base_url(&self) -> &url::Url {
@@ -869,6 +838,21 @@ impl LlmConfig {
 }
 
 impl ErConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(
+            self.name_sim_threshold > 0.0 && self.name_sim_threshold <= 1.0,
+            "er.name_similarity_threshold must be in (0, 1]",
+        )?;
+        check(
+            self.embedding_sim_threshold > 0.0 && self.embedding_sim_threshold <= 1.0,
+            "er.embedding_similarity_threshold must be in (0, 1]",
+        )?;
+        check(
+            self.max_evidence > 0 && self.max_occurrences > 0,
+            "er.max_evidence / er.max_occurrences must be > 0 (§8 Stage 4 caps)",
+        )
+    }
+
     /// Normalized-name similarity floor for same-supertype matches (§8 Stage 4.2).
     #[must_use]
     pub fn name_sim_threshold(&self) -> f64 {
@@ -895,6 +879,32 @@ impl ErConfig {
 }
 
 impl RetrievalConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        check(
+            self.entity_embedding_threshold > 0.0 && self.entity_embedding_threshold <= 1.0,
+            "retrieval.entity_embedding_threshold must be in (0, 1]",
+        )?;
+        check(
+            self.max_query_entities > 0,
+            "retrieval.max_query_entities must be > 0 (§8 Stage 5.2)",
+        )?;
+        check(
+            self.fact_hops > 0 && self.fact_hops <= 2,
+            "retrieval.fact_hops must be in 1..=2 (§8 Stage 5.3 precision-first)",
+        )?;
+        check(self.pool > 0, "retrieval.pool must be > 0")?;
+        check(
+            self.rrf_k.is_finite() && self.rrf_k > 0.0,
+            "retrieval.rrf_k must be finite and > 0",
+        )?;
+        check(
+            self.detection_confidence_floor.is_finite()
+                && self.detection_confidence_floor >= 0.0
+                && self.detection_confidence_floor <= 1.0,
+            "retrieval.detection_confidence_floor must be in [0, 1]",
+        )
+    }
+
     /// `EntityNames` embedding-similarity floor for query entities (§8
     /// Stage 5.2).
     #[must_use]

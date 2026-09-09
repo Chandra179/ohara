@@ -1,6 +1,6 @@
-//! ENGINE PLANE facade (§1.3) — the fetch ladder (plain HTTP → impersonation →
-//! Obscura) and the [`Fetcher`] port. This plane owns the network; nothing else
-//! may touch it (§1.2.2).
+//! ENGINE PLANE facade (§1.3) — the HTTP fetcher and the [`Fetcher`] port. This
+//! plane owns the network; future impersonation and Obscura ladder legs must
+//! remain behind the same port (§1.2.2).
 
 mod http;
 mod obscura;

@@ -266,9 +266,7 @@ async fn run_eval(
         model_id: ModelId::new(embedder.model_id().to_string()),
     };
 
-    let normalizer = WhatlangNormalizer::new(
-        fixture_config(fixture).detection_confidence_floor(),
-    );
+    let normalizer = WhatlangNormalizer::new(fixture_config(fixture).detection_confidence_floor());
     let retriever = Retriever::new(
         &conn,
         knowledge,
@@ -308,8 +306,8 @@ async fn run_eval(
 
         // Graph path raw recall (§14): the query's entities -> their
         // mentioning chunks. Mirrors the retriever's phrase-window alias pass.
-        let normalized = ohara::text::normalize_surface_form(&q.text);
-        let terms: Vec<&str> = normalized.split_whitespace().collect();
+        let normalized_query = ohara::text::normalize_surface_form(&q.text);
+        let terms: Vec<&str> = normalized_query.split_whitespace().collect();
         let mut entity_ids: Vec<String> = Vec::new();
         for window in (1..=terms.len()).rev() {
             for start in 0..=terms.len() - window {

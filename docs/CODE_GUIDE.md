@@ -7,17 +7,17 @@
 | Concern | Governing document | Enforced by |
 | :--- | :--- | :--- |
 | Formatting | [Rust Style Guide](https://doc.rust-lang.org/nightly/style-guide/) | `cargo fmt` — never hand-format |
-| Lints | This guide's `[lints]` table (C-LINT below) | `cargo clippy` in CI, warnings = errors |
+| Lints | This guide's `[lints]` table (C-LINT below) | `make clippy`, warnings = errors |
 | API shape & naming | [API Guidelines](https://rust-lang.github.io/api-guidelines/checklist.html) | code review, this guide's checklist |
 | Module tree, visibility | Rust Book ch07, ARCHITECTURE Appendix A | compiler + review |
 | Errors, panics | Rust Book ch09, ARCHITECTURE §10 | compiler + contract tests |
-| Design decisions | ARCHITECTURE.md (v2.1) | — |
+| Design decisions | ARCHITECTURE.md (v2.2) | — |
 
 ---
 
 ## 1. Formatting — rustfmt's job
 
-`cargo fmt` is the only formatter; CI runs `cargo fmt --check`. No project `rustfmt.toml` — the defaults **are** the [default Rust style](https://doc.rust-lang.org/nightly/style-guide/):
+`cargo fmt` is the only formatter; `make fmt-check` runs `cargo fmt --check` with the pinned toolchain from [`rust-toolchain.toml`](../rust-toolchain.toml). No project `rustfmt.toml` — the defaults **are** the [default Rust style](https://doc.rust-lang.org/nightly/style-guide/):
 
 - Spaces, **4-space indent**, **max line width 100**.
 - **Block indent over visual indent** (smaller diffs, less rightward drift):
@@ -46,7 +46,7 @@
 - **C-GETTER:** getters drop the `get_` prefix — `model_id()`, `capabilities()`, `class()` (§9 ports), not `get_model_id()`.
 - **C-ITER / C-ITER-TY:** collection-producing-iterator methods are `iter`, `iter_mut`, `into_iter`; the iterator types they return are named after the method.
 - **C-WORD-ORDER:** consistent error/enum naming — `FetchError`, `KnowledgeError`, `StageError` (noun + `Error`); predicate methods `is_*`/`has_*` (C-PRED); constructors are static inherent methods named `new` (C-CTOR) — `NormalizedUrl::new(raw, final_url) -> Result<Self, …>`.
-- **C-FEATURE:** cargo feature names describe content, never placeholders: `obscura`, `onnx-embedder`, `graph` (Appendix A) — never `extra`, `new`, `full`.
+- **C-FEATURE:** cargo feature names describe content, never placeholders: `ladybug`, `onnx-embedder`, and the future `obscura` feature — never `extra`, `new`, `full`.
 
 ## 3. API design
 
@@ -63,8 +63,8 @@
 
 ## 4. Documentation
 
-- **C-CRATE-DOC:** `lib.rs` opens with a crate-level `//!` overview and at least one `# Examples` block exercising the public API end-to-end (enqueue → query, against fakes).
-- **C-EXAMPLE:** every public item in a facade gets a rustdoc example — these double as integration tests. Examples use `?`, never `unwrap`/`try!` (C-QUESTION-MARK).
+- **C-CRATE-DOC:** `lib.rs` opens with a crate-level `//!` overview and at least one `# Examples` block exercising the public API end-to-end (enqueue → complete, against the control plane).
+- **C-EXAMPLE:** new public facade items should get a rustdoc example when the setup is useful to callers; examples use `?`, never `unwrap`/`try!` (C-QUESTION-MARK).
 - **C-FAILURE:** function docs carry `# Errors` (which variants, when) and `# Panics` sections whenever either applies. In ohara, `# Panics` documents *invariant* panics only — any other failure mode is a `Result` (§10).
 - **C-LINK:** prose doc comments hyperlink types and sections (`[`Fetcher`](crate::engine::Fetcher)`); rustdoc links are checked by `cargo doc`.
 - **C-HIDDEN:** implementation details stay out of docs — vendor types never appear in public signatures (§9 rule 3), so rustdoc never leaks them.
@@ -95,7 +95,9 @@ Allowed-by-default `pedantic` exceptions go in the same table with a one-line ju
 
 Recap from ARCHITECTURE Appendix A (ch07): `pub mod` planes at the crate root, private leaf modules, `pub(crate)`/`pub(super)` for internals, facade re-exports (`pub use models::{Document, Job};`) so the public surface stays flat. **C-STRUCT-PRIVATE** applies to every struct crossing a plane boundary — with the guideline's own exception: plain data records whose fields carry no invariant beyond construction (DTOs like `FetchedDoc`, `Fact`, `ScoredChunk`) may expose `pub` fields; anything whose fields must stay coherent (e.g. [`Config`](config.rs), the ID newtypes) keeps them private behind constructors and getters. `pipeline/` depends on traits and facades only — a PR that names a vendor type outside its owning plane is rejected in review, full stop.
 
-## 7. CI gates
+## 7. Repository gates
+
+The repository exposes the quality gates through the [Makefile](../Makefile). CI is not wired yet, so run these locally before every commit:
 
 ```
 cargo fmt --check
@@ -103,6 +105,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo doc --no-deps      # docs build warning-free (C-LINK)
 ```
+
+The equivalent one-shot command is `make verify`.
 
 ## 8. Review checklist (the 60-second version)
 

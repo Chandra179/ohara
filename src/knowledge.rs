@@ -275,7 +275,9 @@ impl KnowledgeError {
     }
 }
 
-/// The knowledge port (§9): HNSW vectors + property graph, `VectorSpace`-scoped.
+/// The knowledge port (§9): vector search plus property graph,
+/// `VectorSpace`-scoped. The current Ladybug implementation uses exact
+/// in-engine cosine KNN; an HNSW implementation can be substituted later.
 ///
 /// Contracts (postconditions, not mechanisms):
 /// - upserts are deterministic — replaying a stage is a no-op on written data (§7.1);

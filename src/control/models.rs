@@ -61,7 +61,7 @@ impl Stage {
 
 /// What a `DONE` job means for its document and the chain (§6 stage chaining).
 /// Decided by the worker — it owns the configuration (`graph_enabled`) and the
-/// stage's reported outcome; applied by [`super::jobs::complete`] in one
+/// stage's reported outcome; applied by [`crate::control::complete`] in one
 /// transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion {
