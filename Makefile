@@ -1,8 +1,12 @@
 SHELL := /bin/sh
 
-CARGO ?= cargo
+RUSTUP ?= rustup
 TOOLCHAIN ?= 1.98.1
-CARGO_CMD := $(CARGO) +$(TOOLCHAIN)
+TOOLCHAIN_BIN := $(dir $(shell $(RUSTUP) which cargo --toolchain $(TOOLCHAIN) 2>/dev/null))
+export PATH := $(TOOLCHAIN_BIN):$(PATH)
+CARGO_CMD := $(RUSTUP) run $(TOOLCHAIN) cargo
+CARGO_FMT_CMD := $(RUSTUP) run $(TOOLCHAIN) cargo-fmt
+CARGO_CLIPPY_CMD := $(RUSTUP) run $(TOOLCHAIN) cargo-clippy
 
 .DEFAULT_GOAL := verify
 
@@ -29,13 +33,13 @@ help:
 		'make clean            Remove Cargo build artifacts'
 
 toolchain:
-	rustup toolchain install $(TOOLCHAIN) --profile minimal --component rustfmt --component clippy
+	$(RUSTUP) toolchain install $(TOOLCHAIN) --profile minimal --component rustfmt --component clippy
 
 fmt:
-	$(CARGO_CMD) fmt --all
+	$(CARGO_FMT_CMD) --all
 
 fmt-check:
-	$(CARGO_CMD) fmt --all -- --check
+	$(CARGO_FMT_CMD) --all -- --check
 
 check:
 	$(CARGO_CMD) check --workspace --all-targets
@@ -44,7 +48,7 @@ check-minimal:
 	$(CARGO_CMD) check --workspace --lib --bins --no-default-features
 
 clippy:
-	$(CARGO_CMD) clippy --workspace --all-targets -- -D warnings
+	$(CARGO_CLIPPY_CMD) --workspace --all-targets -- -D warnings
 
 test:
 	$(CARGO_CMD) test --workspace

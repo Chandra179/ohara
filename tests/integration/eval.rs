@@ -61,6 +61,44 @@ struct EvalFixture {
     config: Config,
 }
 
+/// Small deterministic embedder used by hermetic retrieval acceptance tests.
+struct EvalEmbedder;
+
+impl Embedder for EvalEmbedder {
+    fn model_id(&self) -> &'static str {
+        "eval-fake-embedder"
+    }
+
+    fn dim(&self) -> usize {
+        4
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count() + 2
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ohara::pipeline::EmbedError> {
+        // Word-hash bag: shared vocabulary produces stable, useful lexical
+        // similarity without downloading a model.
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let mut v = [0.0f32; 4];
+                for word in t.split_whitespace() {
+                    let b = usize::from(word.as_bytes().first().copied().unwrap_or(b' '));
+                    v[b % 4] += 1.0;
+                }
+                let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt();
+                if norm > 0.0 {
+                    v.map(|x| x / norm).to_vec()
+                } else {
+                    v.to_vec()
+                }
+            })
+            .collect())
+    }
+}
+
 /// Seeds the graph side for one topic (§8 Stage 4 write shape): a CONCEPT
 /// entity with a typed alias, its `EntityNames` vector, `:MENTIONS` edges from
 /// every chunk, so the graph path has structure to traverse.
@@ -370,44 +408,7 @@ async fn run_eval(
 /// the one that gates retrieval changes.
 #[tokio::test]
 async fn eval_retrieval_baseline_machinery() {
-    struct FakeEmbedder;
-
-    impl Embedder for FakeEmbedder {
-        fn model_id(&self) -> &'static str {
-            "eval-fake-embedder"
-        }
-
-        fn dim(&self) -> usize {
-            4
-        }
-
-        fn count_tokens(&self, text: &str) -> usize {
-            text.split_whitespace().count() + 2
-        }
-
-        fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ohara::pipeline::EmbedError> {
-            // Word-hash bag (same shape as the unit-test fake): shared
-            // vocabulary → shared vectors, so the lexical golden set works.
-            Ok(texts
-                .iter()
-                .map(|t| {
-                    let mut v = [0.0f32; 4];
-                    for word in t.split_whitespace() {
-                        let b = usize::from(word.as_bytes().first().copied().unwrap_or(b' '));
-                        v[b % 4] += 1.0;
-                    }
-                    let norm = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]).sqrt();
-                    if norm > 0.0 {
-                        v.map(|x| x / norm).to_vec()
-                    } else {
-                        v.to_vec()
-                    }
-                })
-                .collect())
-        }
-    }
-
-    let embedder = FakeEmbedder;
+    let embedder = EvalEmbedder;
     let (fixture, knowledge, queries) = build_corpus(&embedder).await;
     assert_eq!(queries.len(), 50, "§14: 50-query golden set");
 
@@ -428,6 +429,98 @@ async fn eval_retrieval_baseline_machinery() {
         "graph machinery floor: {metrics:?}"
     );
     assert!(metrics.fused_mrr >= 0.7, "fusion floor: {metrics:?}");
+}
+
+/// End-to-end retrieval acceptance cases that are not represented by the
+/// single-relevant-chunk golden set: typed entity aliases, graph-backed
+/// retrieval, empty input, and deletion cleanup across every read path.
+#[tokio::test]
+async fn retrieval_acceptance_covers_entities_empty_queries_and_deletion() {
+    let embedder = EvalEmbedder;
+    let (fixture, knowledge, _queries) = build_corpus(&embedder).await;
+    let conn = control::connect(&fixture.store).unwrap();
+    let normalizer = WhatlangNormalizer::new(fixture_config(&fixture).detection_confidence_floor());
+    let retriever = Retriever::new(
+        &conn,
+        &knowledge,
+        &embedder,
+        &normalizer,
+        &IdentityReranker,
+        fixture_config(&fixture),
+    );
+
+    let entities = retriever.query_entities("wal checkpointing").await.unwrap();
+    assert!(
+        entities.iter().any(|entity| entity.entity_id == "ent-0"
+            && entity.source == ohara::pipeline::QueryEntitySource::Alias),
+        "typed topic alias must resolve before embedding fallback: {entities:?}"
+    );
+
+    let topic_doc = find_doc(&conn, "https://eval.example/0");
+    let topic_chunks = control::chunk_signatures(&conn, &topic_doc)
+        .unwrap()
+        .into_iter()
+        .map(|signature| signature.chunk_id)
+        .collect::<HashSet<_>>();
+    let results = retriever.query("wal checkpointing", 20).await.unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|chunk| topic_chunks.contains(&chunk.chunk_id)),
+        "graph-backed entity retrieval must return the topic's chunks"
+    );
+    assert!(
+        retriever.query("   ", 20).await.unwrap().is_empty(),
+        "empty queries must not scan or return arbitrary corpus results"
+    );
+
+    // Follow the production deletion order: knowledge first, then the
+    // SQLite intent/cascade. This verifies no stale result survives in FTS,
+    // vectors, or graph mentions.
+    knowledge.delete_doc(&topic_doc).await.unwrap();
+    control::request_deletion(&conn, &topic_doc, Some("acceptance test")).unwrap();
+    let report = control::reconcile(&conn, NOW, std::time::Duration::ZERO).unwrap();
+    assert_eq!(report.deletions_executed, 1);
+    let deleted_chunk = topic_chunks
+        .iter()
+        .next()
+        .expect("the evaluation topic has chunks");
+    assert!(
+        !knowledge
+            .has_vector(
+                VectorSpace::Chunks {
+                    model_id: ModelId::new(embedder.model_id().to_string()),
+                },
+                deleted_chunk,
+            )
+            .await
+            .unwrap(),
+        "deletion must remove the topic's vector rows"
+    );
+    assert!(
+        knowledge
+            .chunks_for_entities(&["ent-0"])
+            .await
+            .unwrap()
+            .is_empty(),
+        "deletion must remove graph mention edges"
+    );
+    assert!(
+        retriever
+            .query("wal checkpointing", 20)
+            .await
+            .unwrap()
+            .iter()
+            .all(|chunk| !topic_chunks.contains(&chunk.chunk_id)),
+        "deleted chunks must disappear from every retrieval path"
+    );
+    assert!(
+        control::search_bm25(&conn, "checkpointing", 20)
+            .unwrap()
+            .iter()
+            .all(|chunk| !topic_chunks.contains(&chunk.chunk_id)),
+        "deletion must not leave FTS ghosts"
+    );
 }
 
 /// The real-model run (§15 step 5's "measured on the golden set"): the pinned

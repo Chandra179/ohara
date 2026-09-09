@@ -218,6 +218,54 @@ fn vec_to_value(v: &[f32]) -> lbug::Value {
     )
 }
 
+/// Keeps the graph-side chunk identity aligned with chunk-vector writes. The
+/// vectorize stage runs before entity extraction, so this is what gives a later
+/// `link_mention` call a document-owned `Chunk` node instead of a bare node
+/// that deletion cannot find (§7.6).
+fn ensure_chunk_node(
+    conn: &lbug::Connection<'_>,
+    chunk_id: &str,
+    doc_id: &str,
+) -> Result<(), KnowledgeError> {
+    let mut find = conn
+        .prepare("MATCH (c:Chunk {chunk_id: $id}) RETURN count(c)")
+        .map_err(|e| backend(&e))?;
+    let exists = conn
+        .execute(
+            &mut find,
+            vec![("id", lbug::Value::String(chunk_id.into()))],
+        )
+        .map_err(|e| backend(&e))?
+        .next()
+        .map_or(0, |row| int_at(&row, 0));
+    if exists == 0 {
+        let mut insert = conn
+            .prepare("CREATE (c:Chunk {chunk_id: $id, doc_id: $doc})")
+            .map_err(|e| backend(&e))?;
+        conn.execute(
+            &mut insert,
+            vec![
+                ("id", lbug::Value::String(chunk_id.into())),
+                ("doc", lbug::Value::String(doc_id.into())),
+            ],
+        )
+        .map_err(|e| backend(&e))?;
+    } else {
+        let mut update = conn
+            .prepare("MATCH (c:Chunk {chunk_id: $id}) SET c.doc_id = $doc")
+            .map_err(|e| backend(&e))?;
+        conn.execute(
+            &mut update,
+            vec![
+                ("id", lbug::Value::String(chunk_id.into())),
+                ("doc", lbug::Value::String(doc_id.into())),
+            ],
+        )
+        .map_err(|e| backend(&e))?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl KnowledgeStore for LadybugStore {
     fn capabilities(&self) -> crate::knowledge::KsCapabilities {
@@ -256,6 +304,7 @@ impl KnowledgeStore for LadybugStore {
         }
         let conn = self.conn()?;
         let table = self.ensure_collection(&conn, &space)?;
+        let is_chunk_space = matches!(&space, VectorSpace::Chunks { .. });
         conn.query("BEGIN TRANSACTION").map_err(|e| backend(&e))?;
         let mut del = conn
             .prepare(&format!("MATCH (v:{table} {{id: $id}}) DELETE v"))
@@ -277,6 +326,9 @@ impl KnowledgeStore for LadybugStore {
                 ],
             )
             .map_err(|e| backend(&e))?;
+            if is_chunk_space {
+                ensure_chunk_node(&conn, id, doc_id)?;
+            }
         }
         conn.query("COMMIT").map_err(|e| backend(&e))?;
         Ok(())
