@@ -99,13 +99,11 @@ pub struct Ollama {
     base: url::Url,
     client: reqwest::Client,
     usage: Mutex<LlmUsage>,
+    health_timeout: std::time::Duration,
 }
 
 /// The OpenAI-compatible completions path on an Ollama endpoint.
 const COMPLETIONS_PATH: &str = "/v1/chat/completions";
-
-/// Health-check timeout: liveness is a boot gate (§2), not an inference wait.
-const HEALTH_TIMEOUT_SECS: u64 = 10;
 
 impl Ollama {
     /// Builds the client for `base_url` (config-validated http/https). No network
@@ -113,7 +111,10 @@ impl Ollama {
     ///
     /// # Errors
     /// [`LlmError::Unavailable`] if the HTTP client cannot be built.
-    pub fn new(base_url: url::Url) -> Result<Self, LlmError> {
+    pub fn new(
+        base_url: url::Url,
+        health_timeout: std::time::Duration,
+    ) -> Result<Self, LlmError> {
         let client = reqwest::Client::builder().build().map_err(|e| {
             LlmError::Unavailable(format!("cannot build http client for {base_url}: {e}"))
         })?;
@@ -121,6 +122,7 @@ impl Ollama {
             base: base_url,
             client,
             usage: Mutex::new(LlmUsage::default()),
+            health_timeout,
         })
     }
 
@@ -139,7 +141,7 @@ impl Ollama {
         let resp = self
             .client
             .get(url)
-            .timeout(std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS))
+            .timeout(self.health_timeout)
             .send()
             .await
             .map_err(|e| LlmError::Unavailable(format!("ollama health probe failed: {e}")))?;

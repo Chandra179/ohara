@@ -16,13 +16,6 @@ use reqwest::{Client, StatusCode};
 use super::robots::Robots;
 use super::{FetchCapabilities, FetchError, FetchPolicy, FetchedDoc, Fetcher, NormalizedUrl};
 
-/// Hard cap on a response body (§11 cost posture: a multi-GB response is a
-/// protocol violation, not a document).
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
-
-/// §12: at most 5 redirect hops, each re-validated.
-const MAX_REDIRECTS: usize = 5;
-
 /// The user-agent token this crawler presents to `robots.txt` (§8: honest UA).
 const AGENT_TOKEN: &str = "ohara";
 
@@ -38,6 +31,10 @@ pub struct HttpFetcherParams {
     pub rate_limit: Duration,
     /// §12 override: allow private/loopback/link-local targets (tests, intranets).
     pub allow_private_hosts: bool,
+    /// Maximum accepted response body in bytes.
+    pub max_body_bytes: usize,
+    /// Maximum redirect hops, each revalidated for SSRF.
+    pub max_redirects: usize,
 }
 
 /// Ladder leg 1 — the [`Fetcher`] for plain HTTP fetching. Lives as long as the
@@ -46,6 +43,8 @@ pub struct HttpFetcher {
     client: Client,
     timeout_secs: u64,
     rate_limit: Duration,
+    max_body_bytes: usize,
+    max_redirects: usize,
     robots: Mutex<HashMap<String, Arc<RobotsDecision>>>,
     last_hit: Mutex<HashMap<String, Instant>>,
 }
@@ -100,6 +99,8 @@ impl HttpFetcher {
             client,
             timeout_secs: params.timeout.as_secs(),
             rate_limit: params.rate_limit,
+            max_body_bytes: params.max_body_bytes,
+            max_redirects: params.max_redirects,
             robots: Mutex::new(HashMap::new()),
             last_hit: Mutex::new(HashMap::new()),
         })
@@ -199,7 +200,7 @@ impl HttpFetcher {
         url: &NormalizedUrl,
     ) -> Result<(reqwest::Response, NormalizedUrl), FetchError> {
         let mut current = url.clone();
-        for _ in 0..=MAX_REDIRECTS {
+        for _ in 0..=self.max_redirects {
             let response = self.request_once(&current).await?;
             if !response.status().is_redirection() {
                 return Ok((response, current));
@@ -215,7 +216,8 @@ impl HttpFetcher {
             current = NormalizedUrl::new(location, current.as_str())?;
         }
         Err(FetchError::Protocol(format!(
-            "more than {MAX_REDIRECTS} redirects on {url}"
+            "more than {} redirects on {url}",
+            self.max_redirects
         )))
     }
 
@@ -260,9 +262,10 @@ impl HttpFetcher {
                     .bytes()
                     .await
                     .map_err(|e| map_request_error(&e, self.timeout_secs))?;
-                if body.len() > MAX_BODY_BYTES {
+                if body.len() > self.max_body_bytes {
                     return Err(FetchError::Protocol(format!(
-                        "body exceeds {MAX_BODY_BYTES} bytes on {url}"
+                        "body exceeds {} bytes on {url}",
+                        self.max_body_bytes
                     )));
                 }
                 Ok(FetchedDoc {
@@ -454,6 +457,8 @@ mod tests {
             timeout: Duration::from_secs(2),
             rate_limit: rate,
             allow_private_hosts: allow_private,
+            max_body_bytes: 10 * 1024 * 1024,
+            max_redirects: 5,
         })
         .unwrap()
     }
@@ -647,6 +652,8 @@ mod tests {
             timeout: Duration::from_millis(300),
             rate_limit: Duration::ZERO,
             allow_private_hosts: true,
+            max_body_bytes: 10 * 1024 * 1024,
+            max_redirects: 5,
         })
         .unwrap();
         let err = fetcher

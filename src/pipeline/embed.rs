@@ -13,7 +13,7 @@ use crate::knowledge::{KnowledgeError, ModelId, VectorSpace};
 
 use super::StageError;
 use super::StageOutcome;
-use super::chunk::{self, CHUNK_BUDGET_TOKENS};
+use super::chunk;
 
 /// The embedder port (§9): pinned model identity, order-preserving batch embedding.
 /// Sync by contract — CPU-bound batch; callers invoke it inside `spawn_blocking`
@@ -124,9 +124,13 @@ pub(super) fn run(ctx: &super::StageCtx<'_>, job: &ClaimedJob) -> Result<StageOu
 
     // §8 Stage 3: budget measured in the embedder's tokenizer, breadcrumb
     // included.
-    let chunks = chunk::chunk_document(&markdown, &title, CHUNK_BUDGET_TOKENS, &|s| {
-        ctx.embedder.count_tokens(s)
-    });
+    let chunks = chunk::chunk_document(
+        &markdown,
+        &title,
+        ctx.config.pipeline().chunk_budget_tokens(),
+        ctx.config.pipeline().chunk_overlap_percent(),
+        &|s| ctx.embedder.count_tokens(s),
+    );
 
     // §3 identity: chunk_id = sha256(doc_id:seq); §8 dedup: sha256(embed_text).
     let hashes: Vec<String> = chunks
@@ -378,7 +382,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::control::testing::seed_doc;
-    use crate::control::{self, ClaimedJob, Stage};
+    use crate::control::{self, ClaimedJob, ControlDb, Stage};
     use crate::knowledge::KnowledgeStore;
     use crate::pipeline::test_support::{
         FakeEmbedder, InMemoryKnowledge, NeverExtractor, NeverFetcher,
@@ -423,7 +427,7 @@ mod tests {
             .join(format!("{doc_id}.md"));
         std::fs::create_dir_all(clean_path.parent().unwrap()).unwrap();
         std::fs::write(&clean_path, MARKDOWN).unwrap();
-        conn.execute(
+        conn.raw().execute(
             "UPDATE documents SET status = 'CLEANED', clean_file_path = ?2, title = 'On SQLite' WHERE doc_id = ?1",
             rusqlite::params![doc_id, clean_path.to_string_lossy()],
         )
@@ -438,7 +442,7 @@ mod tests {
         }
     }
 
-    fn vectorize_job(conn: &rusqlite::Connection, doc_id: &str) -> ClaimedJob {
+    fn vectorize_job(conn: &ControlDb, doc_id: &str) -> ClaimedJob {
         control::enqueue(conn, "v-job", doc_id, Stage::Vectorize, 5, None, NOW).unwrap();
         control::claim_next(conn, Stage::Vectorize, "w1", NOW, 60)
             .unwrap()
@@ -521,6 +525,7 @@ mod tests {
         assert!(doc.token_count.unwrap_or(0) > 0);
         // The registry points at the embedder's model (§4).
         let stored_model: String = conn
+            .raw()
             .query_row(
                 "SELECT embedding_model FROM chunks WHERE doc_id = ?1 LIMIT 1",
                 rusqlite::params![fx.doc_id],

@@ -20,6 +20,14 @@ mod defaults {
     pub const STAGE_EVENTS_RETENTION_DAYS: u64 = 90;
     /// Global politeness default: 1 request / 2 s (§8 Stage 1).
     pub const RATE_LIMIT_MS: u64 = 2_000;
+    /// The Stage 4 graph path is enabled in the reference profile (§6).
+    pub const GRAPH_ENABLED: bool = true;
+    /// Honor robots.txt by default (§8 Stage 1).
+    pub const FETCH_ROBOTS: bool = true;
+    /// Refuse private targets by default (§12 SSRF posture).
+    pub const FETCH_ALLOW_PRIVATE_HOSTS: bool = false;
+    /// The default corpus language (§4).
+    pub const TARGET_LANGUAGE: &str = "en";
     /// Pinned embedder model (§4); the quantization variant is part of the id (§11.1).
     pub const EMBEDDER_MODEL: &str = "bge-small-en-v1.5";
     /// Pinned embedder dimensionality (§4).
@@ -28,6 +36,8 @@ mod defaults {
     pub const LLM_BASE_URL: &str = "http://localhost:11434";
     /// Pinned extraction model (§11.2).
     pub const LLM_EXTRACTION_MODEL: &str = "phi4-mini:latest";
+    /// Cloud LLM egress is opt-in (§12).
+    pub const LLM_CLOUD_ENABLED: bool = false;
     /// §8 Stage 4.2: normalized-name similarity floor for same-supertype
     /// entity-resolution matches.
     pub const ER_NAME_SIMILARITY: f64 = 0.85;
@@ -49,6 +59,28 @@ mod defaults {
     pub const RETRIEVAL_FACT_HOPS: u8 = 2;
     /// Fetch deadline per request (§8 Stage 1).
     pub const FETCH_TIMEOUT_SECS: u64 = 30;
+    /// Maximum accepted HTTP response body (§11 cost posture).
+    pub const FETCH_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+    /// Maximum redirect hops (§12 SSRF posture).
+    pub const FETCH_MAX_REDIRECTS: usize = 5;
+    /// Minimum clean document size (§8 Stage 2 quality gate).
+    pub const MIN_WORD_COUNT: i64 = 50;
+    /// Embedder-token budget for one chunk (§4).
+    pub const CHUNK_BUDGET_TOKENS: usize = 512;
+    /// Recursive chunk overlap as a percentage of the content budget (§8).
+    pub const CHUNK_OVERLAP_PERCENT: usize = 12;
+    /// Maximum extracted triplets per chunk (§8 Stage 4).
+    pub const MAX_TRIPLETS_PER_CHUNK: usize = 32;
+    /// Entity-resolution candidate breadth (§8 Stage 4.2).
+    pub const ER_CANDIDATE_K: usize = 8;
+    /// Candidate pool per retrieval path (§8 Stage 5).
+    pub const RETRIEVAL_POOL: usize = 50;
+    /// Reciprocal-rank fusion constant (§8 Stage 5.4).
+    pub const RETRIEVAL_RRF_K: f32 = 60.0;
+    /// Minimum confidence for language classification on queries.
+    pub const QUERY_DETECTION_CONFIDENCE_FLOOR: f64 = 0.5;
+    /// Ollama liveness probe timeout (§2 boot gate).
+    pub const LLM_HEALTH_TIMEOUT_SECS: u64 = 10;
     /// Honest User-Agent (§8): identifies the crawler and its owner.
     pub const USER_AGENT: &str = concat!(
         "ohara/",
@@ -110,6 +142,11 @@ pub struct EmbedderConfig {
 pub struct PipelineConfig {
     /// Whether the stage chain continues past VECTORIZE into EXTRACT (§6).
     graph_enabled: bool,
+    min_word_count: i64,
+    chunk_budget_tokens: usize,
+    chunk_overlap_percent: usize,
+    max_triplets_per_chunk: usize,
+    entity_candidate_k: usize,
 }
 
 /// Knowledge-plane namespace pointers (§4): the read switch is atomic, the write
@@ -133,6 +170,10 @@ pub struct FetcherConfig {
     user_agent: String,
     /// §12 override for tests and intranets; defaults to refused.
     allow_private_hosts: bool,
+    /// Maximum accepted response body in bytes.
+    max_body_bytes: usize,
+    /// Maximum redirect hops, each revalidated for SSRF.
+    max_redirects: usize,
 }
 
 /// LLM endpoint and pinned models (§2, §11.2, §12).
@@ -142,6 +183,7 @@ pub struct LlmConfig {
     extraction_model: String,
     fallback_model: Option<String>,
     cloud_llm_enabled: bool,
+    health_timeout: Duration,
 }
 
 /// Entity-resolution thresholds and fact-edge caps (§8 Stage 4). The thresholds
@@ -162,6 +204,9 @@ pub struct RetrievalConfig {
     entity_embedding_threshold: f64,
     max_query_entities: usize,
     fact_hops: u8,
+    pool: usize,
+    rrf_k: f32,
+    detection_confidence_floor: f64,
 }
 
 /// Raw TOML mirror — `deny_unknown_fields` so a typo'd knob fails at boot, not never.
@@ -192,11 +237,13 @@ struct RawFetcher {
     timeout_secs: Option<u64>,
     user_agent: Option<String>,
     allow_private_hosts: Option<bool>,
+    max_body_bytes: Option<usize>,
+    max_redirects: Option<usize>,
 }
 
 fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
     FetcherConfig {
-        robots: raw.and_then(|f| f.robots).unwrap_or(true),
+        robots: raw.and_then(|f| f.robots).unwrap_or(defaults::FETCH_ROBOTS),
         timeout: Duration::from_secs(
             raw.and_then(|f| f.timeout_secs)
                 .unwrap_or(defaults::FETCH_TIMEOUT_SECS),
@@ -204,7 +251,15 @@ fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
         user_agent: raw
             .and_then(|f| f.user_agent.clone())
             .unwrap_or_else(|| defaults::USER_AGENT.to_string()),
-        allow_private_hosts: raw.and_then(|f| f.allow_private_hosts).unwrap_or(false),
+        allow_private_hosts: raw
+            .and_then(|f| f.allow_private_hosts)
+            .unwrap_or(defaults::FETCH_ALLOW_PRIVATE_HOSTS),
+        max_body_bytes: raw
+            .and_then(|f| f.max_body_bytes)
+            .unwrap_or(defaults::FETCH_MAX_BODY_BYTES),
+        max_redirects: raw
+            .and_then(|f| f.max_redirects)
+            .unwrap_or(defaults::FETCH_MAX_REDIRECTS),
     }
 }
 
@@ -212,6 +267,11 @@ fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
 #[serde(deny_unknown_fields)]
 struct RawPipeline {
     graph_enabled: Option<bool>,
+    min_word_count: Option<i64>,
+    chunk_budget_tokens: Option<usize>,
+    chunk_overlap_percent: Option<usize>,
+    max_triplets_per_chunk: Option<usize>,
+    entity_candidate_k: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -235,6 +295,7 @@ struct RawLlm {
     extraction_model: Option<String>,
     fallback_model: Option<String>,
     cloud_llm_enabled: Option<bool>,
+    health_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -252,6 +313,9 @@ struct RawRetrieval {
     entity_embedding_threshold: Option<f64>,
     max_query_entities: Option<usize>,
     fact_hops: Option<u8>,
+    pool: Option<usize>,
+    rrf_k: Option<f32>,
+    detection_confidence_floor: Option<f64>,
 }
 
 fn build_er(raw: Option<&RawEr>) -> ErConfig {
@@ -280,6 +344,11 @@ fn build_retrieval(raw: Option<&RawRetrieval>) -> RetrievalConfig {
             .max_query_entities
             .unwrap_or(defaults::RETRIEVAL_MAX_QUERY_ENTITIES),
         fact_hops: raw.fact_hops.unwrap_or(defaults::RETRIEVAL_FACT_HOPS),
+        pool: raw.pool.unwrap_or(defaults::RETRIEVAL_POOL),
+        rrf_k: raw.rrf_k.unwrap_or(defaults::RETRIEVAL_RRF_K),
+        detection_confidence_floor: raw
+            .detection_confidence_floor
+            .unwrap_or(defaults::QUERY_DETECTION_CONFIDENCE_FLOOR),
     }
 }
 
@@ -331,14 +400,39 @@ impl Config {
 
         let target_languages = raw
             .target_languages
-            .unwrap_or_else(|| vec!["en".to_string()]);
+            .unwrap_or_else(|| vec![defaults::TARGET_LANGUAGE.to_string()]);
 
         let pipeline = PipelineConfig {
             graph_enabled: raw
                 .pipeline
                 .as_ref()
                 .and_then(|p| p.graph_enabled)
-                .unwrap_or(true),
+                .unwrap_or(defaults::GRAPH_ENABLED),
+            min_word_count: raw
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.min_word_count)
+                .unwrap_or(defaults::MIN_WORD_COUNT),
+            chunk_budget_tokens: raw
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.chunk_budget_tokens)
+                .unwrap_or(defaults::CHUNK_BUDGET_TOKENS),
+            chunk_overlap_percent: raw
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.chunk_overlap_percent)
+                .unwrap_or(defaults::CHUNK_OVERLAP_PERCENT),
+            max_triplets_per_chunk: raw
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.max_triplets_per_chunk)
+                .unwrap_or(defaults::MAX_TRIPLETS_PER_CHUNK),
+            entity_candidate_k: raw
+                .pipeline
+                .as_ref()
+                .and_then(|p| p.entity_candidate_k)
+                .unwrap_or(defaults::ER_CANDIDATE_K),
         };
 
         let fetcher = build_fetcher(raw.fetcher.as_ref());
@@ -386,7 +480,13 @@ impl Config {
                 .llm
                 .as_ref()
                 .and_then(|l| l.cloud_llm_enabled)
-                .unwrap_or(false),
+                .unwrap_or(defaults::LLM_CLOUD_ENABLED),
+            health_timeout: Duration::from_secs(
+                raw.llm
+                    .as_ref()
+                    .and_then(|l| l.health_timeout_secs)
+                    .unwrap_or(defaults::LLM_HEALTH_TIMEOUT_SECS),
+            ),
         };
 
         let er = build_er(raw.er.as_ref());
@@ -435,6 +535,27 @@ impl Config {
             !self.rate_limit.is_zero(),
             "default_rate_limit_ms must be > 0",
         )?;
+        checked(
+            self.pipeline.min_word_count > 0,
+            "pipeline.min_word_count must be > 0",
+        )?;
+        checked(
+            self.pipeline.chunk_budget_tokens > 0
+                && self.pipeline.chunk_budget_tokens <= defaults::CHUNK_BUDGET_TOKENS,
+            "pipeline.chunk_budget_tokens must be in 1..=512 for the pinned embedder",
+        )?;
+        checked(
+            self.pipeline.chunk_overlap_percent <= 100,
+            "pipeline.chunk_overlap_percent must be <= 100",
+        )?;
+        checked(
+            self.pipeline.max_triplets_per_chunk > 0,
+            "pipeline.max_triplets_per_chunk must be > 0",
+        )?;
+        checked(
+            self.pipeline.entity_candidate_k > 0,
+            "pipeline.entity_candidate_k must be > 0",
+        )?;
         checked(self.embedder.dim > 0, "embedder.dim must be > 0")?;
         checked(
             !self.embedder.model_id.is_empty(),
@@ -453,8 +574,20 @@ impl Config {
             "llm.extraction_model must be non-empty",
         )?;
         checked(
+            !self.llm.health_timeout.is_zero(),
+            "llm.health_timeout_secs must be > 0",
+        )?;
+        checked(
             !self.fetcher.timeout.is_zero(),
             "fetcher.timeout_secs must be > 0",
+        )?;
+        checked(
+            self.fetcher.max_body_bytes > 0,
+            "fetcher.max_body_bytes must be > 0",
+        )?;
+        checked(
+            self.fetcher.max_redirects > 0,
+            "fetcher.max_redirects must be > 0",
         )?;
         checked(
             !self.fetcher.user_agent.is_empty(),
@@ -492,6 +625,17 @@ impl Config {
         checked(
             self.retrieval.fact_hops > 0 && self.retrieval.fact_hops <= 2,
             "retrieval.fact_hops must be in 1..=2 (§8 Stage 5.3 precision-first)",
+        )?;
+        checked(self.retrieval.pool > 0, "retrieval.pool must be > 0")?;
+        checked(
+            self.retrieval.rrf_k.is_finite() && self.retrieval.rrf_k > 0.0,
+            "retrieval.rrf_k must be finite and > 0",
+        )?;
+        checked(
+            self.retrieval.detection_confidence_floor.is_finite()
+                && self.retrieval.detection_confidence_floor >= 0.0
+                && self.retrieval.detection_confidence_floor <= 1.0,
+            "retrieval.detection_confidence_floor must be in [0, 1]",
         )?;
         Ok(())
     }
@@ -594,6 +738,36 @@ impl PipelineConfig {
     pub fn graph_enabled(&self) -> bool {
         self.graph_enabled
     }
+
+    /// Minimum clean-text word count accepted by Stage 2.
+    #[must_use]
+    pub fn min_word_count(&self) -> i64 {
+        self.min_word_count
+    }
+
+    /// Maximum chunk size in embedder tokens.
+    #[must_use]
+    pub fn chunk_budget_tokens(&self) -> usize {
+        self.chunk_budget_tokens
+    }
+
+    /// Recursive chunk overlap percentage.
+    #[must_use]
+    pub fn chunk_overlap_percent(&self) -> usize {
+        self.chunk_overlap_percent
+    }
+
+    /// Maximum triplets accepted from one extraction response.
+    #[must_use]
+    pub fn max_triplets_per_chunk(&self) -> usize {
+        self.max_triplets_per_chunk
+    }
+
+    /// Entity-resolution candidate breadth.
+    #[must_use]
+    pub fn entity_candidate_k(&self) -> usize {
+        self.entity_candidate_k
+    }
 }
 
 impl FetcherConfig {
@@ -619,6 +793,18 @@ impl FetcherConfig {
     #[must_use]
     pub fn allow_private_hosts(&self) -> bool {
         self.allow_private_hosts
+    }
+
+    /// Maximum accepted HTTP response body in bytes.
+    #[must_use]
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
+    }
+
+    /// Maximum redirect hops.
+    #[must_use]
+    pub fn max_redirects(&self) -> usize {
+        self.max_redirects
     }
 }
 
@@ -674,6 +860,12 @@ impl LlmConfig {
     pub fn cloud_llm_enabled(&self) -> bool {
         self.cloud_llm_enabled
     }
+
+    /// Timeout for the boot liveness probe.
+    #[must_use]
+    pub fn health_timeout(&self) -> Duration {
+        self.health_timeout
+    }
 }
 
 impl ErConfig {
@@ -721,6 +913,24 @@ impl RetrievalConfig {
     pub fn fact_hops(&self) -> u8 {
         self.fact_hops
     }
+
+    /// Candidate pool size per retrieval path.
+    #[must_use]
+    pub fn pool(&self) -> usize {
+        self.pool
+    }
+
+    /// Reciprocal-rank fusion constant.
+    #[must_use]
+    pub fn rrf_k(&self) -> f32 {
+        self.rrf_k
+    }
+
+    /// Minimum confidence for query language detection.
+    #[must_use]
+    pub fn detection_confidence_floor(&self) -> f64 {
+        self.detection_confidence_floor
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +960,11 @@ mod tests {
             config.pipeline().graph_enabled(),
             "graph on by default (§6)"
         );
+        assert_eq!(config.pipeline().min_word_count(), 50);
+        assert_eq!(config.pipeline().chunk_budget_tokens(), 512);
+        assert_eq!(config.pipeline().chunk_overlap_percent(), 12);
+        assert_eq!(config.pipeline().max_triplets_per_chunk(), 32);
+        assert_eq!(config.pipeline().entity_candidate_k(), 8);
     }
 
     #[test]
@@ -762,17 +977,21 @@ mod tests {
             !config.fetcher().allow_private_hosts(),
             "§12: SSRF guard on"
         );
+        assert_eq!(config.fetcher().max_body_bytes(), 10 * 1024 * 1024);
+        assert_eq!(config.fetcher().max_redirects(), 5);
     }
 
     #[test]
     fn fetcher_overrides_apply() {
         let config = Config::load_from_str(
-            "[fetcher]\nrobots = false\ntimeout_secs = 5\nallow_private_hosts = true\n",
+            "[fetcher]\nrobots = false\ntimeout_secs = 5\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\n",
         )
         .expect("valid config");
         assert!(!config.fetcher().robots());
         assert_eq!(config.fetcher().timeout(), Duration::from_secs(5));
         assert!(config.fetcher().allow_private_hosts());
+        assert_eq!(config.fetcher().max_body_bytes(), 2048);
+        assert_eq!(config.fetcher().max_redirects(), 2);
     }
 
     #[test]
@@ -847,14 +1066,20 @@ mod tests {
         assert_eq!(config.retrieval().entity_embedding_threshold(), 0.75);
         assert_eq!(config.retrieval().max_query_entities(), 8);
         assert_eq!(config.retrieval().fact_hops(), 2);
+        assert_eq!(config.retrieval().pool(), 50);
+        assert_eq!(config.retrieval().rrf_k(), 60.0);
+        assert_eq!(config.retrieval().detection_confidence_floor(), 0.5);
 
         let config = Config::load_from_str(
-            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\n",
+            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\npool = 20\nrrf_k = 42.0\ndetection_confidence_floor = 0.7\n",
         )
         .expect("valid");
         assert_eq!(config.retrieval().entity_embedding_threshold(), 0.8);
         assert_eq!(config.retrieval().max_query_entities(), 4);
         assert_eq!(config.retrieval().fact_hops(), 1);
+        assert_eq!(config.retrieval().pool(), 20);
+        assert_eq!(config.retrieval().rrf_k(), 42.0);
+        assert_eq!(config.retrieval().detection_confidence_floor(), 0.7);
     }
 
     #[test]

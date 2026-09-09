@@ -259,7 +259,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
     use super::super::documents;
-    use super::super::testing::{boot, seed_doc};
+    use super::super::testing::{boot_raw as boot, seed_doc_raw as seed_doc};
     use super::*;
 
     const NOW: &str = "2026-09-06 12:05:00";

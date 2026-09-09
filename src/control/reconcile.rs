@@ -70,7 +70,7 @@ mod tests {
 
     use super::super::documents;
     use super::super::jobs::record_event;
-    use super::super::testing::{boot, seed_doc};
+    use super::super::testing::{boot_raw as boot, seed_doc_raw as seed_doc};
     use super::*;
 
     const NOW: &str = "2026-09-06 12:00:00";

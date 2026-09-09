@@ -104,7 +104,7 @@ pub fn set(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
-    use super::super::testing::boot;
+    use super::super::testing::boot_raw as boot;
     use super::*;
 
     #[test]

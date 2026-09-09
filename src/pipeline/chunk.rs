@@ -3,15 +3,6 @@
 //! blocks are atomic; the budget is measured in the *embedder's tokenizer* (§4),
 //! so the split functions take a token counter rather than counting words.
 
-/// §8 Stage 3 budget: ≤ 512 tokens in the embedder's tokenizer, breadcrumb
-/// included. The embedder itself truncates at the same 512 (§4), so chunks that
-/// pass this gate are never truncated in practice.
-pub(super) const CHUNK_BUDGET_TOKENS: usize = 512;
-
-/// Overlap between recursive-split windows of one over-budget section (§8):
-/// 10–15% of the content budget — 12% sits mid-range.
-const OVERLAP_PERCENT: usize = 12;
-
 /// One chunk ready for the registry + embedding (§5 `chunks` columns).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -35,6 +26,7 @@ pub fn chunk_document(
     markdown: &str,
     title: &str,
     budget: usize,
+    overlap_percent: usize,
     tokens: &dyn Fn(&str) -> usize,
 ) -> Vec<Chunk> {
     let mut chunks = Vec::new();
@@ -46,7 +38,14 @@ pub fn chunk_document(
             // A heading starts a new section: flush what came before it. The
             // breadcrumb replaces the title with the heading chain (§8); the
             // heading line itself lives in the breadcrumb, its body stays here.
-            push_section(&mut chunks, &section, &header_path, budget, tokens);
+            push_section(
+                &mut chunks,
+                &section,
+                &header_path,
+                budget,
+                overlap_percent,
+                tokens,
+            );
             section.clear();
             let depth = usize::from(level); // 1-based depth of the heading
             let path: Vec<&str> = header_path
@@ -70,7 +69,14 @@ pub fn chunk_document(
             section.push_str(block);
         }
     }
-    push_section(&mut chunks, &section, &header_path, budget, tokens);
+    push_section(
+        &mut chunks,
+        &section,
+        &header_path,
+        budget,
+        overlap_percent,
+        tokens,
+    );
     finish(chunks)
 }
 
@@ -81,6 +87,7 @@ fn push_section(
     section: &str,
     header_path: &str,
     budget: usize,
+    overlap_percent: usize,
     tokens: &dyn Fn(&str) -> usize,
 ) {
     let trimmed = section.trim();
@@ -109,7 +116,13 @@ fn push_section(
         });
         return;
     }
-    for (text, header) in recursive_split(trimmed, header_path, content_budget, tokens) {
+    for (text, header) in recursive_split(
+        trimmed,
+        header_path,
+        content_budget,
+        overlap_percent,
+        tokens,
+    ) {
         chunks.push(Chunk {
             embed_text: format!("{header}\n\n{text}"),
             text,
@@ -200,10 +213,11 @@ fn recursive_split<'a>(
     text: &'a str,
     header_path: &'a str,
     budget: usize,
+    overlap_percent: usize,
     tokens: &dyn Fn(&str) -> usize,
 ) -> Vec<(String, String)> {
     let units = atomic_units(text);
-    pack(units, header_path, budget, tokens)
+    pack(units, header_path, budget, overlap_percent, tokens)
 }
 
 /// Breaks `text` into the smallest atomic pieces the ladder allows: paragraphs,
@@ -297,6 +311,7 @@ fn pack(
     units: Vec<String>,
     header_path: &str,
     budget: usize,
+    overlap_percent: usize,
     tokens: &dyn Fn(&str) -> usize,
 ) -> Vec<(String, String)> {
     let mut pieces: Vec<String> = Vec::new();
@@ -321,7 +336,7 @@ fn pack(
         }
     }
 
-    let overlap_budget = budget.saturating_mul(OVERLAP_PERCENT) / 100;
+    let overlap_budget = budget.saturating_mul(overlap_percent) / 100;
     let mut windows: Vec<(String, String)> = Vec::new();
     let mut current: Vec<String> = Vec::new();
     let mut current_tokens = 0usize;
@@ -414,7 +429,7 @@ mod tests {
     #[test]
     fn single_section_under_budget_is_one_chunk() {
         let md = "plain text without headings";
-        let chunks = chunk_document(md, "Title", 512, &words);
+        let chunks = chunk_document(md, "Title", 512, 12, &words);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].seq, 0);
         assert_eq!(chunks[0].text, md);
@@ -425,7 +440,7 @@ mod tests {
     #[test]
     fn headings_build_breadcrumbs_and_reset_sections() {
         let md = "intro\n\n# Alpha\nalpha body\n\n## Beta\nbeta body\n\n## Gamma\ngamma body\n\n# Delta\ndelta body";
-        let chunks = chunk_document(md, "Doc", 512, &words);
+        let chunks = chunk_document(md, "Doc", 512, 12, &words);
         let paths: Vec<&str> = chunks.iter().map(|c| c.header_path.as_str()).collect();
         assert_eq!(
             paths,
@@ -444,7 +459,7 @@ mod tests {
     fn over_budget_section_recursively_splits_with_overlap() {
         let para = |n: usize| format!("sentence {n} with some words to fill budget. ");
         let md: String = std::iter::repeat_n(para(1), 40).collect();
-        let chunks = chunk_document(&md, "T", 60, &words);
+        let chunks = chunk_document(&md, "T", 60, 12, &words);
         assert!(chunks.len() > 1, "expected multiple windows");
         // Budget respected on every chunk
         for chunk in &chunks {
@@ -466,7 +481,7 @@ mod tests {
     fn tables_and_code_fences_are_atomic() {
         let table = "| a | b |\n|---|---|\n| 1 | 2 |";
         let md = format!("# H\n{table}\n\n```rust\nfn main() {{}}\n```\n");
-        let chunks = chunk_document(&md, "T", 512, &words);
+        let chunks = chunk_document(&md, "T", 512, 12, &words);
         assert!(chunks.iter().any(|c| c.text.contains("| 1 | 2 |")));
         assert!(chunks.iter().any(|c| c.text.contains("fn main()")));
         for chunk in &chunks {
@@ -484,7 +499,7 @@ mod tests {
             let _ = write!(table, "| x{i} | y{i} |");
             table.push('\n');
         }
-        let chunks = chunk_document(&table, "T", 30, &words);
+        let chunks = chunk_document(&table, "T", 30, 12, &words);
         assert_eq!(chunks.len(), 1, "table never split mid-block (§8)");
         assert!(chunks[0].text.contains("| x199 | y199 |"));
     }
@@ -496,13 +511,13 @@ mod tests {
         // budget (an unbreakable single sentence is the documented backstop).
         let md = "one two three four five. six seven eight nine ten.";
         let big_title = "T".repeat(8);
-        let chunks = chunk_document(md, &big_title, 12, &words);
+        let chunks = chunk_document(md, &big_title, 12, 12, &words);
         assert_eq!(
             chunks.len(),
             1,
             "breadcrumb + content within budget: one chunk"
         );
-        let chunks = chunk_document(md, "one two three", 12, &words);
+        let chunks = chunk_document(md, "one two three", 12, 12, &words);
         assert!(
             chunks.len() >= 2,
             "breadcrumb + content over budget must split"
@@ -511,8 +526,8 @@ mod tests {
 
     #[test]
     fn empty_and_whitespace_only_documents_yield_no_chunks() {
-        assert!(chunk_document("", "T", 512, &words).is_empty());
-        assert!(chunk_document("  \n\n \t ", "T", 512, &words).is_empty());
+        assert!(chunk_document("", "T", 512, 12, &words).is_empty());
+        assert!(chunk_document("  \n\n \t ", "T", 512, 12, &words).is_empty());
     }
 
     #[test]

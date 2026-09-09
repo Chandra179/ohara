@@ -217,6 +217,19 @@ pub fn entity_type_of(conn: &Connection, entity_id: &str) -> Result<Option<Strin
     }
 }
 
+/// Reads an entity's canonical name for knowledge-plane vector repair.
+pub(crate) fn canonical_name(
+    conn: &Connection,
+    entity_id: &str,
+) -> Result<Option<String>, DbError> {
+    let mut stmt = conn.prepare("SELECT canonical_name FROM entities WHERE entity_id = ?1")?;
+    let mut rows = stmt.query([entity_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
 /// Every canonical name registered under `entity_type` (§8 Stage 4.2: similarity
 /// matching never crosses supertypes).
 ///
@@ -331,7 +344,7 @@ pub(crate) fn new_entity_id() -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::super::documents::replace_chunks;
-    use super::super::testing::{boot, seed_doc};
+    use super::super::testing::{boot_raw as boot, seed_doc_raw as seed_doc};
     use super::super::{NewChunkRow, Stage};
     use super::*;
 

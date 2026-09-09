@@ -5,6 +5,22 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Build-order references are §15
 steps. Anything not listed here is implemented (or a deliberate, documented
 non-goal).
 
+## Stabilization before feature expansion
+These are the next maintenance priorities before tuning retrieval or adding more
+providers. Keep each change behind the existing plane ports and run the full
+verification gates after every slice.
+
+- Expand the retrieval evaluation set before changing thresholds: add
+  entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and
+  failure/retry cases; record per-path recall, fused MRR, rerank delta, and
+  regression baselines.
+- Add operational acceptance coverage: boot/restart reconciliation, replay
+  idempotence, deletion cleanup across SQLite/FTS/vector/graph stores, and
+  retry/dead-letter behavior.
+- Finish the first usable operator slice: query/retrieval from the CLI with
+  citations, plus backup, requeue, archive, delete, and basic health/metrics
+  output. Keep these as explicit commands rather than leaking store internals.
+
 ## Stage 5 — Retrieval leftovers
 The three-path baseline (BM25 + vector + **graph** + RRF + rerank) and query
 entities (typed aliases + `EntityNames` KNN) are done. Remaining:
@@ -37,6 +53,9 @@ outputs, usage counters, boot health check). Remaining:
 - `ohara archive <doc>` / `ohara delete <doc>`
 - A query / REPL command (retrieval is currently library/tests-only)
 - Cost / metrics dashboards (§13)
+
+Implementation order for this section: backup/restore safety, query with
+citations, requeue/archive/delete, then ER merge and dashboards.
 
 ## Deferred small items
 - Entity GC after deletion (§7.6): entities whose `MENTIONS` degree drops to zero

@@ -42,17 +42,45 @@ pub enum DbError {
     },
 }
 
+/// Opaque control-plane database handle.
+///
+/// SQLite stays an implementation detail of the control plane: callers use the
+/// domain operations re-exported from [`crate::control`] instead of receiving a
+/// vendor connection they can query directly.
+pub struct ControlDb {
+    connection: Connection,
+}
+
+impl std::fmt::Debug for ControlDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlDb").finish_non_exhaustive()
+    }
+}
+
+impl ControlDb {
+    /// Borrows the SQLite connection for control-plane implementation code.
+    pub(crate) fn raw(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Converts the handle into its connection for in-crate unit-test fixtures.
+    #[cfg(test)]
+    pub(crate) fn into_raw(self) -> Connection {
+        self.connection
+    }
+}
+
 /// Opens (creating if needed) the control store at `path`, sets the §5 connection
 /// pragmas, and applies any pending migrations.
 ///
 /// # Errors
 /// [`DbError::Sqlite`] on open or pragma failure; [`DbError::Migration`] naming the
 /// version if a migration fails mid-apply.
-pub fn connect(path: &Path) -> Result<Connection, DbError> {
+pub fn connect(path: &Path) -> Result<ControlDb, DbError> {
     let conn = Connection::open(path)?;
     set_pragmas(&conn)?;
     migrate(&conn)?;
-    Ok(conn)
+    Ok(ControlDb { connection: conn })
 }
 
 /// The §5 pragmas, on every connection: WAL, `NORMAL` synchronous, `foreign_keys = ON`
@@ -173,12 +201,14 @@ mod tests {
     fn connect_boots_a_fresh_store() {
         let conn = connect(Path::new(":memory:")).expect("boot");
         let versions: i64 = conn
+            .raw()
             .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
                 row.get(0)
             })
             .expect("schema_migrations");
         assert_eq!(versions, 1, "exactly one migration recorded");
         let jobs: i64 = conn
+            .raw()
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE name = 'jobs'",
                 [],

@@ -3,8 +3,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
-#[path = "integration/boot.rs"]
-mod boot;
 #[path = "integration/eval.rs"]
 mod eval;
 #[path = "integration/pipeline.rs"]

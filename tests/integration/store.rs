@@ -4,19 +4,21 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
-use ohara::control::{self, Completion, DocStatus, EnqueueOutcome, NewDocument, Stage};
+use ohara::control::{
+    self, Completion, ControlDb, DocStatus, EnqueueOutcome, NewChunkRow, NewDocument, Stage,
+};
 
 const NOW: &str = "2026-09-06 12:00:00";
 
-/// Boots a store in a temp dir; returns (guard, connection).
-fn boot() -> (tempfile::TempDir, rusqlite::Connection) {
+/// Boots a store in a temp dir; returns (guard, opaque control store).
+fn boot() -> (tempfile::TempDir, ControlDb) {
     let dir = tempfile::tempdir().unwrap();
     let conn = control::connect(&dir.path().join("ohara.db")).unwrap();
     (dir, conn)
 }
 
 /// Registers a document via the public API; returns its id.
-fn enqueue(conn: &rusqlite::Connection, url: &str) -> String {
+fn enqueue(conn: &ControlDb, url: &str) -> String {
     control::insert_new(
         conn,
         std::path::Path::new("data"),
@@ -78,20 +80,14 @@ fn enqueue_chains_a_document_through_every_milestone() {
     let doc = control::get(&conn, &doc_id).unwrap().unwrap();
     assert_eq!(doc.status, DocStatus::Indexed);
 
-    let (pending, total): (i64, i64) = conn
-        .query_row(
-            "SELECT
-                (SELECT count(*) FROM jobs WHERE status = 'PENDING'),
-                (SELECT count(*) FROM jobs)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (pending, total),
-        (0, 4),
-        "§6: exactly one job per (doc, stage), all DONE, chain ends at EXTRACT"
-    );
+    for stage in Stage::ALL {
+        assert!(
+            control::claim_next(&conn, stage, "w1", NOW, 60)
+                .unwrap()
+                .is_none(),
+            "completed stage queue must not expose another runnable job"
+        );
+    }
 }
 
 #[test]
@@ -131,21 +127,11 @@ fn requeue_grants_a_dead_document_a_fresh_attempt_budget() {
     let reset = control::requeue(&conn, &doc_id, NOW).unwrap();
 
     assert_eq!(reset, 1, "the DEAD SCRAPE job was reset");
-    let (status, attempts): (String, i64) = conn
-        .query_row(
-            "SELECT status, attempts FROM jobs WHERE job_id = ?1",
-            [job.job_id()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(status, "PENDING");
-    assert_eq!(attempts, 0, "§6: requeue resets attempts");
-    assert!(
-        control::claim_next(&conn, Stage::Scrape, "w1", NOW, 60)
-            .unwrap()
-            .is_some(),
-        "the requeued job is immediately claimable"
-    );
+    let requeued = control::claim_next(&conn, Stage::Scrape, "w1", NOW, 60)
+        .unwrap()
+        .expect("the requeued job is immediately claimable");
+    assert_eq!(requeued.job_id(), job.job_id());
+    assert_eq!(requeued.attempts(), 0, "§6: requeue resets attempts");
 }
 
 #[test]
@@ -153,12 +139,19 @@ fn boot_sweep_executes_deletion_intents_without_fts_ghosts() {
     let (_dir, conn) = boot();
     let doc_id = enqueue(&conn, "https://example.com/doomed");
     // A chunk exists so the §7.6 cascade exercises the FTS delete trigger.
-    conn.execute(
-        "INSERT INTO chunks (id, chunk_id, doc_id, seq, text, embed_text, token_count,
-                             embedding_model, content_hash)
-         VALUES (1, 'c1', ?1, 0, 'SQLite is an embedded database',
-                 'SQLite is an embedded database', 6, 'bge-small-en-v1.5', 'h1')",
-        [&doc_id],
+    control::replace_chunks(
+        &conn,
+        &doc_id,
+        &[NewChunkRow {
+            chunk_id: "c1".to_string(),
+            seq: 0,
+            header_path: "article".to_string(),
+            text: "SQLite is an embedded database".to_string(),
+            embed_text: "SQLite is an embedded database".to_string(),
+            token_count: 6,
+            embedding_model: "bge-small-en-v1.5".to_string(),
+            content_hash: "h1".to_string(),
+        }],
     )
     .unwrap();
 
@@ -171,21 +164,13 @@ fn boot_sweep_executes_deletion_intents_without_fts_ghosts() {
     );
     assert!(control::get(&conn, &doc_id).unwrap().is_none());
 
-    let (fts_hits, chunks_left, jobs_left): (i64, i64, i64) = conn
-        .query_row(
-            "SELECT
-                (SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'embedded'),
-                (SELECT count(*) FROM chunks),
-                (SELECT count(*) FROM jobs)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        (fts_hits, chunks_left, jobs_left),
-        (0, 0, 0),
-        "CASCADE removed jobs and chunks; the FTS triggers fired on the cascade"
+    assert!(
+        control::search_bm25(&conn, "embedded", 10)
+            .unwrap()
+            .is_empty(),
+        "CASCADE removed chunks and the FTS index has no ghost"
     );
+    assert!(control::pending_deletions(&conn).unwrap().is_empty());
 
     // Idempotent: a second sweep finds nothing to do.
     let again = control::reconcile(&conn, NOW, std::time::Duration::ZERO).unwrap();

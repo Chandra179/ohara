@@ -16,17 +16,10 @@ use async_trait::async_trait;
 
 use crate::Class;
 use crate::config::RetrievalConfig;
-use crate::control::{self, DbError};
+use crate::control::{self, ControlDb, DbError};
 use crate::knowledge::{KnowledgeError, KnowledgeStore, ModelId, ScoredHit, VectorSpace};
 use crate::pipeline::Embedder;
 use crate::text::normalize_surface_form;
-
-/// Candidate-pool size per path and after fusion (§8 Stage 5: fusion produces
-/// the top-50, rerank returns the top-5).
-pub const RETRIEVAL_POOL: usize = 50;
-
-/// RRF constant (§8 Stage 5): reciprocal rank fusion with k=60.
-const RRF_K: f32 = 60.0;
 
 /// Detected language (§8): the embedder is English-first, so the Stage 2 gate and
 /// the query normalizer share this vocabulary.
@@ -39,8 +32,8 @@ pub enum Lang {
     Other,
 }
 
-/// A chunk candidate with a relevance score — the reranker pool's currency (§8
-/// Stage 5: fusion produces the top-50, rerank returns the top-5).
+/// A chunk candidate with a relevance score — the reranker's pool currency (§8
+/// Stage 5: fusion produces the configured pool, rerank returns requested top-k).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredChunk {
     /// The chunk's cross-store identity (`sha256(doc_id:seq)`, §3).
@@ -106,9 +99,6 @@ pub enum RetrieveError {
     /// The control store failed.
     #[error("control store: {0}")]
     Control(#[from] DbError),
-    /// A raw `SQLite` statement failed (FTS path).
-    #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     /// The knowledge plane failed (vector path).
     #[error("knowledge store: {0}")]
     Knowledge(#[from] KnowledgeError),
@@ -124,14 +114,21 @@ pub enum RetrieveError {
 /// Detection is confidence-gated: whatlang reliably separates languages on
 /// sentence-length input (confidence ≈ 1.0) but mislabels short technical
 /// queries at 0.02–0.10 (measured: "wal throttling" → Tagalog). Below the
-/// 0.5 threshold the result is treated as English — the Stage 2 gate already
-/// bounds this tool's corpora to `target_languages`, and [`Lang`] here is
-/// metadata for callers, never a hard gate on the query path.
-pub struct WhatlangNormalizer;
+/// Below the configured confidence floor the result is treated as English — the
+/// Stage 2 gate already bounds this tool's corpora to `target_languages`, and
+/// [`Lang`] here is metadata for callers, never a hard gate on the query path.
+pub struct WhatlangNormalizer {
+    confidence_floor: f64,
+}
 
-/// Detection-confidence floor (see type doc): whatlang's short-query noise
-/// tops out far below this; real sentence detections land at ≈ 1.0.
-const DETECTION_CONFIDENCE_FLOOR: f64 = 0.5;
+impl WhatlangNormalizer {
+    /// Builds a normalizer with the configured language-detection confidence
+    /// floor. Configuration owns this behavior-changing threshold.
+    #[must_use]
+    pub fn new(confidence_floor: f64) -> Self {
+        Self { confidence_floor }
+    }
+}
 
 impl QueryNormalizer for WhatlangNormalizer {
     fn normalize(&self, query: &str) -> (Lang, String) {
@@ -140,7 +137,7 @@ impl QueryNormalizer for WhatlangNormalizer {
             return (Lang::Other, String::new());
         }
         let lang = match whatlang::detect(trimmed) {
-            Some(info) if info.confidence() >= DETECTION_CONFIDENCE_FLOOR => {
+            Some(info) if info.confidence() >= self.confidence_floor => {
                 if info.lang() == whatlang::Lang::Eng {
                     Lang::En
                 } else {
@@ -288,7 +285,7 @@ impl Reranker for LocalReranker {
 
 /// The fusion pool: each list contributes `1/(k + rank)` per candidate (§8) —
 /// any number of paths, best first.
-fn rrf_fuse(lists: Vec<Vec<(String, String)>>) -> Vec<ScoredChunk> {
+fn rrf_fuse(lists: Vec<Vec<(String, String)>>, rrf_k: f32) -> Vec<ScoredChunk> {
     let mut scores: std::collections::HashMap<String, (f32, String)> =
         std::collections::HashMap::new();
     for list in lists {
@@ -296,7 +293,7 @@ fn rrf_fuse(lists: Vec<Vec<(String, String)>>) -> Vec<ScoredChunk> {
             let entry = scores
                 .entry(chunk_id)
                 .or_insert_with(|| (0.0, text.clone()));
-            entry.0 += 1.0 / (RRF_K + f32::from(u16::try_from(rank).unwrap_or(u16::MAX)) + 1.0);
+            entry.0 += 1.0 / (rrf_k + f32::from(u16::try_from(rank).unwrap_or(u16::MAX)) + 1.0);
         }
     }
     let mut fused: Vec<ScoredChunk> = scores
@@ -343,7 +340,7 @@ pub enum QueryEntitySource {
 /// embedding (ms-scale, unlike the worker's batch path, §9) and the `SQLite`
 /// BM25 scan.
 pub struct Retriever<'a> {
-    conn: &'a rusqlite::Connection,
+    conn: &'a ControlDb,
     knowledge: &'a dyn KnowledgeStore,
     embedder: &'a dyn Embedder,
     normalizer: &'a dyn QueryNormalizer,
@@ -357,7 +354,7 @@ impl<'a> Retriever<'a> {
     /// [`KnowledgeStore`] port from this sync context via the captured handle).
     #[must_use]
     pub fn new(
-        conn: &'a rusqlite::Connection,
+        conn: &'a ControlDb,
         knowledge: &'a dyn KnowledgeStore,
         embedder: &'a dyn Embedder,
         normalizer: &'a dyn QueryNormalizer,
@@ -403,8 +400,11 @@ impl<'a> Retriever<'a> {
             paths.push(self.graph_path(&normalized).await?);
         }
 
-        // Fusion (§8 Stage 5.4): RRF with k=60 → top-50 pool.
-        let pool: Vec<ScoredChunk> = rrf_fuse(paths).into_iter().take(RETRIEVAL_POOL).collect();
+        // Fusion (§8 Stage 5.4): configured RRF → configured candidate pool.
+        let pool: Vec<ScoredChunk> = rrf_fuse(paths, self.retrieval.rrf_k())
+            .into_iter()
+            .take(self.retrieval.pool())
+            .collect();
 
         // Rerank with degradation (§8 Stage 5.5): on RerankError the fusion
         // order is returned as-is — the query never fails on the reranker.
@@ -537,21 +537,10 @@ impl<'a> Retriever<'a> {
         if expression.is_empty() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT c.chunk_id, c.text
-               FROM chunks_fts f JOIN chunks c ON c.id = f.rowid
-              WHERE chunks_fts MATCH ?1
-              ORDER BY bm25(chunks_fts)
-              LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![
-                expression,
-                i64::try_from(RETRIEVAL_POOL).unwrap_or(i64::MAX)
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        Ok(control::search_bm25(self.conn, &expression, self.retrieval.pool())?
+            .into_iter()
+            .map(|chunk| (chunk.chunk_id, chunk.text))
+            .collect())
     }
 
     /// Vector path (§8 Stage 5.3): embed the query, KNN the read-model
@@ -569,7 +558,12 @@ impl<'a> Retriever<'a> {
         };
         let hits = self
             .knowledge
-            .knn(space, &q, RETRIEVAL_POOL, &crate::knowledge::ChunkFilter {})
+            .knn(
+                space,
+                &q,
+                self.retrieval.pool(),
+                &crate::knowledge::ChunkFilter {},
+            )
             .await?;
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         let hydrated = control::chunks_by_ids(self.conn, &ids)?;
@@ -627,7 +621,7 @@ mod tests {
 
     #[test]
     fn normalizer_detects_english_and_passes_through() {
-        let n = WhatlangNormalizer;
+        let n = WhatlangNormalizer::new(0.5);
         // Short technical queries sit below whatlang's reliable-confidence
         // range: the documented fallback is En (the Stage 2 gate bounds the
         // corpus languages anyway).
@@ -736,6 +730,7 @@ mod tests {
         for doc_id in &fx.doc_ids {
             for sig in control::chunk_signatures(&conn, doc_id).unwrap() {
                 let text: String = conn
+                    .raw()
                     .query_row(
                         "SELECT embed_text FROM chunks WHERE chunk_id = ?1",
                         [&sig.chunk_id],
@@ -758,11 +753,13 @@ mod tests {
         let conn = control::connect(&fx.store).unwrap();
         let embedder = FakeEmbedder::new();
         let knowledge = knowledge_with_vectors(&fx, &embedder).await;
+        let normalizer =
+            WhatlangNormalizer::new(fx.config.retrieval().detection_confidence_floor());
         let retriever = Retriever::new(
             &conn,
             &knowledge,
             &embedder,
-            &WhatlangNormalizer,
+            &normalizer,
             &IdentityReranker,
             fx.config.retrieval().clone(),
         );
@@ -785,11 +782,13 @@ mod tests {
         let conn = control::connect(&fx.store).unwrap();
         let embedder = FakeEmbedder::new();
         let knowledge = knowledge_with_vectors(&fx, &embedder).await;
+        let normalizer =
+            WhatlangNormalizer::new(fx.config.retrieval().detection_confidence_floor());
         let retriever = Retriever::new(
             &conn,
             &knowledge,
             &embedder,
-            &WhatlangNormalizer,
+            &normalizer,
             &BrokenReranker,
             fx.config.retrieval().clone(),
         );
@@ -807,11 +806,13 @@ mod tests {
         let conn = control::connect(&fx.store).unwrap();
         let embedder = FakeEmbedder::new();
         let knowledge = knowledge_with_vectors(&fx, &embedder).await;
+        let normalizer =
+            WhatlangNormalizer::new(fx.config.retrieval().detection_confidence_floor());
         let retriever = Retriever::new(
             &conn,
             &knowledge,
             &embedder,
-            &WhatlangNormalizer,
+            &normalizer,
             &IdentityReranker,
             fx.config.retrieval().clone(),
         );
@@ -823,7 +824,7 @@ mod tests {
     /// `:MENTIONS` edges in the knowledge store.
     async fn graph_fixture() -> (
         Fixture,
-        rusqlite::Connection,
+        ControlDb,
         FakeEmbedder,
         InMemoryKnowledge,
     ) {
@@ -889,11 +890,13 @@ mod tests {
     #[tokio::test]
     async fn query_entities_resolve_aliases_and_embeddings() {
         let (fx, conn, embedder, knowledge) = graph_fixture().await;
+        let normalizer =
+            WhatlangNormalizer::new(fx.config.retrieval().detection_confidence_floor());
         let retriever = Retriever::new(
             &conn,
             &knowledge,
             &embedder,
-            &WhatlangNormalizer,
+            &normalizer,
             &IdentityReranker,
             fx.config.retrieval().clone(),
         );
@@ -942,11 +945,13 @@ mod tests {
     #[tokio::test]
     async fn graph_path_surfaces_mentioning_chunks_into_fusion() {
         let (fx, conn, embedder, knowledge) = graph_fixture().await;
+        let normalizer =
+            WhatlangNormalizer::new(fx.config.retrieval().detection_confidence_floor());
         let retriever = Retriever::new(
             &conn,
             &knowledge,
             &embedder,
-            &WhatlangNormalizer,
+            &normalizer,
             &IdentityReranker,
             fx.config.retrieval().clone(),
         );
@@ -968,11 +973,13 @@ mod tests {
         // (§9 honest capabilities): the lexical paths still answer. This store
         // has no chunk vectors either — the BM25 path alone carries the query.
         let knowledge = InMemoryKnowledge::without_graph();
+        let normalizer =
+            WhatlangNormalizer::new(fx.config.retrieval().detection_confidence_floor());
         let retriever = Retriever::new(
             &conn,
             &knowledge,
             &embedder,
-            &WhatlangNormalizer,
+            &normalizer,
             &IdentityReranker,
             fx.config.retrieval().clone(),
         );

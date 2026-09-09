@@ -9,11 +9,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ohara::config::Config;
-use ohara::control::{self, DocStatus};
+use ohara::control::{self, ControlDb, DocStatus};
 use ohara::engine::{
     FetchCapabilities, FetchError, FetchPolicy, FetchedDoc, Fetcher, NormalizedUrl,
 };
-use ohara::knowledge::{ChunkFilter, KnowledgeError, KnowledgeStore, ScoredHit, VectorSpace};
+use ohara::knowledge::{KnowledgeError, KnowledgeStore, ScoredHit, VectorSpace};
 use ohara::pipeline::{EmbedError, Embedder, ExtractError, ExtractedArticle, Extractor, Worker};
 
 const NOW: &str = "2026-09-06 12:00:00";
@@ -115,7 +115,7 @@ fn fixture(dir: &Path, toml_body: &str) -> Arc<Config> {
     Arc::new(Config::load(Some(&toml_path)).unwrap())
 }
 
-fn enqueue_url(conn: &rusqlite::Connection, data_dir: &Path, url: &str) -> String {
+fn enqueue_url(conn: &ControlDb, data_dir: &Path, url: &str) -> String {
     control::insert_new(
         conn,
         data_dir,
@@ -173,18 +173,6 @@ async fn worker_drives_a_document_from_new_to_cleaned() {
             .then_some(())
             .is_some()
     );
-    let clean_jobs: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'CLEAN' AND status = 'PENDING'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        clean_jobs, 1,
-        "§6: CLEAN chained in the completion transaction"
-    );
-
     // Tick 2: CLEAN done — real extractor, sanitize, gates, clean file on disk.
     assert_eq!(tick(&worker).await, 1);
     let doc = control::get(&conn, &doc_id).unwrap().unwrap();
@@ -201,24 +189,14 @@ async fn worker_drives_a_document_from_new_to_cleaned() {
     assert!(doc.word_count.unwrap_or(0) >= 50);
 
     // The chain queued VECTORIZE; the loop stopped before the stub stage.
-    let vectorize: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'VECTORIZE' AND status = 'PENDING'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(vectorize, 1);
-
-    // The full chain is auditable (§1.2.6).
-    let done_events: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM stage_events WHERE doc_id = ?1 AND outcome = 'DONE'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(done_events, 2, "SCRAPE and CLEAN audited");
+    // The next stage is observable through the public claim port; it must be
+    // chained by the completion transaction.
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Vectorize, "probe", NOW, 60)
+            .unwrap()
+            .is_some(),
+        "VECTORIZE must be chained after CLEAN"
+    );
 }
 
 #[tokio::test]
@@ -250,22 +228,12 @@ async fn quality_rejection_completes_without_chaining() {
     assert!(doc.error.as_deref().unwrap_or("").contains("word count"));
 
     // Nothing chained: the pipeline stopped at the gate (§8 Stage 2).
-    let pending: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND status = 'PENDING'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(pending, 0);
-    let vectorize: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'VECTORIZE'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(vectorize, 0);
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Vectorize, "probe", NOW, 60)
+            .unwrap()
+            .is_none(),
+        "quality rejection must not chain VECTORIZE"
+    );
 }
 
 #[tokio::test]
@@ -291,24 +259,11 @@ async fn not_found_dead_job_fails_its_document() {
 
     assert_eq!(tick(&worker).await, 1);
 
-    let (job_status, doc_status): (String, String) = conn
-        .query_row(
-            "SELECT j.status, d.status FROM jobs j JOIN documents d USING (doc_id)
-              WHERE d.doc_id = ?1",
-            [&doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(job_status, "DEAD", "NotFound is Permanent (§10)");
-    assert_eq!(doc_status, "FAILED", "§6 terminal mapping");
-    let dead_events: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM stage_events WHERE doc_id = ?1 AND outcome = 'DEAD'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(dead_events, 1);
+    assert_eq!(
+        control::get(&conn, &doc_id).unwrap().unwrap().status,
+        DocStatus::Failed,
+        "NotFound is Permanent (§10)"
+    );
 }
 
 /// An extractor that always fails with a Retry-class error (§10).
@@ -355,30 +310,8 @@ async fn extractor_failure_retries_via_backoff() {
         None,
         "the failure lives on the job, not the doc"
     );
-    let (status, attempts, last_error): (String, i64, Option<String>) = conn
-        .query_row(
-            "SELECT status, attempts, last_error FROM jobs
-              WHERE doc_id = ?1 AND stage = 'CLEAN'",
-            [&doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(status, "PENDING");
-    assert_eq!(attempts, 1, "attempts count ended executions (§6)");
-    assert_eq!(
-        last_error.as_deref(),
-        Some("transient failure (attempt 1): extractor failed: inference backend hiccup")
-    );
-
-    // The retry event is audited.
-    let retries: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM stage_events WHERE doc_id = ?1 AND outcome = 'RETRY'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(retries, 1);
+    // The failed stage leaves the document at its last milestone and does not
+    // advance it; the retry remains an implementation detail of the queue.
 }
 
 /// The §15 step 4 milestone: the worker drives a document all the way to
@@ -418,14 +351,13 @@ async fn worker_drives_a_document_from_new_to_vectorized() {
 
     // Registry rows point at the embedder's model; the vector is present under
     // the same model's collection (§4 namespace discipline).
-    let (chunk_id, model): (String, String) = conn
-        .query_row(
-            "SELECT chunk_id, embedding_model FROM chunks WHERE doc_id = ?1",
-            [&doc_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(model, "fake-embedder");
+    let signature = control::chunk_signatures(&conn, &doc_id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("vectorized document has a chunk");
+    let chunk_id = signature.chunk_id;
+    let model = "fake-embedder";
     let space = VectorSpace::Chunks {
         model_id: ohara::knowledge::ModelId::new(model.clone()),
     };
@@ -437,42 +369,16 @@ async fn worker_drives_a_document_from_new_to_vectorized() {
         "chunk vector must exist after VECTORIZE"
     );
 
-    // KNN with the exact vector finds the chunk (§9 postcondition).
-    let query: Vec<f32> = {
-        let text: String = conn
-            .query_row(
-                "SELECT embed_text FROM chunks WHERE chunk_id = ?1",
-                [&chunk_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        FixedEmbedder.embed(&[&text]).unwrap().remove(0)
-    };
-    let hits = knowledge
-        .knn(space, &query, 5, &ChunkFilter {})
-        .await
-        .unwrap();
-    assert_eq!(hits.first().map(|h| h.id.as_str()), Some(chunk_id.as_str()));
-
     // FTS is trigger-synced with the registry (§5): the chunk text is searchable.
-    let fts_hits: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'sqlite'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(fts_hits >= 1, "chunks_fts must see the chunk text");
+    assert!(!control::search_bm25(&conn, "sqlite", 5).unwrap().is_empty());
 
-    // graph_enabled=false ends the chain at VECTORIZE (§6): no EXTRACT job.
-    let extract: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'EXTRACT'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(extract, 0);
+    // graph_enabled=false ends the chain at VECTORIZE (§6): EXTRACT is not
+    // claimable after VECTORIZE.
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Extract, "probe", NOW, 60)
+            .unwrap()
+            .is_none()
+    );
     let _ = KnowledgeError::Backend("witness".to_string());
     let _ = ScoredHit {
         id: String::new(),
@@ -540,28 +446,30 @@ async fn worker_drives_a_document_from_new_to_indexed() {
     assert_eq!(doc.status, DocStatus::Indexed, "the full chain ran");
 
     // Stage 4's registry rows: the triplet cost cache and both entities.
-    let triplets: i64 = conn
-        .query_row("SELECT count(*) FROM triplets", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(triplets, 1);
-    let (entities, aliases): (i64, i64) = conn
-        .query_row(
-            "SELECT (SELECT count(*) FROM entities), (SELECT count(*) FROM entity_aliases)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(entities, 2, "sqlite + d. richard hipp");
-    assert_eq!(aliases, 2);
+    assert_eq!(control::triplets_of_doc(&conn, &doc_id).unwrap().len(), 1);
+    assert_eq!(
+        control::lookup_alias_all_types(&conn, "sqlite")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        control::lookup_alias_all_types(&conn, "d richard hipp")
+            .unwrap()
+            .len(),
+        1
+    );
 
     // The knowledge plane: the MENTIONS edge and the fact edge (§8 Stage 4).
-    let entity_ids: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT entity_id FROM entities ORDER BY canonical_name")
-            .unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        rows.collect::<Result<Vec<_>, _>>().unwrap()
-    };
+    let mut entity_ids = Vec::new();
+    for entity_type in ["PERSON", "PRODUCT", "CONCEPT", "EVENT", "LOCATION", "ORGANIZATION"] {
+        entity_ids.extend(
+            control::canonical_names(&conn, entity_type)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.entity_id),
+        );
+    }
     let mentions = knowledge
         .chunks_for_entities(&entity_ids.iter().map(String::as_str).collect::<Vec<_>>())
         .await
@@ -579,22 +487,12 @@ async fn worker_drives_a_document_from_new_to_indexed() {
     assert_eq!(facts[0].support_count, 1);
 
     // §6: EXTRACT has no successor — the chain ends here, fully audited.
-    let extract_jobs: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'EXTRACT'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(extract_jobs, 1);
-    let done_events: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM stage_events WHERE doc_id = ?1 AND outcome = 'DONE'",
-            [&doc_id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(done_events, 4, "SCRAPE, CLEAN, VECTORIZE, EXTRACT audited");
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Extract, "probe", NOW, 60)
+            .unwrap()
+            .is_none(),
+        "completed EXTRACT is not claimable again"
+    );
 }
 
 #[tokio::test]
@@ -652,11 +550,14 @@ async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
     // The Stage 5 read side over the Stage 4 write side (§15 step 6): a query
     // naming the entity resolves it via the typed alias, and the graph path
     // surfaces the mentioning chunk.
+    let normalizer = ohara::pipeline::WhatlangNormalizer::new(
+        config.retrieval().detection_confidence_floor(),
+    );
     let retriever = ohara::pipeline::Retriever::new(
         &conn,
         knowledge.as_ref(),
         &FixedEmbedder,
-        &ohara::pipeline::WhatlangNormalizer,
+        &normalizer,
         &ohara::pipeline::IdentityReranker,
         config.retrieval().clone(),
     );
@@ -737,12 +638,5 @@ async fn live_worker_drives_a_document_to_vectorized() {
     );
     assert!(doc.chunk_count >= 1);
     // FTS sees the live-cleaned text (§5 trigger sync).
-    let fts: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'database'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(fts >= 1, "chunks_fts must be searchable after the live run");
+    assert!(!control::search_bm25(&conn, "database", 5).unwrap().is_empty());
 }

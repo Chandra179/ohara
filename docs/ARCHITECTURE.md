@@ -685,6 +685,7 @@ Step 5 deliberately precedes graph work: the eval baseline quantifies what Stage
 6. **`EntityType` gained `FromStr` on the `knowledge` facade** (the graph module's private impl moved up): Stage 4 parses LLM-supplied type strings without the `ladybug` feature.
 7. **`facts_within_hops` was fixed to dedup by fact identity `(subject, predicate, object)`,** not by entity pair — two edges between the same entities under different predicates are different facts (§8). The traversal now carries `f.predicate` through each hop.
 8. **ER knobs are config:** `[er] name_similarity_threshold` (default 0.85), `embedding_similarity_threshold` (0.75), `max_evidence` (8), `max_occurrences` (8) — validated at boot; the numbers are the conservative defaults until the eval expansion (§15 step 8) measures them on real corpora.
+9. **Behavior-changing stage limits are config:** `[pipeline]` owns the clean word gate, chunk budget/overlap, extraction cap, and ER candidate breadth; `[fetcher]` owns response-body and redirect limits; `[retrieval]` owns the path pool, RRF constant, and query language-confidence floor; `[llm]` owns the health-probe timeout. Defaults remain pinned in `config.rs`, and stage/provider code receives validated values rather than repeating literals.
 
 ### B.5 — Stage 5 graph-path build amendments (§15 step 6 read side, 2026-09-08)
 

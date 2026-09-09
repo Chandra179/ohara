@@ -5,7 +5,7 @@
 use unicode_normalization::UnicodeNormalization;
 
 use crate::Class;
-use crate::control::{self, ClaimedJob};
+use crate::control::{self, ClaimedJob, ControlDb};
 
 use super::{StageCtx, StageError, StageOutcome};
 
@@ -86,9 +86,6 @@ const PAYWALL_MARKERS: &[&str] = &[
     "start your free trial to continue",
 ];
 
-/// Documents shorter than this fail the §8 quality gate.
-const MIN_WORD_COUNT: i64 = 50;
-
 /// The [`Extractor`] implementation (§2): `readability` for primary-content
 /// extraction, `html2md` for the Markdown conversion. Pure — file and store I/O
 /// belong to the stage body.
@@ -168,11 +165,12 @@ pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, 
     let markdown = sanitize(&article.markdown);
     let word_count = i64::try_from(markdown.split_whitespace().count()).unwrap_or(i64::MAX);
 
-    if word_count < MIN_WORD_COUNT {
+    let min_word_count = ctx.config.pipeline().min_word_count();
+    if word_count < min_word_count {
         return reject(
             ctx.conn,
             job.doc_id(),
-            &format!("word count {word_count} < {MIN_WORD_COUNT}"),
+            &format!("word count {word_count} < {min_word_count}"),
             &now,
         )
         .map_err(StageError::from)
@@ -253,7 +251,7 @@ pub(super) fn run(ctx: &StageCtx<'_>, job: &ClaimedJob) -> Result<StageOutcome, 
 
 /// Records a §8 quality rejection (`FAILED_QUALITY` + reason) and stops.
 fn reject(
-    conn: &rusqlite::Connection,
+    conn: &ControlDb,
     doc_id: &str,
     reason: &str,
     now: &str,
@@ -376,7 +374,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::control::testing::{boot, seed_doc};
-    use crate::control::{ClaimedJob, Completion, DocStatus, Stage};
+    use crate::control::{ClaimedJob, Completion, ControlDb, DocStatus, Stage};
     use crate::engine::{FetchError, FetchedDoc, NormalizedUrl};
 
     const NOW: &str = "2026-09-06 12:00:00";
@@ -427,7 +425,7 @@ tables, indices, triggers, and views lives inside one portable file.";
 
     fn ctx_with<'a>(
         config: &'a Arc<Config>,
-        conn: &'a rusqlite::Connection,
+        conn: &'a ControlDb,
         extractor: &'a dyn Extractor,
         handle: &'a tokio::runtime::Handle,
     ) -> StageCtx<'a> {
@@ -461,7 +459,7 @@ tables, indices, triggers, and views lives inside one portable file.";
         }
     }
 
-    fn claimed(conn: &rusqlite::Connection, doc_id: &str, stage: Stage) -> ClaimedJob {
+    fn claimed(conn: &ControlDb, doc_id: &str, stage: Stage) -> ClaimedJob {
         control::enqueue(conn, "test-job", doc_id, stage, 5, None, NOW).unwrap();
         control::claim_next(conn, stage, "w1", NOW, 60)
             .unwrap()
@@ -475,7 +473,7 @@ tables, indices, triggers, and views lives inside one portable file.";
         let conn = boot();
         let doc_id = seed_doc(&conn, "a");
         let raw_path = write_raw(&config, &doc_id, "<html><body>raw</body></html>");
-        conn.execute(
+        conn.raw().execute(
             "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
             rusqlite::params![raw_path, doc_id],
         )
@@ -519,7 +517,7 @@ tables, indices, triggers, and views lives inside one portable file.";
         let conn = boot();
         let doc_id = seed_doc(&conn, "a");
         let raw_path = write_raw(&config, &doc_id, "<html></html>");
-        conn.execute(
+        conn.raw().execute(
             "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
             rusqlite::params![raw_path, doc_id],
         )
@@ -544,6 +542,7 @@ tables, indices, triggers, and views lives inside one portable file.";
         // The job completes Done — nothing chains.
         control::complete(&conn, Stage::Clean, &job, Completion::Done, NOW).unwrap();
         let clean_job = conn
+            .raw()
             .query_row(
                 "SELECT status FROM jobs WHERE doc_id = ?1 AND stage = 'VECTORIZE'",
                 [&doc_id],
@@ -553,6 +552,7 @@ tables, indices, triggers, and views lives inside one portable file.";
             .or::<std::convert::Infallible>(Ok(()));
         assert!(clean_job.is_ok());
         let vectorize_jobs: i64 = conn
+            .raw()
             .query_row(
                 "SELECT count(*) FROM jobs WHERE doc_id = ?1 AND stage = 'VECTORIZE'",
                 [&doc_id],
@@ -569,7 +569,7 @@ tables, indices, triggers, and views lives inside one portable file.";
         let conn = boot();
         let doc_id = seed_doc(&conn, "a");
         let raw_path = write_raw(&config, &doc_id, "<html></html>");
-        conn.execute(
+        conn.raw().execute(
             "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
             rusqlite::params![raw_path, doc_id],
         )
@@ -605,13 +605,13 @@ tables, indices, triggers, and views lives inside one portable file.";
         let original = seed_doc(&conn, "original");
         let duplicate = seed_doc(&conn, "dup");
         let dup_raw = write_raw(&config, &duplicate, "<html></html>");
-        conn.execute(
+        conn.raw().execute(
             "UPDATE documents SET raw_file_path = ?1 WHERE doc_id = ?2",
             rusqlite::params![dup_raw, duplicate],
         )
         .unwrap();
         // The original already carries this exact content hash.
-        conn.execute(
+        conn.raw().execute(
             "UPDATE documents SET clean_content_hash = ?1 WHERE doc_id = ?2",
             rusqlite::params![content_hash(&sanitize(ARTICLE)), original],
         )
@@ -637,6 +637,7 @@ tables, indices, triggers, and views lives inside one portable file.";
             "the duplicate stores nothing of its own"
         );
         let events: i64 = conn
+            .raw()
             .query_row(
                 "SELECT count(*) FROM stage_events WHERE doc_id = ?1 AND detail LIKE 'duplicate of%'",
                 [&duplicate],

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::Class;
 use crate::config::Config;
-use crate::control::{self, ClaimedJob, Completion, DbError, Stage};
+use crate::control::{self, ClaimedJob, Completion, ControlDb, DbError, Stage};
 use crate::engine::Fetcher;
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
@@ -30,7 +30,7 @@ pub use embed::{EmbedError, Embedder};
 #[cfg(feature = "onnx-embedder")]
 pub use retrieve::LocalReranker;
 pub use retrieve::{
-    IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer, RETRIEVAL_POOL,
+    IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer,
     RerankError, Reranker, RetrieveError, Retriever, ScoredChunk, WhatlangNormalizer,
     fts_match_expression,
 };
@@ -133,7 +133,7 @@ impl From<DbError> for StageError {
 /// the ports themselves — fakes substitute cleanly in tests (§14).
 pub(crate) struct StageCtx<'a> {
     pub(crate) config: &'a Config,
-    pub(crate) conn: &'a rusqlite::Connection,
+    pub(crate) conn: &'a ControlDb,
     /// Handle for `block_on`-ing async port calls from the blocking thread.
     pub(crate) handle: &'a tokio::runtime::Handle,
     pub(crate) fetcher: &'a dyn Fetcher,
@@ -151,12 +151,12 @@ enum Flow {
     Abort(Box<StageError>),
 }
 
-/// The worker: owns the control connection, the validated configuration, and the
-/// ports. The connection sits behind a [`Mutex`] — `rusqlite::Connection`
-/// is `Send` but not `Sync`, and the loop reaches it from blocking tasks.
+/// The worker: owns the control database, the validated configuration, and the
+/// ports. The database sits behind a [`Mutex`] because the embedded control
+/// implementation serializes SQLite writes internally.
 pub struct Worker {
     config: Arc<Config>,
-    conn: Mutex<rusqlite::Connection>,
+    conn: Mutex<ControlDb>,
     handle: tokio::runtime::Handle,
     fetcher: Arc<dyn Fetcher>,
     extractor: Arc<dyn Extractor>,
@@ -214,7 +214,10 @@ fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, crate::BootError> {
     if !config.pipeline().graph_enabled() {
         return Ok(Arc::new(crate::llm::NoLlm));
     }
-    let ollama = crate::llm::Ollama::new(config.llm().base_url().clone())?;
+    let ollama = crate::llm::Ollama::new(
+        config.llm().base_url().clone(),
+        config.llm().health_timeout(),
+    )?;
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
         crate::BootError::Worker(
             "ohara must run inside a tokio runtime to health-check the LLM endpoint".to_string(),
@@ -239,6 +242,8 @@ impl Worker {
             timeout: config.fetcher().timeout(),
             rate_limit: config.rate_limit(),
             allow_private_hosts: config.fetcher().allow_private_hosts(),
+            max_body_bytes: config.fetcher().max_body_bytes(),
+            max_redirects: config.fetcher().max_redirects(),
         })?);
         let extractor = Arc::new(ReadabilityExtractor);
         let embedder = default_embedder(&config)?;
@@ -283,7 +288,7 @@ impl Worker {
     /// Locks the control connection. A poisoned lock (a panic while a store call
     /// was in flight) is recovered: the store itself is transactional, so the
     /// next statement runs against a consistent state (§1.2.4 idempotency).
-    fn conn(&self) -> MutexGuard<'_, rusqlite::Connection> {
+    fn conn(&self) -> MutexGuard<'_, ControlDb> {
         self.conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -354,7 +359,7 @@ impl Worker {
     /// [`DbError`] on store failure (transitions and audit writes).
     fn execute(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &ControlDb,
         stage: Stage,
         job: &ClaimedJob,
     ) -> Result<Flow, DbError> {
@@ -448,7 +453,7 @@ impl Worker {
 
     /// Records the §6 terminal mapping: job `DEAD`, document `FAILED`.
     fn dead(
-        conn: &rusqlite::Connection,
+        conn: &ControlDb,
         job: &ClaimedJob,
         stage: Stage,
         error: &str,

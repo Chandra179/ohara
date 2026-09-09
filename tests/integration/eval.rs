@@ -65,7 +65,7 @@ struct EvalFixture {
 /// entity with a typed alias, its `EntityNames` vector, `:MENTIONS` edges from
 /// every chunk, so the graph path has structure to traverse.
 async fn seed_topic_graph(
-    conn: &rusqlite::Connection,
+    conn: &ohara::control::ControlDb,
     knowledge: &ohara::knowledge::LadybugStore,
     embedder: &dyn Embedder,
     t: usize,
@@ -210,13 +210,8 @@ async fn build_corpus(
     (fixture, knowledge, queries)
 }
 
-fn find_doc(conn: &rusqlite::Connection, url: &str) -> String {
-    conn.query_row(
-        "SELECT doc_id FROM documents WHERE source_url_normalized = ?1",
-        [url],
-        |r| r.get(0),
-    )
-    .unwrap()
+fn find_doc(conn: &ohara::control::ControlDb, url: &str) -> String {
+    control::find_id_by_url(conn, url).unwrap().unwrap()
 }
 
 /// The fixture's validated retrieval knobs (§8 Stage 5.2).
@@ -271,11 +266,14 @@ async fn run_eval(
         model_id: ModelId::new(embedder.model_id().to_string()),
     };
 
+    let normalizer = WhatlangNormalizer::new(
+        fixture_config(fixture).detection_confidence_floor(),
+    );
     let retriever = Retriever::new(
         &conn,
         knowledge,
         embedder,
-        &WhatlangNormalizer,
+        &normalizer,
         reranker,
         fixture_config(fixture),
     );
@@ -290,18 +288,11 @@ async fn run_eval(
         // Raw-path rankings, straight from the machinery (§14: recall@20 per
         // path), computed via the same primitives the retriever uses.
         let bm25_expr = ohara::pipeline::fts_match_expression(&q.text);
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.chunk_id FROM chunks_fts f JOIN chunks c ON c.id = f.rowid
-                  WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT 20",
-            )
-            .unwrap();
-        let bm25_top: HashSet<String> = stmt
-            .query_map([&bm25_expr], |r| r.get::<_, String>(0))
+        let bm25_top: HashSet<String> = control::search_bm25(&conn, &bm25_expr, 20)
             .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        drop(stmt);
+            .into_iter()
+            .map(|chunk| chunk.chunk_id)
+            .collect();
         if bm25_top.contains(&q.relevant) {
             bm25_hits += 1;
         }
@@ -340,7 +331,7 @@ async fn run_eval(
 
         // Fused list via the retriever (identity reranker returns fusion order).
         let fused: Vec<ScoredChunk> = retriever
-            .query(&q.text, ohara::pipeline::RETRIEVAL_POOL)
+            .query(&q.text, fixture_config(fixture).pool())
             .await
             .unwrap();
         let rank = fused.iter().position(|h| h.chunk_id == q.relevant);

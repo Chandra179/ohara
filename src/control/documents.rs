@@ -557,6 +557,31 @@ pub fn chunks_by_ids(conn: &Connection, ids: &[&str]) -> Result<Vec<ChunkText>, 
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Searches the trigger-synced FTS5 index and hydrates the matching chunks.
+/// The SQL and SQLite ranking details stay inside the control plane.
+pub(crate) fn search_bm25(
+    conn: &Connection,
+    expression: &str,
+    limit: usize,
+) -> Result<Vec<ChunkText>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT c.chunk_id, c.doc_id, c.text
+           FROM chunks_fts f JOIN chunks c ON c.id = f.rowid
+          WHERE chunks_fts MATCH ?1
+          ORDER BY bm25(chunks_fts)
+          LIMIT ?2",
+    )?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(rusqlite::params![expression, limit], |row| {
+        Ok(ChunkText {
+            chunk_id: row.get(0)?,
+            doc_id: row.get(1)?,
+            text: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Records Stage 3's aggregate result on the document row: how many chunks the
 /// document now has and their total token count (§5).
 ///
@@ -587,7 +612,7 @@ mod tests {
     use super::super::jobs;
     use super::super::models::Completion;
     use super::super::models::Stage;
-    use super::super::testing::boot;
+    use super::super::testing::boot_raw as boot;
     use super::*;
 
     const NOW: &str = "2026-09-06 12:00:00";
@@ -691,7 +716,7 @@ mod tests {
     #[test]
     fn quality_rejection_records_failed_quality_with_the_reason() {
         let conn = boot();
-        let doc_id = super::super::testing::seed_doc(&conn, "a");
+        let doc_id = super::super::testing::seed_doc_raw(&conn, "a");
 
         mark_quality_rejected(&conn, &doc_id, "paywall markers", NOW).unwrap();
 
@@ -704,10 +729,10 @@ mod tests {
     #[test]
     fn due_for_recrawl_excludes_terminal_and_undated_documents() {
         let conn = boot();
-        let due_id = super::super::testing::seed_doc(&conn, "due");
-        let future_id = super::super::testing::seed_doc(&conn, "future");
-        let never_id = super::super::testing::seed_doc(&conn, "never");
-        let failed_id = super::super::testing::seed_doc(&conn, "failed");
+        let due_id = super::super::testing::seed_doc_raw(&conn, "due");
+        let future_id = super::super::testing::seed_doc_raw(&conn, "future");
+        let never_id = super::super::testing::seed_doc_raw(&conn, "never");
+        let failed_id = super::super::testing::seed_doc_raw(&conn, "failed");
         conn.execute(
             "UPDATE documents SET next_crawl_at = '2026-09-06 11:00:00' WHERE doc_id = ?1",
             [&due_id],
@@ -738,7 +763,7 @@ mod tests {
     #[test]
     fn deletion_intent_executes_with_cascades_and_disappears() {
         let conn = boot();
-        let doc_id = super::super::testing::seed_doc(&conn, "a");
+        let doc_id = super::super::testing::seed_doc_raw(&conn, "a");
         // A chunk exists so the §7.6 cascade (and its FTS trigger) is exercised.
         conn.execute(
             "INSERT INTO chunks (id, chunk_id, doc_id, seq, text, embed_text, token_count,
@@ -794,7 +819,7 @@ mod tests {
         // Guardrail: documents.rs exposes no milestone setter — chaining must stay
         // transactional (§6). The round-trip goes through jobs::complete.
         let conn = boot();
-        let doc_id = super::super::testing::seed_doc(&conn, "a");
+        let doc_id = super::super::testing::seed_doc_raw(&conn, "a");
         let job = jobs::claim_next(&conn, Stage::Scrape, "w1", NOW, 60)
             .unwrap()
             .expect("claim");
