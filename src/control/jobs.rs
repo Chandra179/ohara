@@ -6,7 +6,7 @@
 use rusqlite::Connection;
 
 use super::db::{DbError, now_plus};
-use super::models::{ClaimedJob, Completion, Stage, new_id};
+use super::models::{ClaimedJob, Completion, Stage, StageEvent, new_id};
 
 /// The §6 atomic claim, verbatim: one `UPDATE` over a correlated single-row sub-select.
 /// `attempts` increments only on expired-lease reclaim, because attempts count *ended
@@ -211,7 +211,7 @@ pub fn requeue(conn: &Connection, doc_id: &str, now_stamp: &str) -> Result<usize
 }
 
 /// Appends an audit row to `stage_events` (§1.2.6: every transition and every error).
-/// `outcome` is `DONE | RETRY | DEAD | PANIC` (§5); the table has no FK — the audit
+/// `outcome` is `DONE | RETRY | DEAD | FATAL | PANIC | SKIP` (§5); the table has no FK — the audit
 /// trail outlives deleted rows.
 ///
 /// # Errors
@@ -230,6 +230,33 @@ pub fn record_event(
         rusqlite::params![doc_id, job_id, stage, outcome, detail],
     )?;
     Ok(())
+}
+
+/// Reads the retained audit trail for one document in insertion order (§13).
+/// The query stays in the control plane so callers never receive a SQLite
+/// connection or vendor row type.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement or row decoding failure.
+pub fn events_for_doc(conn: &Connection, doc_id: &str) -> Result<Vec<StageEvent>, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id, doc_id, job_id, stage, outcome, detail, ts
+           FROM stage_events
+          WHERE doc_id = ?1
+          ORDER BY event_id",
+    )?;
+    let rows = stmt.query_map([doc_id], |row| {
+        Ok(StageEvent {
+            event_id: row.get(0)?,
+            doc_id: row.get(1)?,
+            job_id: row.get(2)?,
+            stage: row.get(3)?,
+            outcome: row.get(4)?,
+            detail: row.get(5)?,
+            ts: row.get(6)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
 }
 
 /// Enqueues a `PENDING` job (priority per §6; `params` is JSON or `NULL`).

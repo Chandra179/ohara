@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 /// Built-in defaults — the pinned reference profile (§4, §8, §11.2).
-mod defaults {
+pub(crate) mod defaults {
     /// Worker poll interval when the queue is empty (ms).
     pub const POLL_INTERVAL_MS: u64 = 2_000;
     /// Job lease duration (§6).
@@ -771,6 +771,10 @@ impl KnowledgeConfig {
         check(
             !self.read_model.is_empty() && !self.write_model.is_empty(),
             "knowledge.read_model / knowledge.write_model must be non-empty",
+        )?;
+        check(
+            self.read_model == self.write_model,
+            "knowledge.read_model and knowledge.write_model must match until dual-write migration is implemented",
         )
     }
 
@@ -1024,6 +1028,15 @@ mod tests {
 
         let err = Config::load_from_str("[llm]\nbase_url = \"ftp://x\"").expect_err("scheme");
         assert!(matches!(err, ConfigError::Validation(m) if m.contains("http/https")));
+    }
+
+    #[test]
+    fn split_vector_namespaces_are_rejected_until_dual_write_exists() {
+        let err = Config::load_from_str(
+            "[knowledge]\nread_model = \"old-model\"\nwrite_model = \"new-model\"\n",
+        )
+        .expect_err("the current runtime cannot dual-write model namespaces");
+        assert!(matches!(err, ConfigError::Validation(message) if message.contains("dual-write")));
     }
 
     #[test]

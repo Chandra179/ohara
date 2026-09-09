@@ -14,13 +14,23 @@ verification gates after every slice.
   entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and
   failure/retry cases; record per-path recall, fused MRR, rerank delta, and
   regression baselines.
-- Boot/restart reconciliation and knowledge-first deletion cleanup across
-  SQLite/FTS/vector/graph stores are covered by the worker acceptance suite.
-- Finish the remaining operational acceptance coverage: an expired-lease replay
-  through the worker, plus retry-to-dead-letter behavior and its recovery path.
+- Boot/restart reconciliation, expired-lease replay, and knowledge-first deletion
+  cleanup across SQLite/FTS/vector/graph stores are covered by the worker
+  acceptance suite.
+- Retry-to-dead-letter classification and `requeue` recovery are covered by the
+  worker acceptance suite.
+- The `Embedder` port exposes provider input capacity; worker boot rejects a
+  chunk budget that would exceed it, preventing silent provider truncation.
 - Finish the first usable operator slice: query/retrieval from the CLI with
   citations, plus backup, requeue, archive, delete, and basic health/metrics
   output. Keep these as explicit commands rather than leaking store internals.
+
+## Embedding migration
+
+- The current runtime requires one model namespace:
+  `knowledge.read_model == knowledge.write_model == embedder.model_id()`.
+  Implement and acceptance-test provider dual-write before enabling a split
+  read/write migration.
 
 ## Stage 5 — Retrieval leftovers
 The three-path baseline (BM25 + vector + **graph** + RRF + rerank) and query

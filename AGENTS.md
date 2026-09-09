@@ -22,7 +22,8 @@ Focused runs:
 - Stage/module tests: `cargo test --lib pipeline::retrieve` (or any module path).
 - Integration suites are `#[path]` modules mounted in `tests/integration.rs`; run one via `cargo test --test integration eval`.
 - The real-model golden-set eval is `#[ignore]`d (downloads models): `cargo test --test integration eval_retrieval_baseline_real_models -- --ignored`. The hermetic `eval_retrieval_baseline_machinery` runs normally.
-- `tests/ports/` (port contract suites) exists but is currently empty.
+- `tests/ports/` contains the port contract suites; keep them updated for every
+  new implementation or contract change.
 
 ## Lint discipline (will trip you up)
 - `unwrap_used = deny` across the codebase; tests opt out via a file-level `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` header.

@@ -1,6 +1,6 @@
-# ohara — System Architecture (v2.2)
+# ohara — System Architecture (v2.4)
 
-> **Status:** design of record and implementation status. v2.2 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval is implemented, while the remaining fetch legs, synthesis, and operator tooling are explicitly planned. v2.1 superseded v2 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.4 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval and worker recovery acceptance are implemented, while the remaining fetch legs, synthesis, evaluation expansion, and operator tooling are explicitly planned. v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -55,7 +55,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Cleaning | `readability` (Rust) + `html2md` | Behind `Extractor` port; swap = alternate impl |
 | Text utils | `whatlang`, Unicode normalization | Pure language detection and surface-form normalization; domain-dictionary correction is planned |
 | Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher) via the `lbug` crate (pinned 0.20.2) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port. **§2 build gates verified empirically against lbug 0.20.2 (2026-09-06):** (a) *transaction model* — MVCC snapshot reads run concurrently with the single write transaction; a second concurrent writer is refused (maps to `KnowledgeError::Unavailable`, Retry) — the single-worker default already serializes writers, so the actor-task contingency is not needed; (b) *edge-rewire/fold (§7.8)* — `CREATE`+`DELETE`+node deletion in one `BEGIN`/`COMMIT` verified. The bundled engine ships **no HNSW** (`query_hnsw_index` is absent); Phase 4 ships exact KNN via the in-engine `array_cosine_similarity` scalar — the HNSW index is a drop-in swap behind the same port (§11). Note: `lbug` links OpenSSL at link time (`libssl-dev` is a build prerequisite) |
-| Embedder | BAAI `bge-small-en-v1.5` via ONNX (`fastembed` 6.0.2 + `ort`, fp32; tokenizer via `tokenizers`/`hf-hub` — rustls-only features, never native-tls) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1. Model + tokenizer files fetched once from the HF hub into `data/models/` (fail-fast at boot), offline afterwards. Behind the `Embedder` port; the port also exposes `count_tokens` so chunk budgets are measured in the model's own tokenizer (§4) |
+| Embedder | BAAI `bge-small-en-v1.5` via ONNX (`fastembed` 6.0.2 + `ort`, fp32; tokenizer via `tokenizers`/`hf-hub` — rustls-only features, never native-tls) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1. Model + tokenizer files fetched once from the HF hub into `data/models/` (fail-fast at boot), offline afterwards. Behind the `Embedder` port; the port exposes tokenizer counting and input capacity so chunk budgets are measured and bounded in the model's own tokenizer (§4) |
 | Reranker | `bge-reranker-base` ONNX **int8** (Xenova export, ~280 MB) plus the identity baseline | Behind `Reranker`; the local model is feature-gated and cached under `data/models`; identity is the deterministic fallback |
 | LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned extraction model `phi4-mini:latest` (§11.2) | Behind `Llm`; graph extraction, usage counters, and boot health checks are implemented. Synthesis and cloud providers remain planned; §12 governs egress |
 
@@ -87,15 +87,15 @@ The same logical row in both stores is always the same row, because every cross-
 ## 4. The embedding layer
 
 - **Model (pinned):** `BAAI/bge-small-en-v1.5`, 384 dims, cosine distance, ONNX via a local runtime (e.g. `fastembed`-style). English-first — enforced at the Stage 2 gate (§8); a multilingual swap is a model migration, not a code change.
-- **Tokenizer alignment:** chunk budgets are measured **in the embedder's tokenizer**, not characters or whitespace words. Budget: ≤ 512 tokens *including* the breadcrumb prefix.
+- **Tokenizer alignment:** chunk budgets are measured **in the embedder's tokenizer**, not characters or whitespace words. The `Embedder` port exposes its maximum input-token capacity, and worker boot rejects a configured budget above that capacity. The pinned local model accepts ≤ 512 tokens *including* the breadcrumb prefix.
 - **Versioning as a namespace pointer:** one vector collection exists per model (`VectorSpace::Chunks { model_id }`, §9). `chunks.embedding_model` records, **per row**, the model whose vectors that row currently carries — it is the registry's pointer into a collection, and the boot sweep verifies each row against its own pointer (§7.3). Mixing models in one collection is structurally impossible.
-- **Provider swap vs model swap:** the `Embedder` port makes the *provider* hot-swappable (ONNX ↔ API) at equal model. Changing the *model* is a migration: set `write_model = new` (dual-write), backfill chunk-by-chunk — write the new-collection vector, then update that row's `embedding_model` — then flip `read_model = new` (the atomic read switch), then drop the old collection. An interrupted backfill resumes cleanly because each row's pointer says which collection it belongs to. Never in-place.
+- **Provider swap vs model swap:** the `Embedder` port makes the *provider* hot-swappable (ONNX ↔ API) at equal model. The current runtime requires `read_model == write_model == embedder.model_id()` and validates the dimension at worker boot. Changing the model is still a planned migration: implement dual-write first, backfill chunk-by-chunk — write the new-collection vector, then update that row's `embedding_model` — then flip `read_model` to the new namespace (the atomic read switch), then drop the old collection. Never in-place.
 - **Cost/latency:** local CPU ~5–15 ms per chunk; 15k chunks ≈ 2–4 minutes single-threaded — negligible next to LLM stages.
 - **Quantization:** fp32 is the default; an int8 variant is an optional, golden-set-gated lever (§11.1). The variant is part of the `model_id` string and gets its own collection.
 
 ---
 
-## 5. Control-plane schema (SQLite, v2.2)
+## 5. Control-plane schema (SQLite, v2.4)
 
 **Connection pragmas** — set on *every* connection in `control/db.rs`: `foreign_keys = ON` (SQLite defaults it **off**; without it the CASCADEs below are inert), `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`.
 
@@ -261,7 +261,7 @@ CREATE TABLE IF NOT EXISTS stage_events (
     doc_id   TEXT,
     job_id   TEXT,
     stage    TEXT,
-    outcome  TEXT,                        -- DONE | RETRY | DEAD | PANIC
+    outcome  TEXT,                        -- DONE | RETRY | DEAD | FATAL | PANIC | SKIP
     detail   TEXT,                        -- error chain / decision reason
     ts       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -402,7 +402,7 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
     ORDER BY bm25(chunks_fts) LIMIT 50;
    ```
 
-   vector KNN over `VectorSpace::Chunks { read_model }` (`k=50`); graph path (`facts_within_hops` + `chunks_for_entities` via `:MENTIONS`).
+   vector KNN over `VectorSpace::Chunks { read_model }` (`k=50`); graph path via `chunks_for_entities` and `:MENTIONS`. `facts_within_hops` is reserved for the planned synthesis context.
 4. **Fusion:** Reciprocal Rank Fusion (k=60) across the three lists → top-50 candidates.
 5. **Rerank:** `Reranker` port over the 50-candidate pool → top-5. Reranking is **fallible and degrades, never fails the query**: on `RerankError` the fusion order is returned as-is and the failure is counted. The local ONNX reranker is available behind the feature flag; the identity reranker is the deterministic baseline and fallback.
 6. **Synthesis (planned):** `Llm` port; context = top chunks + graph facts rendered as a labeled fact list; citations = `chunk_id`s. The current library returns ranked chunks and does not synthesize an answer.
@@ -468,6 +468,7 @@ pub trait KnowledgeStore: Send + Sync {
 pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;                             // "bge-small-en-v1.5"
     fn dim(&self) -> usize;                                 // 384
+    fn max_input_tokens(&self) -> usize;                    // provider input limit
     fn count_tokens(&self, text: &str) -> usize;            // §4: budgets measured in
                                                             // the model's tokenizer
     // Sync by contract: CPU-bound batch. Callers invoke it inside spawn_blocking.
@@ -602,7 +603,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 | :--- | :--- | :--- |
 | Unit | in-module `#[cfg(test)]` | `text.rs` exhaustive; chunker golden-file tests; **URL normalization fixtures** |
 | Port contract | `tests/ports/<port>/` | Same suite against every impl + fakes; error-mapping tests; **vector-collection isolation**; `fold_entity` fixture graphs |
-| Integration | `tests/integration/` | End-to-end via the public API only — canned fetcher, deterministic injected embedder, real knowledge store, tiny fixture corpus; also validates **FTS trigger-sync** and **deletion-intent** flows |
+| Integration | `tests/integration/` | End-to-end via the public API only — canned fetcher, deterministic injected embedder, real knowledge store, tiny fixture corpus; validates **FTS trigger-sync**, **deletion-intent**, restart/lease recovery, and retry/dead-letter/requeue flows |
 | Eval | golden set | Current machinery metrics are recall@20/MRR per path and rerank delta; broader acceptance cases are the next stabilization task |
 
 ---
@@ -615,7 +616,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor and cloud LLM opt-in remain planned
-7. Stabilization and operator slice: expand evaluation, add restart/deletion/retry acceptance coverage, and ship query/citation plus backup/requeue/archive/delete commands
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**; remaining work is broader evaluation, then query/citation plus backup/requeue/archive/delete commands
 8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, entity-merge executor, and cost dashboards
 
 ---
@@ -668,7 +669,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 1. **§2 build gates verified empirically against `lbug` 0.20.2** (2026-09-06): MVCC snapshot reads run concurrently with the single write transaction (a second concurrent writer is refused → `KnowledgeError::Unavailable`, Retry); the §7.8 fold (`CREATE` rewire + `DELETE` edges + node delete in one `BEGIN`/`COMMIT`) works. The bundled engine ships **no HNSW** — vector collections are `FLOAT[dim]` node-table properties with exact in-engine KNN (`array_cosine_similarity`); an HNSW index is a drop-in swap behind the port. `lbug` links OpenSSL at link time (`libssl-dev` build prerequisite).
 2. **`KnowledgeStore::upsert_vectors` gained a `doc_id` parameter:** the §7.6 delete flow ("every vector collection") requires the store to know vector→document membership; entity-name vectors pass `""`. The §9 sketch above predates this.
-3. **`Embedder` port gained `count_tokens`:** §4 requires chunk budgets measured in the embedder's *tokenizer*; the port owns that so stage code never names a vendor tokenizer.
+3. **`Embedder` port gained tokenizer capabilities:** §4 requires chunk budgets measured in the embedder's *tokenizer* and bounded by its input limit; the port owns both capabilities so stage code never names a vendor tokenizer or truncation policy.
 4. **§7.3 realized as idempotent replay, not a vector sweep:** the Stage 3 body compares the registry's `(seq, content_hash)` signature — identical → repair missing vectors via `has_vector`; drift → §7.4 delete-first. No separate boot pass is needed for ordinary knowledge writes; deletion intents are the exception and are handled by `Worker::reconcile` with the knowledge-first protocol, while audit retention remains a control-plane operation.
 5. **Feature gates:** `ladybug` and `onnx-embedder` features (both default-on) isolate the heavy native stacks; `--no-default-features` builds for deployments injecting remote providers through `Worker::with_ports`.
 
@@ -692,3 +693,26 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 4. **`Retriever::new` now takes the `[retrieval]` config section**: `entity_embedding_threshold` (0.75), `max_query_entities` (8), `fact_hops` (1..=2, validated) — the store stays config-free; `facts_within_hops` context for synthesis (Stage 5.6, not yet built) will read `fact_hops` when it lands.
 5. **Eval harness grew per-path graph recall** (`graph_recall20` in the golden-set report) and its corpus seeds the §8 Stage 4 write shape (CONCEPT entities, typed aliases, name vectors, `:MENTIONS` edges). The reproducible machinery run currently reports all-path recall@20 = 1.000, fused MRR = 0.723, and rerank delta 0.000. The ignored real-model run remains a separate, network/model-dependent benchmark.
 6. **`InMemoryKnowledge` (test fake) now declares `graph_traversal: true`** — its reads mirror the real store (§14), so the fake was under-declaring. `without_graph()` is the explicit capability-off variant for degradation tests.
+
+### B.6 — Recovery acceptance and audit facade (§15 step 7, 2026-09-09)
+
+1. **Worker recovery acceptance landed:** integration coverage now exercises a transient fetch retry, terminal dead-letter classification, operator requeue, and successful continuation through the next pipeline milestones.
+2. **Restart recovery coverage is complete:** boot deletion reconciliation and expired-lease replay are covered through the worker with the real knowledge store.
+3. **Audit reads stay in the control plane:** `control::events_for_doc` exposes retained `stage_events` as domain records for acceptance checks and future operator/metrics commands; SQLite remains hidden behind the facade.
+
+### B.7 — Vector namespace contract (§4, 2026-09-09)
+
+1. **The configured namespace is authoritative:** Stage 3 writes to `knowledge.write_model`; retrieval reads from `knowledge.read_model`.
+2. **The current runtime is single-model:** configuration rejects a read/write split, and worker boot validates the injected embedder's model id and dimensions against the configured values. This prevents silently writing vectors into one collection while querying another.
+3. **Dual-write migration remains a separate implementation:** it must add provider support and acceptance coverage before `read_model` and `write_model` may diverge.
+
+### B.8 — Embedder input-capacity contract (§4, 2026-09-09)
+
+1. **Provider limits are explicit:** `Embedder::max_input_tokens` is part of the
+   port contract, and worker boot rejects a chunk budget above the injected
+   provider's capacity.
+2. **The pinned local implementation reports 512 tokens:** this keeps the
+   provider capability with the embedder while the configurable chunk budget
+   remains owned by `[pipeline]`.
+3. **Acceptance coverage:** a provider with a smaller capacity is rejected
+   before work is accepted, preventing silent inference-time truncation.

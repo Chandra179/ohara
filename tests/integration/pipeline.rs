@@ -6,7 +6,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Duration;
 
 use ohara::config::Config;
 use ohara::control::{self, ControlDb, DocStatus, NewChunkRow};
@@ -37,6 +41,12 @@ enum Fake {
 
 struct FakeFetcher {
     result: Fake,
+}
+
+/// A fetcher sequence that makes the worker exercise retry, terminal failure,
+/// and recovery through the real queue state machine (§6).
+struct RetryThenPermanentFetcher {
+    calls: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -71,6 +81,39 @@ impl Fetcher for FakeFetcher {
     }
 }
 
+#[async_trait::async_trait]
+impl Fetcher for RetryThenPermanentFetcher {
+    fn capabilities(&self) -> FetchCapabilities {
+        FetchCapabilities {
+            js_rendering: false,
+            stealth: false,
+        }
+    }
+
+    async fn fetch_with_policy(
+        &self,
+        _url: &NormalizedUrl,
+        _policy: &FetchPolicy,
+    ) -> Result<FetchedDoc, FetchError> {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err(FetchError::Timeout { secs: 1 }),
+            1 => Err(FetchError::NotFound {
+                url: "https://example.com/recovery".to_string(),
+            }),
+            _ => Ok(FetchedDoc {
+                html: ARTICLE_HTML.to_string(),
+                js_executed: false,
+                final_url: "https://example.com/recovery".to_string(),
+                status: 200,
+                content_type: Some("text/html; charset=utf-8".to_string()),
+                etag: None,
+                last_modified: None,
+                fetched_at: "2026-09-06T12:00:00+00:00".to_string(),
+            }),
+        }
+    }
+}
+
 /// The embedder port fake (§14): deterministic vectors, whitespace token
 /// counting +2 (specials). Same shape as the §9 contract requires of the real
 /// ONNX embedder: pinned model id, fixed dim, order-preserving batch.
@@ -83,6 +126,10 @@ impl Embedder for FixedEmbedder {
 
     fn dim(&self) -> usize {
         4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
     }
 
     fn count_tokens(&self, text: &str) -> usize {
@@ -100,6 +147,31 @@ impl Embedder for FixedEmbedder {
     }
 }
 
+/// Provider fake with a smaller input capacity than the default chunk budget.
+struct LimitedCapacityEmbedder;
+
+impl Embedder for LimitedCapacityEmbedder {
+    fn model_id(&self) -> &'static str {
+        "fake-embedder"
+    }
+
+    fn dim(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        128
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        text.split_whitespace().count() + 2
+    }
+
+    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        FixedEmbedder.embed(texts)
+    }
+}
+
 /// The real `LadybugDB` engine, in-memory (§14 integration: real stores, canned
 /// content).
 fn memory_knowledge() -> Arc<dyn KnowledgeStore> {
@@ -111,10 +183,77 @@ fn fixture(dir: &Path, toml_body: &str) -> Arc<Config> {
     let toml_path = dir.join("ohara.toml");
     std::fs::write(
         &toml_path,
-        format!("data_dir = {:?}\n{toml_body}", dir.join("data").display()),
+        format!(
+            "data_dir = {:?}\n\
+{toml_body}\
+[embedder]\n\
+model_id = \"fake-embedder\"\n\
+dim = 4\n\
+[knowledge]\n\
+read_model = \"fake-embedder\"\n\
+write_model = \"fake-embedder\"\n",
+            dir.join("data").display()
+        ),
     )
     .unwrap();
     Arc::new(Config::load(Some(&toml_path)).unwrap())
+}
+
+#[tokio::test]
+async fn worker_rejects_embedder_namespace_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let toml_path = dir.path().join("ohara.toml");
+    std::fs::write(
+        &toml_path,
+        format!(
+            "data_dir = {:?}\n[embedder]\nmodel_id = \"configured-model\"\ndim = 4\n[knowledge]\nread_model = \"configured-model\"\nwrite_model = \"configured-model\"\n[pipeline]\ngraph_enabled = false\n",
+            dir.path().join("data").display()
+        ),
+    )
+    .unwrap();
+    let config = Arc::new(Config::load(Some(&toml_path)).unwrap());
+
+    let result = Worker::with_ports(
+        config,
+        Arc::new(FakeFetcher {
+            result: Fake::Html(ARTICLE_HTML),
+        }),
+        Arc::new(ohara::pipeline::ReadabilityExtractor),
+        Arc::new(FixedEmbedder),
+        memory_knowledge(),
+        Arc::new(ohara::llm::NoLlm),
+    );
+    assert!(matches!(
+        result,
+        Err(ohara::BootError::Worker(message)) if message.contains("embedder.model_id")
+    ));
+}
+
+#[tokio::test]
+async fn worker_rejects_chunk_budget_above_embedder_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let config = fixture(
+        dir.path(),
+        "[pipeline]\nchunk_budget_tokens = 512\ngraph_enabled = false\n",
+    );
+
+    let result = Worker::with_ports(
+        config,
+        Arc::new(FakeFetcher {
+            result: Fake::Html(ARTICLE_HTML),
+        }),
+        Arc::new(ohara::pipeline::ReadabilityExtractor),
+        Arc::new(LimitedCapacityEmbedder),
+        memory_knowledge(),
+        Arc::new(ohara::llm::NoLlm),
+    );
+    assert!(matches!(
+        result,
+        Err(ohara::BootError::Worker(message))
+            if message.contains("chunk budget") && message.contains("max input tokens")
+    ));
 }
 
 fn enqueue_url(conn: &ControlDb, data_dir: &Path, url: &str) -> String {
@@ -265,6 +404,91 @@ async fn not_found_dead_job_fails_its_document() {
         control::get(&conn, &doc_id).unwrap().unwrap().status,
         DocStatus::Failed,
         "NotFound is Permanent (§10)"
+    );
+}
+
+/// The worker-level recovery path (§6): a transient fetch is retried, a later
+/// permanent classification dead-letters the job, and `requeue` grants a fresh
+/// budget so the same worker can complete the document.
+#[tokio::test]
+async fn retry_then_dead_letter_requeues_and_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let config = fixture(
+        dir.path(),
+        "backoff_base_secs = 1\n[pipeline]\ngraph_enabled = false\n",
+    );
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(
+        &conn,
+        &dir.path().join("data"),
+        "https://example.com/recovery",
+    );
+    let worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(RetryThenPermanentFetcher {
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
+        )
+        .unwrap(),
+    );
+
+    // The first transient failure is pending behind the configured backoff.
+    assert_eq!(tick(&worker).await, 1);
+    assert_eq!(
+        control::get(&conn, &doc_id).unwrap().unwrap().status,
+        DocStatus::New
+    );
+
+    // The timestamp format is second-precision, so two seconds clears the
+    // one-second test backoff even when the first tick is near a boundary.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The second attempt is permanently not found and must become DEAD.
+    assert_eq!(tick(&worker).await, 1);
+    assert_eq!(
+        control::get(&conn, &doc_id).unwrap().unwrap().status,
+        DocStatus::Failed
+    );
+    let events = control::events_for_doc(&conn, &doc_id).unwrap();
+    let outcomes: Vec<&str> = events.iter().map(|event| event.outcome.as_str()).collect();
+    assert_eq!(outcomes, ["RETRY", "DEAD"]);
+    assert!(
+        events[0]
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("timeout")
+    );
+    assert!(
+        events[1]
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("not found")
+    );
+
+    // Recovery is an explicit operator action: reset the dead SCRAPE job, then
+    // let the real worker continue through CLEAN and VECTORIZE.
+    assert_eq!(control::requeue(&conn, &doc_id, NOW).unwrap(), 1);
+    assert_eq!(tick(&worker).await, 1); // SCRAPE succeeds on the third fetch.
+    assert_eq!(tick(&worker).await, 1); // CLEAN
+    assert_eq!(tick(&worker).await, 1); // VECTORIZE
+
+    assert_eq!(
+        control::get(&conn, &doc_id).unwrap().unwrap().status,
+        DocStatus::Vectorized
+    );
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Extract, "probe", NOW, 60)
+            .unwrap()
+            .is_none(),
+        "graph-disabled recovery ends at VECTORIZE"
     );
 }
 
@@ -751,6 +975,7 @@ async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
         &FixedEmbedder,
         &normalizer,
         &ohara::pipeline::IdentityReranker,
+        ohara::knowledge::ModelId::new(config.knowledge().read_model()),
         config.retrieval().clone(),
     );
 

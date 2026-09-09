@@ -16,7 +16,7 @@ pub use documents::{
     NewDocument,
 };
 pub use entities::{NameCandidate, NewTriplet, TripletRow};
-pub use models::{ClaimedJob, Completion, DocStatus, Stage};
+pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
 pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
 
@@ -414,6 +414,15 @@ pub fn record_event(
     detail: Option<&str>,
 ) -> Result<(), DbError> {
     jobs::record_event(db.raw(), doc_id, job_id, stage, outcome, detail)
+}
+
+/// Reads retained audit events for one document in insertion order.
+///
+/// # Errors
+///
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn events_for_doc(db: &ControlDb, doc_id: &str) -> Result<Vec<StageEvent>, DbError> {
+    jobs::events_for_doc(db.raw(), doc_id)
 }
 
 /// Enqueues a job.

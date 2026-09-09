@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, vectorization, graph extraction, and three-path retrieval baseline are implemented. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. Retrieval currently returns ranked chunks; LLM synthesis, the query CLI, and operational subcommands remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, vectorization, graph extraction, and three-path retrieval baseline are implemented. Worker boot reconciliation, expired-lease recovery, and retry/dead-letter recovery are covered by acceptance tests. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. Retrieval currently returns ranked chunks; LLM synthesis, the query CLI, and operational subcommands remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -78,7 +78,7 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── ARCHITECTURE.md        # system design (v2.2) — the source of truth
+│   ├── ARCHITECTURE.md        # system design (v2.4) — the source of truth
 │   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
@@ -153,7 +153,7 @@ ohara/
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
-7. Stabilization: broader retrieval evaluation, remaining retry/dead-letter acceptance coverage, and the first operator CLI slice
+7. Stabilization: broader retrieval evaluation and the first operator CLI slice; restart, deletion, lease, and retry/dead-letter recovery acceptance is landed
 8. Obscura leg + full fetch ladder, LLM synthesis, entity-merge tooling, and cost dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

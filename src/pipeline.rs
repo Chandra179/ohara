@@ -206,6 +206,41 @@ fn default_knowledge(_config: &Config) -> Result<Arc<dyn KnowledgeStore>, crate:
     ))
 }
 
+/// Validates the model contract shared by the configured namespace and
+/// embedder (§4). The current runtime has one embedder and one vector write
+/// target; dual-write model migration remains a future feature.
+fn validate_embedder(config: &Config, embedder: &dyn Embedder) -> Result<(), crate::BootError> {
+    if embedder.model_id() != config.embedder().model_id() {
+        return Err(crate::BootError::Worker(format!(
+            "embedder model {:?} does not match configured embedder.model_id {:?}",
+            embedder.model_id(),
+            config.embedder().model_id()
+        )));
+    }
+    if embedder.dim() != config.embedder().dim() {
+        return Err(crate::BootError::Worker(format!(
+            "embedder dimension {} does not match configured embedder.dim {}",
+            embedder.dim(),
+            config.embedder().dim()
+        )));
+    }
+    if config.pipeline().chunk_budget_tokens() > embedder.max_input_tokens() {
+        return Err(crate::BootError::Worker(format!(
+            "pipeline chunk budget {} exceeds embedder max input tokens {}",
+            config.pipeline().chunk_budget_tokens(),
+            embedder.max_input_tokens()
+        )));
+    }
+    if embedder.model_id() != config.knowledge().write_model() {
+        return Err(crate::BootError::Worker(format!(
+            "embedder model {:?} does not match knowledge.write_model {:?}",
+            embedder.model_id(),
+            config.knowledge().write_model()
+        )));
+    }
+    Ok(())
+}
+
 /// The default [`Llm`]: the local Ollama provider (§2, §11.2), health-checked at
 /// boot (§2 fail-fast) when the graph is enabled — without the graph, no stage
 /// ever reaches the LLM, so deployments without a running Ollama stay bootable.
@@ -246,6 +281,7 @@ impl Worker {
         })?);
         let extractor = Arc::new(ReadabilityExtractor);
         let embedder = default_embedder(&config)?;
+        validate_embedder(&config, embedder.as_ref())?;
         let knowledge = default_knowledge(&config)?;
         let llm = default_llm(&config)?;
         Self::with_ports(config, fetcher, extractor, embedder, knowledge, llm)
@@ -256,8 +292,9 @@ impl Worker {
     /// stage bodies drive async port calls from blocking threads via its handle.
     ///
     /// # Errors
-    /// [`crate::BootError`] if the store cannot be opened or migrated, or if no
-    /// tokio runtime is active.
+    /// [`crate::BootError`] if a provider violates the configured model
+    /// contract, the store cannot be opened or migrated, or if no tokio runtime
+    /// is active.
     pub fn with_ports(
         config: Arc<Config>,
         fetcher: Arc<dyn Fetcher>,
@@ -266,6 +303,7 @@ impl Worker {
         knowledge: Arc<dyn KnowledgeStore>,
         llm: Arc<dyn Llm>,
     ) -> Result<Self, crate::BootError> {
+        validate_embedder(&config, embedder.as_ref())?;
         let id = format!("worker-{}", std::process::id());
         let conn = control::connect(config.db_path())?;
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
@@ -623,6 +661,10 @@ pub(crate) mod test_support {
             panic!("stage must not embed")
         }
 
+        fn max_input_tokens(&self) -> usize {
+            panic!("stage must not embed")
+        }
+
         fn count_tokens(&self, _text: &str) -> usize {
             panic!("stage must not count tokens")
         }
@@ -760,6 +802,10 @@ pub(crate) mod test_support {
 
         fn dim(&self) -> usize {
             4
+        }
+
+        fn max_input_tokens(&self) -> usize {
+            512
         }
 
         fn count_tokens(&self, text: &str) -> usize {

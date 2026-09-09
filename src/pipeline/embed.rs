@@ -25,10 +25,17 @@ pub trait Embedder: Send + Sync {
     /// Embedding dimensionality (384 for the pinned model, §4).
     fn dim(&self) -> usize;
 
+    /// Maximum number of tokenizer tokens accepted by the model input.
+    ///
+    /// The worker validates the configured chunk budget against this
+    /// capability before accepting work, so provider implementations cannot
+    /// silently truncate chunks at inference time.
+    fn max_input_tokens(&self) -> usize;
+
     /// Token count in **this model's tokenizer** (§4: chunk budgets are measured
     /// in the embedder's tokenizer, not characters or whitespace words). Includes
-    /// the special tokens the model input carries, so the §8 Stage 3 budget
-    /// (≤ 512) covers the full embedded string.
+    /// the special tokens the model input carries, so the configured Stage 3
+    /// budget covers the full embedded string.
     fn count_tokens(&self, text: &str) -> usize;
 
     /// Embeds `texts`, preserving order and pairwise association.
@@ -138,7 +145,7 @@ pub(super) fn run(ctx: &super::StageCtx<'_>, job: &ClaimedJob) -> Result<StageOu
         .map(|c| crate::text::sha256_hex(&c.embed_text))
         .collect();
 
-    let model = ctx.embedder.model_id().to_string();
+    let model = ctx.config.knowledge().write_model().to_string();
     let space = VectorSpace::Chunks {
         model_id: ModelId::new(model.clone()),
     };
@@ -278,7 +285,7 @@ impl LocalEmbedder {
     const HF_REPO: &str = "Xenova/bge-small-en-v1.5";
     /// §4/§8: the budget the tokenizer must measure against — fastembed
     /// truncates at exactly this width.
-    pub(crate) const MAX_LENGTH: usize = 512;
+    pub(crate) const MAX_LENGTH: usize = crate::config::defaults::CHUNK_BUDGET_TOKENS;
 
     /// Loads (downloading on first use) the pinned model into `cache_dir`.
     ///
@@ -341,6 +348,10 @@ impl Embedder for LocalEmbedder {
 
     fn dim(&self) -> usize {
         self.dim
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        Self::MAX_LENGTH
     }
 
     fn count_tokens(&self, text: &str) -> usize {
@@ -413,7 +424,16 @@ mod tests {
         let toml_path = dir.path().join("ohara.toml");
         std::fs::write(
             &toml_path,
-            format!("data_dir = {:?}\n", dir.path().join("data").display()),
+            format!(
+                "data_dir = {:?}\n\
+[embedder]\n\
+model_id = \"fake-embedder\"\n\
+dim = 4\n\
+[knowledge]\n\
+read_model = \"fake-embedder\"\n\
+write_model = \"fake-embedder\"\n",
+                dir.path().join("data").display()
+            ),
         )
         .unwrap();
         let config = Arc::new(Config::load(Some(&toml_path)).unwrap());

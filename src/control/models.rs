@@ -137,6 +137,26 @@ impl std::str::FromStr for DocStatus {
     }
 }
 
+/// One immutable audit record from `stage_events` (§5, §13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageEvent {
+    /// SQLite event id, ordered by insertion.
+    pub event_id: i64,
+    /// The document involved, when the event belongs to a document.
+    pub doc_id: Option<String>,
+    /// The job involved, when the event belongs to a job.
+    pub job_id: Option<String>,
+    /// The stage involved, when the event belongs to a stage.
+    pub stage: Option<String>,
+    /// The recorded outcome, such as `DONE`, `RETRY`, `DEAD`, `FATAL`, `PANIC`,
+    /// or `SKIP`.
+    pub outcome: String,
+    /// Error chain or decision detail, when recorded.
+    pub detail: Option<String>,
+    /// UTC timestamp in SQLite's native format (§5).
+    pub ts: String,
+}
+
 /// A job atomically claimed by the worker (the §6 claim SQL's `RETURNING` row).
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {

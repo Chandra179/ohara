@@ -348,13 +348,15 @@ pub struct Retriever<'a> {
     embedder: &'a dyn Embedder,
     normalizer: &'a dyn QueryNormalizer,
     reranker: &'a dyn Reranker,
+    read_model: ModelId,
     retrieval: RetrievalConfig,
 }
 
 impl<'a> Retriever<'a> {
-    /// Builds a retriever over the config's `[retrieval]` knobs; must be called
-    /// inside a tokio runtime (the vector and graph paths drive the async
-    /// [`KnowledgeStore`] port from this sync context via the captured handle).
+    /// Builds a retriever over the configured read namespace and `[retrieval]`
+    /// knobs; must be called inside a tokio runtime (the vector and graph paths
+    /// drive the async [`KnowledgeStore`] port from this sync context via the
+    /// captured handle).
     #[must_use]
     pub fn new(
         conn: &'a ControlDb,
@@ -362,6 +364,7 @@ impl<'a> Retriever<'a> {
         embedder: &'a dyn Embedder,
         normalizer: &'a dyn QueryNormalizer,
         reranker: &'a dyn Reranker,
+        read_model: ModelId,
         retrieval: RetrievalConfig,
     ) -> Self {
         Self {
@@ -370,6 +373,7 @@ impl<'a> Retriever<'a> {
             embedder,
             normalizer,
             reranker,
+            read_model,
             retrieval,
         }
     }
@@ -563,7 +567,7 @@ impl<'a> Retriever<'a> {
             return Ok(Vec::new());
         };
         let space = VectorSpace::Chunks {
-            model_id: ModelId::new(self.embedder.model_id().to_string()),
+            model_id: self.read_model.clone(),
         };
         let hits = self
             .knowledge
@@ -614,7 +618,7 @@ mod tests {
     use crate::config::Config;
     use crate::control::testing::seed_doc;
     use crate::control::{self, ControlDb, NewChunkRow};
-    use crate::knowledge::VectorSpace;
+    use crate::knowledge::{ModelId, VectorSpace};
     use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
     use crate::text::sha256_hex;
 
@@ -698,7 +702,16 @@ mod tests {
         let toml_path = dir.path().join("ohara.toml");
         std::fs::write(
             &toml_path,
-            format!("data_dir = {:?}\n", dir.path().join("data").display()),
+            format!(
+                "data_dir = {:?}\n\
+[embedder]\n\
+model_id = \"fake-embedder\"\n\
+dim = 4\n\
+[knowledge]\n\
+read_model = \"fake-embedder\"\n\
+write_model = \"fake-embedder\"\n",
+                dir.path().join("data").display()
+            ),
         )
         .unwrap();
         let config = Arc::new(Config::load(Some(&toml_path)).unwrap());
@@ -784,6 +797,7 @@ mod tests {
             &embedder,
             &normalizer,
             &IdentityReranker,
+            ModelId::new(fx.config.knowledge().read_model()),
             fx.config.retrieval().clone(),
         );
 
@@ -813,6 +827,7 @@ mod tests {
             &embedder,
             &normalizer,
             &BrokenReranker,
+            ModelId::new(fx.config.knowledge().read_model()),
             fx.config.retrieval().clone(),
         );
 
@@ -837,6 +852,7 @@ mod tests {
             &embedder,
             &normalizer,
             &IdentityReranker,
+            ModelId::new(fx.config.knowledge().read_model()),
             fx.config.retrieval().clone(),
         );
         assert!(retriever.query("", 5).await.unwrap().is_empty());
@@ -916,6 +932,7 @@ mod tests {
             &embedder,
             &normalizer,
             &IdentityReranker,
+            ModelId::new(fx.config.knowledge().read_model()),
             fx.config.retrieval().clone(),
         );
 
@@ -971,6 +988,7 @@ mod tests {
             &embedder,
             &normalizer,
             &IdentityReranker,
+            ModelId::new(fx.config.knowledge().read_model()),
             fx.config.retrieval().clone(),
         );
 
@@ -999,6 +1017,7 @@ mod tests {
             &embedder,
             &normalizer,
             &IdentityReranker,
+            ModelId::new(fx.config.knowledge().read_model()),
             fx.config.retrieval().clone(),
         );
         let hits = retriever.query("wal truncation", 5).await.unwrap();

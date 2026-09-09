@@ -61,6 +61,23 @@ struct EvalFixture {
     config: Config,
 }
 
+fn write_eval_config(path: &std::path::Path, data_dir: &std::path::Path) {
+    std::fs::write(
+        path,
+        format!(
+            "data_dir = {:?}\n\
+[embedder]\n\
+model_id = \"eval-fake-embedder\"\n\
+dim = 4\n\
+[knowledge]\n\
+read_model = \"eval-fake-embedder\"\n\
+write_model = \"eval-fake-embedder\"\n",
+            data_dir.display()
+        ),
+    )
+    .unwrap();
+}
+
 /// Small deterministic embedder used by hermetic retrieval acceptance tests.
 struct EvalEmbedder;
 
@@ -71,6 +88,10 @@ impl Embedder for EvalEmbedder {
 
     fn dim(&self) -> usize {
         4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
     }
 
     fn count_tokens(&self, text: &str) -> usize {
@@ -149,7 +170,7 @@ async fn build_corpus(
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let toml_path = dir.path().join("ohara.toml");
-    std::fs::write(&toml_path, format!("data_dir = {:?}\n", data_dir.display())).unwrap();
+    write_eval_config(&toml_path, &data_dir);
     let config = Config::load(Some(&toml_path)).unwrap();
     let store = dir.path().join("store.db");
     let conn = control::connect(&store).unwrap();
@@ -311,6 +332,7 @@ async fn run_eval(
         embedder,
         &normalizer,
         reranker,
+        ModelId::new(fixture.config.knowledge().read_model()),
         fixture_config(fixture),
     );
     let mut bm25_hits = 0usize;
@@ -446,6 +468,7 @@ async fn retrieval_acceptance_covers_entities_empty_queries_and_deletion() {
         &embedder,
         &normalizer,
         &IdentityReranker,
+        ModelId::new(fixture.config.knowledge().read_model()),
         fixture_config(&fixture),
     );
 

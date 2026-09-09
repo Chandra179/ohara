@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS stage_events (
     doc_id   TEXT,
     job_id   TEXT,
     stage    TEXT,
-    outcome  TEXT,                        -- DONE | RETRY | DEAD | PANIC
+    outcome  TEXT,                        -- DONE | RETRY | DEAD | FATAL | PANIC | SKIP
     detail   TEXT,                        -- error chain / decision reason
     ts       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
