@@ -3,10 +3,11 @@ SHELL := /bin/sh
 RUSTUP ?= rustup
 TOOLCHAIN ?= 1.98.1
 TOOLCHAIN_BIN := $(dir $(shell $(RUSTUP) which cargo --toolchain $(TOOLCHAIN) 2>/dev/null))
-export PATH := $(TOOLCHAIN_BIN):$(PATH)
-CARGO_CMD := $(RUSTUP) run $(TOOLCHAIN) cargo
-CARGO_FMT_CMD := $(RUSTUP) run $(TOOLCHAIN) cargo-fmt
-CARGO_CLIPPY_CMD := $(RUSTUP) run $(TOOLCHAIN) cargo-clippy
+HOST_PATH := $(PATH)
+RUST_ENV := env PATH="$(TOOLCHAIN_BIN):$(HOST_PATH)"
+CARGO_CMD := $(RUST_ENV) $(RUSTUP) run $(TOOLCHAIN) cargo
+CARGO_FMT_CMD := $(RUST_ENV) $(RUSTUP) run $(TOOLCHAIN) cargo-fmt
+CARGO_CLIPPY_CMD := $(RUST_ENV) $(RUSTUP) run $(TOOLCHAIN) cargo-clippy
 
 .DEFAULT_GOAL := verify
 

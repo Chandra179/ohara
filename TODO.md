@@ -14,9 +14,10 @@ verification gates after every slice.
   entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and
   failure/retry cases; record per-path recall, fused MRR, rerank delta, and
   regression baselines.
-- Add operational acceptance coverage: boot/restart reconciliation, replay
-  idempotence, deletion cleanup across SQLite/FTS/vector/graph stores, and
-  retry/dead-letter behavior.
+- Boot/restart reconciliation and knowledge-first deletion cleanup across
+  SQLite/FTS/vector/graph stores are covered by the worker acceptance suite.
+- Finish the remaining operational acceptance coverage: an expired-lease replay
+  through the worker, plus retry-to-dead-letter behavior and its recovery path.
 - Finish the first usable operator slice: query/retrieval from the CLI with
   citations, plus backup, requeue, archive, delete, and basic health/metrics
   output. Keep these as explicit commands rather than leaking store internals.

@@ -20,13 +20,14 @@ pub struct ReconcileReport {
     pub stage_events_pruned: usize,
 }
 
-/// Runs the boot sweep (§7.3):
+/// Runs the control-plane portion of the boot sweep (§7.3):
 ///
 /// 1. **Deletion intents** (§7.6): any `deletions` row means a deletion was
 ///    requested but not finished — execute it. Idempotent: the intent row is
 ///    removed by the same CASCADE that removes the document, so it re-appears
 ///    only if the deletion was interrupted before it. The knowledge-plane
-///    `delete_doc` precedes the `SQLite` half once the knowledge store exists.
+///    `delete_doc` must precede this SQLite-only half; the worker's full boot
+///    sweep performs that cross-store ordering before calling this module.
 /// 2. **Audit retention** (§5 note): `stage_events` rows older than `retention`
 ///    are pruned; a zero retention disables pruning.
 ///
@@ -50,16 +51,40 @@ pub fn reconcile(
         }
     }
 
-    if !retention.is_zero() {
-        let cutoff = shift(
-            now_stamp,
-            -i64::try_from(retention.as_secs()).unwrap_or(i64::MAX),
-        )?;
-        report.stage_events_pruned =
-            conn.execute("DELETE FROM stage_events WHERE ts < ?1", [&cutoff])?;
-    }
+    report.stage_events_pruned = prune_stage_events(conn, now_stamp, retention)?;
 
     Ok(report)
+}
+
+/// Prunes retained audit events without touching deletion intents.
+///
+/// The worker uses this after it has completed the knowledge-first deletion
+/// protocol. Keeping the operation separate prevents a boot sweep from
+/// deleting a SQLite document before its `LadybugDB` index is cleaned.
+pub(crate) fn reconcile_retention(
+    conn: &Connection,
+    now_stamp: &str,
+    retention: Duration,
+) -> Result<ReconcileReport, DbError> {
+    Ok(ReconcileReport {
+        stage_events_pruned: prune_stage_events(conn, now_stamp, retention)?,
+        ..ReconcileReport::default()
+    })
+}
+
+fn prune_stage_events(
+    conn: &Connection,
+    now_stamp: &str,
+    retention: Duration,
+) -> Result<usize, DbError> {
+    if retention.is_zero() {
+        return Ok(0);
+    }
+    let cutoff = shift(
+        now_stamp,
+        -i64::try_from(retention.as_secs()).unwrap_or(i64::MAX),
+    )?;
+    Ok(conn.execute("DELETE FROM stage_events WHERE ts < ?1", [&cutoff])?)
 }
 
 #[cfg(test)]

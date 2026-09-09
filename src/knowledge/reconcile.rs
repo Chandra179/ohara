@@ -9,5 +9,6 @@
 //! and their missing vectors repaired; changed content deletes first (§7.4).
 //! Entity/fact writes (Stage 4) re-merge on replay by the same principle, so a
 //! dedicated boot sweep would duplicate that machinery without adding recovery
-//! power. What *is* swept at boot: pending deletion intents and expired
-//! `stage_events` — see [`crate::control::reconcile`].
+//! power. Pending deletion intents are the exception: they are handled by
+//! [`crate::pipeline::Worker::reconcile`] (knowledge first, SQLite second),
+//! while expired `stage_events` are pruned by [`crate::control::reconcile`].

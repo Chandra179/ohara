@@ -90,7 +90,7 @@ ohara/
     ├── main.rs                # binary crate root — thin shell: parse args → ohara::run()
     ├── lib.rs                 # library crate root — declares the module tree
     ├── config.rs              # settings load + validation into an immutable struct
-    ├── control.rs             # CONTROL PLANE facade (SQLite) + boot reconciliation sweep
+    ├── control.rs             # CONTROL PLANE facade (SQLite) + SQLite reconciliation helpers
     ├── control/
     │   ├── db.rs              #   connections, WAL pragmas, migrations, the one now()
     │   ├── documents.rs       #   document registry, enqueue + dedup, deletion intents
@@ -108,9 +108,9 @@ ohara/
     │   │                      #   exact in-engine cosine KNN), delete sweep, graph schema
     │   ├── graph.rs           #   openCypher: entity upserts, :MENTIONS edges, the §7.8
     │   │                      #   fold (one transaction), hop-wise fact traversals
-    │   └── reconcile.rs       #   reconciliation posture: replay-idempotent writes + lease
-    │                          #   reclaim make a separate boot sweep redundant (§7.3)
-    ├── pipeline.rs            # worker loop: claim jobs, dispatch stages, retries, audit
+    │   └── reconcile.rs       #   knowledge-plane replay posture; worker owns the
+    │                          #   knowledge-first deletion ordering (§7.3)
+    ├── pipeline.rs            # worker loop: claim/dispatch/retry/audit + cross-store boot reconciliation
     ├── pipeline/
     │   ├── scrape.rs          # Stage 1
     │   ├── clean.rs           # Stage 2 — declares the Extractor port
@@ -133,8 +133,8 @@ ohara/
 - **`config.rs`** — Loads and validates every knob (paths, embedder model + version, per-domain rate limits, LLM keys) into an immutable struct at boot: fail fast at startup, never mid-stage.
 - **`control/` — the control plane.** Owns *all* SQLite access: documents, the job queue, and the audit trail. The queue lives inside the SQLite module because claiming a job must be an atomic SQL statement against a single-writer WAL database. One directory owns the schema; schema changes touch one place.
 - **`engine/` — the fetch engine.** The current implementation gets raw HTML through the plain HTTP leg and exposes capabilities honestly. Future impersonation and Obscura implementations must stay behind the same `Fetcher` port; downstream stages test against a canned fetcher and never require network access.
-- **`knowledge/` — the knowledge plane.** Owns *all* LadybugDB access (vectors + graph) plus `reconcile.rs`, because SQLite and LadybugDB cannot share a transaction: consistency is an explicit protocol (deterministic IDs, idempotent upserts, boot-time reconciliation), and that protocol needs a home it can be tested in.
-- **`pipeline.rs` + `pipeline/` — orchestration and stages.** The worker loop claims jobs and dispatches; each stage is one file and one state-machine transition, so a change to chunking never touches graph extraction and every status is greppable. Stages take their dependencies as traits, which makes them unit-testable in isolation.
+- **`knowledge/` — the knowledge plane.** Owns *all* LadybugDB access (vectors + graph) plus the knowledge-side reconciliation posture in `reconcile.rs`. Because SQLite and LadybugDB cannot share a transaction, the worker in `pipeline.rs` owns the cross-store boot ordering while each plane keeps its datastore-specific operations testable.
+- **`pipeline.rs` + `pipeline/` — orchestration and stages.** The worker loop claims jobs, performs the knowledge-first boot reconciliation protocol, and dispatches stages; each stage is one file and one state-machine transition, so a change to chunking never touches graph extraction and every status is greppable. Stages take their dependencies as traits, which makes them unit-testable in isolation.
 - **`llm.rs`** — The single LLM port: provider impls, retry/backoff, token/cost counters, prompt templates. Three stages call LLMs; without one port, cost accounting and the data-governance decision (what content leaves the machine) scatter everywhere.
 - **`text.rs`** — Pure functions (zero I/O, no async) shared by three stages: the cheapest code to test exhaustively, and it keeps algorithms out of orchestration files.
 
@@ -153,7 +153,7 @@ ohara/
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
-7. Stabilization: broader retrieval evaluation, restart/deletion/retry acceptance coverage, and the first operator CLI slice
+7. Stabilization: broader retrieval evaluation, remaining retry/dead-letter acceptance coverage, and the first operator CLI slice
 8. Obscura leg + full fetch ladder, LLM synthesis, entity-merge tooling, and cost dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

@@ -446,6 +446,18 @@ pub fn reconcile(
     reconcile::reconcile(db.raw(), now_stamp, retention)
 }
 
+/// Prunes retained audit events without executing deletion intents.
+///
+/// This is crate-visible because the worker must first delete a document from
+/// the knowledge plane before it removes the SQLite row (§7.6).
+pub(crate) fn reconcile_retention(
+    db: &ControlDb,
+    now_stamp: &str,
+    retention: std::time::Duration,
+) -> Result<ReconcileReport, DbError> {
+    reconcile::reconcile_retention(db.raw(), now_stamp, retention)
+}
+
 /// Reads one host policy.
 ///
 /// # Errors

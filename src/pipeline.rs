@@ -293,19 +293,40 @@ impl Worker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Runs the §7.3 boot reconciliation sweep before the loop claims anything:
-    /// interrupted §7.6 deletions re-execute, the §5 audit trail is pruned to
-    /// retention. Expired leases are deliberately not swept — the §6 claim
-    /// reclaims them with the correct accounting.
+    /// Runs the full §7.3 boot reconciliation sweep before the loop claims
+    /// anything: interrupted §7.6 deletions are removed from `LadybugDB` first,
+    /// then from SQLite, and the §5 audit trail is pruned to retention. Expired
+    /// leases are deliberately not swept — the §6 claim reclaims them with the
+    /// correct accounting.
     ///
     /// # Errors
-    /// [`DbError`] on store failure.
-    pub fn reconcile(&self) -> Result<control::ReconcileReport, DbError> {
-        control::reconcile(
-            &self.conn(),
-            &control::now(),
-            self.config.stage_events_retention(),
-        )
+    /// [`crate::BootError`] on control- or knowledge-plane failure.
+    pub async fn reconcile(&self) -> Result<control::ReconcileReport, crate::BootError> {
+        let now = control::now();
+        let intents = {
+            let conn = self.conn();
+            control::pending_deletions(&conn)?
+        };
+        let mut deletions_executed = 0;
+        for intent in intents {
+            // §7.6 intent-before-write: the intent survives a failure here, so
+            // the next boot can safely retry the knowledge cleanup.
+            self.knowledge.delete_doc(&intent.doc_id).await?;
+            let deleted = {
+                let conn = self.conn();
+                control::execute_deletion(&conn, &intent.doc_id)?
+            };
+            if deleted {
+                deletions_executed += 1;
+            }
+        }
+
+        let mut report = {
+            let conn = self.conn();
+            control::reconcile_retention(&conn, &now, self.config.stage_events_retention())?
+        };
+        report.deletions_executed = deletions_executed;
+        Ok(report)
     }
 
     /// One scheduling step: claim the next runnable job in pipeline order,
@@ -526,7 +547,7 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let worker = Arc::new(Worker::new(Arc::clone(&config))?);
-    worker.reconcile()?;
+    worker.reconcile().await?;
 
     loop {
         let executed = tokio::task::spawn_blocking({

@@ -9,11 +9,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ohara::config::Config;
-use ohara::control::{self, ControlDb, DocStatus};
+use ohara::control::{self, ControlDb, DocStatus, NewChunkRow};
 use ohara::engine::{
     FetchCapabilities, FetchError, FetchPolicy, FetchedDoc, Fetcher, NormalizedUrl,
 };
-use ohara::knowledge::{KnowledgeError, KnowledgeStore, ScoredHit, VectorSpace};
+use ohara::knowledge::{
+    EntityRecord, EntityType, KnowledgeError, KnowledgeStore, ModelId, ScoredHit, VectorSpace,
+};
 use ohara::pipeline::{EmbedError, Embedder, ExtractError, ExtractedArticle, Extractor, Worker};
 
 const NOW: &str = "2026-09-06 12:00:00";
@@ -263,6 +265,190 @@ async fn not_found_dead_job_fails_its_document() {
         control::get(&conn, &doc_id).unwrap().unwrap().status,
         DocStatus::Failed,
         "NotFound is Permanent (§10)"
+    );
+}
+
+/// A restart acceptance case for the cross-store deletion protocol (§7.6): the
+/// SQLite intent survives the first process, and the next worker removes the
+/// `LadybugDB` index before completing the SQLite cascade.
+#[tokio::test]
+async fn worker_restart_reconciles_deletion_across_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let config = fixture(dir.path(), "");
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(
+        &conn,
+        &dir.path().join("data"),
+        "https://example.com/doomed",
+    );
+    let chunk_id = "chunk-doomed";
+    let model = VectorSpace::Chunks {
+        model_id: ModelId::new("fake-embedder"),
+    };
+    control::replace_chunks(
+        &conn,
+        &doc_id,
+        &[NewChunkRow {
+            chunk_id: chunk_id.to_string(),
+            seq: 0,
+            header_path: "article".to_string(),
+            text: "SQLite survives process restarts".to_string(),
+            embed_text: "SQLite survives process restarts".to_string(),
+            token_count: 5,
+            embedding_model: "fake-embedder".to_string(),
+            content_hash: "hash-doomed".to_string(),
+        }],
+    )
+    .unwrap();
+
+    // Populate a persistent knowledge store, then close it to model the first
+    // process exiting after it recorded the deletion intent.
+    let knowledge_path = dir.path().join("knowledge");
+    let first_store = ohara::knowledge::LadybugStore::open(&knowledge_path, 4).unwrap();
+    first_store
+        .upsert_vectors(
+            model.clone(),
+            &doc_id,
+            &[chunk_id],
+            &[vec![1.0, 0.0, 0.0, 0.0]],
+        )
+        .await
+        .unwrap();
+    first_store
+        .upsert_entity(&EntityRecord {
+            entity_id: "entity-doomed".to_string(),
+            canonical_name: "SQLite".to_string(),
+            entity_type: EntityType::Product,
+            subtype: None,
+        })
+        .await
+        .unwrap();
+    first_store
+        .link_mention(chunk_id, "entity-doomed")
+        .await
+        .unwrap();
+    assert!(
+        first_store
+            .has_vector(model.clone(), chunk_id)
+            .await
+            .unwrap()
+    );
+    drop(first_store);
+
+    control::request_deletion(&conn, &doc_id, Some("restart acceptance")).unwrap();
+
+    // The second worker is the boot/restart boundary under test.
+    let restarted_store =
+        Arc::new(ohara::knowledge::LadybugStore::open(&knowledge_path, 4).unwrap());
+    let worker = Worker::with_ports(
+        Arc::clone(&config),
+        Arc::new(FakeFetcher {
+            result: Fake::NotFound,
+        }),
+        Arc::new(ohara::pipeline::ReadabilityExtractor),
+        Arc::new(FixedEmbedder),
+        restarted_store.clone(),
+        Arc::new(ohara::llm::NoLlm),
+    )
+    .unwrap();
+
+    let report = worker.reconcile().await.unwrap();
+    assert_eq!(report.deletions_executed, 1);
+    assert!(control::get(&conn, &doc_id).unwrap().is_none());
+    assert!(control::pending_deletions(&conn).unwrap().is_empty());
+    assert!(!restarted_store.has_vector(model, chunk_id).await.unwrap());
+    assert!(
+        restarted_store
+            .chunks_for_entities(&["entity-doomed"])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        control::search_bm25(&conn, "survives", 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let again = worker.reconcile().await.unwrap();
+    assert_eq!(
+        again.deletions_executed, 0,
+        "restart reconciliation is idempotent"
+    );
+}
+
+/// A restart acceptance case for the lease protocol (§6): a process dies after
+/// claiming CLEAN, and the next worker reclaims the expired lease exactly once
+/// before continuing the stage chain.
+#[tokio::test]
+async fn worker_restart_reclaims_expired_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let config = fixture(dir.path(), "");
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(
+        &conn,
+        &dir.path().join("data"),
+        "https://example.com/restart",
+    );
+    let first_worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(FakeFetcher {
+                result: Fake::Html(ARTICLE_HTML),
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
+        )
+        .unwrap(),
+    );
+
+    // SCRAPE completes normally and chains CLEAN. The simulated crashed
+    // process claims CLEAN with a lease that is already expired by real time.
+    assert_eq!(tick(&first_worker).await, 1);
+    let crashed_claim = control::claim_next(
+        &conn,
+        ohara::control::Stage::Clean,
+        "crashed-worker",
+        "2000-01-01 00:00:00",
+        1,
+    )
+    .unwrap()
+    .expect("the simulated process claimed CLEAN before it crashed");
+    assert_eq!(
+        crashed_claim.attempts(),
+        0,
+        "a fresh claim is not an attempt"
+    );
+    drop(first_worker);
+
+    let restarted_worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(FakeFetcher {
+                result: Fake::NotFound,
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
+        )
+        .unwrap(),
+    );
+    assert_eq!(tick(&restarted_worker).await, 1);
+    assert_eq!(
+        control::get(&conn, &doc_id).unwrap().unwrap().status,
+        DocStatus::Cleaned,
+        "the restarted worker reclaimed CLEAN and advanced the milestone"
+    );
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Vectorize, "probe", NOW, 60,)
+            .unwrap()
+            .is_some(),
+        "reclaimed completion must chain VECTORIZE"
     );
 }
 
