@@ -1,6 +1,6 @@
-# ohara — System Architecture (v2.4)
+# ohara — System Architecture (v2.6)
 
-> **Status:** design of record and implementation status. v2.4 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval and worker recovery acceptance are implemented, while the remaining fetch legs, synthesis, evaluation expansion, and operator tooling are explicitly planned. v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, and the first operator query command are implemented, while the remaining fetch legs, synthesis, and lifecycle/backup tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -95,7 +95,7 @@ The same logical row in both stores is always the same row, because every cross-
 
 ---
 
-## 5. Control-plane schema (SQLite, v2.4)
+## 5. Control-plane schema (SQLite, v2.6)
 
 **Connection pragmas** — set on *every* connection in `control/db.rs`: `foreign_keys = ON` (SQLite defaults it **off**; without it the CASCADEs below are inert), `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`.
 
@@ -389,7 +389,7 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 ### Stage 5 — Retrieval (GraphRAG)
 
-*The three-path baseline is implemented (§15 steps 5–6): language detection, query entities from typed aliases and `EntityNames` KNN, BM25 + vector + capability-gated graph paths, RRF, degradation-aware reranking, and the golden-set harness. Symspell, HyDE, and LLM synthesis are not implemented yet. The current reproducible machinery baseline reports recall@20 = 1.000 for each path and fused MRR = 0.723; broader acceptance coverage is a stabilization task.*
+*The three-path baseline is implemented (§15 steps 5–6): language detection, query entities from typed aliases and `EntityNames` KNN, BM25 + vector + capability-gated graph paths, RRF, degradation-aware reranking, the golden-set harness, and the `ohara query` operator entry point. The CLI returns ranked chunks with immutable `chunk_id` citations; it deliberately does not call the extraction LLM. Symspell, HyDE, and LLM synthesis are not implemented yet. The current reproducible machinery baseline reports recall@20 = 1.000 for each path, fused MRR = 0.723, and rerank delta = 0.000. The stabilization acceptance matrix also covers entity-aware queries, multi-hop graph context, duplicate/deletion behavior, wrong-language and paywall quality gates, and failure/retry recovery.*
 
 1. **Query preprocessing:** whatlang language detection is implemented and confidence-gated at 0.5 — short technical queries that fall below the floor are treated as English. Symspell domain correction and optional HyDE remain planned because they need evaluation before changing query text or latency.
 2. **Query entities:** typed alias match against `entity_aliases` — a homograph alias returns **all** its type-variants and lets rerank/graph context disambiguate — plus embedding KNN over the `EntityNames` collection above a threshold.
@@ -603,8 +603,8 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 | :--- | :--- | :--- |
 | Unit | in-module `#[cfg(test)]` | `text.rs` exhaustive; chunker golden-file tests; **URL normalization fixtures** |
 | Port contract | `tests/ports/<port>/` | Same suite against every impl + fakes; error-mapping tests; **vector-collection isolation**; `fold_entity` fixture graphs |
-| Integration | `tests/integration/` | End-to-end via the public API only — canned fetcher, deterministic injected embedder, real knowledge store, tiny fixture corpus; validates **FTS trigger-sync**, **deletion-intent**, restart/lease recovery, and retry/dead-letter/requeue flows |
-| Eval | golden set | Current machinery metrics are recall@20/MRR per path and rerank delta; broader acceptance cases are the next stabilization task |
+| Integration | `tests/integration/` | End-to-end via the public API only — canned fetcher, deterministic injected embedder, real knowledge store, tiny fixture corpus; validates **FTS trigger-sync**, **deletion-intent**, restart/lease recovery, retry/dead-letter/requeue flows, and quality-gate rejection |
+| Eval | golden set + integration acceptance | Machinery metrics are recall@20/MRR per path and rerank delta; acceptance covers entity-aware, multi-hop, duplicate/deletion, quality-gate, and failure/retry cases |
 
 ---
 
@@ -616,7 +616,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor and cloud LLM opt-in remain planned
-7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**; remaining work is broader evaluation, then query/citation plus backup/requeue/archive/delete commands
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` now exposes ranked chunks with citations; remaining work is backup/requeue/archive/delete, ER merge, and metrics commands
 8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, entity-merge executor, and cost dashboards
 
 ---
@@ -625,7 +625,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 - `lib.rs` declares `pub mod` planes (backyard style); leaves are private (`mod jobs;`) with `pub(crate)`/`pub(super)` internals (Rust Reference visibility) and facade re-exports (`pub use models::{Document, Job};`).
 - Absolute `crate::` paths (the book's stated preference); `super::` only for parent-sibling access.
-- `src/bin/*` for future extra binaries (`ohara backup`, `ohara er merge`, the re-embed tool); `[features]` gate heavy deps (`ladybug`, `onnx-embedder`).
+- `main.rs` remains a thin command parser; future operator commands (`ohara backup`, `ohara er merge`, the re-embed tool) should call library services rather than access stores directly. `[features]` gate heavy deps (`ladybug`, `onnx-embedder`).
 - Code style, API design, and lint policy live in [CODE_GUIDE.md](CODE_GUIDE.md) — the Rust API Guidelines and Rust Style Guide applied to ohara.
 
 ## Appendix B — Change log
@@ -683,7 +683,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 6. **`EntityType` gained `FromStr` on the `knowledge` facade** (the graph module's private impl moved up): Stage 4 parses LLM-supplied type strings without the `ladybug` feature.
 7. **`facts_within_hops` was fixed to dedup by fact identity `(subject, predicate, object)`,** not by entity pair — two edges between the same entities under different predicates are different facts (§8). The traversal now carries `f.predicate` through each hop.
 8. **ER knobs are config:** `[er] name_similarity_threshold` (default 0.85), `embedding_similarity_threshold` (0.75), `max_evidence` (8), `max_occurrences` (8) — validated at boot; the numbers are the conservative defaults until the eval expansion (§15 step 8) measures them on real corpora.
-9. **Behavior-changing stage limits are config:** `[pipeline]` owns the clean word gate, chunk budget/overlap, extraction cap, and ER candidate breadth; `[fetcher]` owns response-body and redirect limits; `[retrieval]` owns the path pool, RRF constant, and query language-confidence floor; `[llm]` owns the health-probe timeout. Defaults remain pinned in `config.rs`, and stage/provider code receives validated values rather than repeating literals.
+9. **Behavior-changing stage limits are config:** `[pipeline]` owns the clean word gate, chunk budget/overlap, extraction cap, and ER candidate breadth; `[fetcher]` owns response-body and redirect limits; `[retrieval]` owns the path pool, query result count, RRF constant, and query language-confidence floor; `[llm]` owns the health-probe timeout. Defaults remain pinned in `config.rs`, and stage/provider code receives validated values rather than repeating literals.
 
 ### B.5 — Stage 5 graph-path build amendments (§15 step 6 read side, 2026-09-08)
 
@@ -716,3 +716,29 @@ A concrete instance of the cost model (the development machine) — the knobs mo
    remains owned by `[pipeline]`.
 3. **Acceptance coverage:** a provider with a smaller capacity is rejected
    before work is accepted, preventing silent inference-time truncation.
+
+### B.9 — Stabilization evaluation matrix (§15 step 7, 2026-09-09)
+
+1. **Regression floors:** the hermetic retrieval evaluator records BM25,
+   vector, and graph recall@20, fused MRR, and rerank delta behind named
+   baseline floors.
+2. **Graph and lifecycle cases:** integration coverage now exercises typed
+   entity retrieval, one- and two-hop fact context, duplicate content surviving
+   deletion of its sibling, and deletion cleanup across BM25, vectors, and
+   graph mentions.
+3. **Quality and recovery cases:** worker acceptance covers wrong-language and
+   paywall rejection without stage chaining, alongside transient retry,
+   dead-letter, and operator requeue recovery.
+
+### B.10 — Operator query slice (§15 step 7, 2026-09-09)
+
+1. `ohara query <text>` uses the same validated local embedder, control store,
+   knowledge store, query normalizer, and three-path retriever as the pipeline;
+   it does not boot the worker or health-check the extraction LLM.
+2. Results expose immutable `chunk_id` values as citations and preserve the
+   configured deterministic retrieval order. The CLI's `--top-k` override is
+   bounded by the configured `[retrieval].pool` and defaults to the new
+   `[retrieval].top_k` setting.
+3. Argument parsing stays in the binary shell; provider/store orchestration and
+   retrieval errors remain in the library, preserving the plane boundaries and
+   keeping the command testable without a subprocess.

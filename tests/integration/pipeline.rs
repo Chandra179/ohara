@@ -33,6 +33,20 @@ const ARTICLE_HTML: &str = r"<html><head><title>On SQLite</title></head><body>
     to ordinary disk files, and the complete database with multiple tables, indices,
     triggers, and views lives inside one portable file.</p></article></body></html>";
 
+const PAYWALL_HTML: &str = r"<html><body><article><p>SQLite is an embedded database engine
+that stores data in a single cross-platform file and needs no separate server process.
+The library supports tables, indexes, triggers, and views while keeping deployment
+simple for applications of many shapes and sizes. It is widely used on phones,
+browsers, and desktop tools because the complete database remains portable and easy
+to back up. Subscribe to continue reading.</p></article></body></html>";
+
+const FRENCH_HTML: &str = r"<html><body><article><p>Le système de gestion de base de données
+relationnelle permet de stocker des informations structurées dans des tables reliées
+entre elles par des clés étrangères très pratiques pour les applications modernes et
+anciennes. Les développeurs peuvent créer des index, des déclencheurs et des vues
+pour organiser les données, améliorer les recherches et conserver une architecture
+simple, portable et fiable sur plusieurs plateformes et environnements.</p></article></body></html>";
+
 /// The fetcher port fake (§14).
 enum Fake {
     Html(&'static str),
@@ -375,6 +389,53 @@ async fn quality_rejection_completes_without_chaining() {
             .is_none(),
         "quality rejection must not chain VECTORIZE"
     );
+}
+
+async fn assert_quality_rejection(html: &'static str, reason: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("data")).unwrap();
+    let config = fixture(dir.path(), "");
+    let conn = control::connect(config.db_path()).unwrap();
+    let doc_id = enqueue_url(
+        &conn,
+        &dir.path().join("data"),
+        "https://example.com/quality",
+    );
+    let worker = Arc::new(
+        Worker::with_ports(
+            Arc::clone(&config),
+            Arc::new(FakeFetcher {
+                result: Fake::Html(html),
+            }),
+            Arc::new(ohara::pipeline::ReadabilityExtractor),
+            Arc::new(FixedEmbedder),
+            memory_knowledge(),
+            Arc::new(ohara::llm::NoLlm),
+        )
+        .unwrap(),
+    );
+
+    tick(&worker).await; // SCRAPE
+    tick(&worker).await; // CLEAN — quality gate rejects
+
+    let doc = control::get(&conn, &doc_id).unwrap().unwrap();
+    assert_eq!(doc.status, DocStatus::FailedQuality);
+    assert!(
+        doc.error.as_deref().unwrap_or("").contains(reason),
+        "quality rejection must explain {reason}: {doc:?}"
+    );
+    assert!(
+        control::claim_next(&conn, ohara::control::Stage::Vectorize, "probe", NOW, 60)
+            .unwrap()
+            .is_none(),
+        "quality rejection must not chain VECTORIZE"
+    );
+}
+
+#[tokio::test]
+async fn quality_evaluation_covers_paywall_and_wrong_language() {
+    assert_quality_rejection(PAYWALL_HTML, "paywall").await;
+    assert_quality_rejection(FRENCH_HTML, "language").await;
 }
 
 #[tokio::test]

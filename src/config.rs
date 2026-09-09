@@ -75,6 +75,8 @@ pub(crate) mod defaults {
     pub const ER_CANDIDATE_K: usize = 8;
     /// Candidate pool per retrieval path (§8 Stage 5).
     pub const RETRIEVAL_POOL: usize = 50;
+    /// Default number of chunks returned by the operator query command.
+    pub const RETRIEVAL_TOP_K: usize = 10;
     /// Reciprocal-rank fusion constant (§8 Stage 5.4).
     pub const RETRIEVAL_RRF_K: f32 = 60.0;
     /// Minimum confidence for language classification on queries.
@@ -205,6 +207,7 @@ pub struct RetrievalConfig {
     max_query_entities: usize,
     fact_hops: u8,
     pool: usize,
+    top_k: usize,
     rrf_k: f32,
     detection_confidence_floor: f64,
 }
@@ -314,6 +317,7 @@ struct RawRetrieval {
     max_query_entities: Option<usize>,
     fact_hops: Option<u8>,
     pool: Option<usize>,
+    top_k: Option<usize>,
     rrf_k: Option<f32>,
     detection_confidence_floor: Option<f64>,
 }
@@ -345,6 +349,7 @@ fn build_retrieval(raw: Option<&RawRetrieval>) -> RetrievalConfig {
             .unwrap_or(defaults::RETRIEVAL_MAX_QUERY_ENTITIES),
         fact_hops: raw.fact_hops.unwrap_or(defaults::RETRIEVAL_FACT_HOPS),
         pool: raw.pool.unwrap_or(defaults::RETRIEVAL_POOL),
+        top_k: raw.top_k.unwrap_or(defaults::RETRIEVAL_TOP_K),
         rrf_k: raw.rrf_k.unwrap_or(defaults::RETRIEVAL_RRF_K),
         detection_confidence_floor: raw
             .detection_confidence_floor
@@ -898,6 +903,10 @@ impl RetrievalConfig {
         )?;
         check(self.pool > 0, "retrieval.pool must be > 0")?;
         check(
+            self.top_k > 0 && self.top_k <= self.pool,
+            "retrieval.top_k must be in 1..=pool",
+        )?;
+        check(
             self.rrf_k.is_finite() && self.rrf_k > 0.0,
             "retrieval.rrf_k must be finite and > 0",
         )?;
@@ -932,6 +941,12 @@ impl RetrievalConfig {
     #[must_use]
     pub fn pool(&self) -> usize {
         self.pool
+    }
+
+    /// Default result count for the operator query command.
+    #[must_use]
+    pub fn top_k(&self) -> usize {
+        self.top_k
     }
 
     /// Reciprocal-rank fusion constant.
@@ -1088,17 +1103,19 @@ mod tests {
         let config = Config::load(None).expect("defaults are valid");
         assert_eq!(config.retrieval().entity_embedding_threshold(), 0.75);
         assert_eq!(config.retrieval().max_query_entities(), 8);
+        assert_eq!(config.retrieval().top_k(), 10);
         assert_eq!(config.retrieval().fact_hops(), 2);
         assert_eq!(config.retrieval().pool(), 50);
         assert_eq!(config.retrieval().rrf_k(), 60.0);
         assert_eq!(config.retrieval().detection_confidence_floor(), 0.5);
 
         let config = Config::load_from_str(
-            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\npool = 20\nrrf_k = 42.0\ndetection_confidence_floor = 0.7\n",
+            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\npool = 20\ntop_k = 6\nrrf_k = 42.0\ndetection_confidence_floor = 0.7\n",
         )
         .expect("valid");
         assert_eq!(config.retrieval().entity_embedding_threshold(), 0.8);
         assert_eq!(config.retrieval().max_query_entities(), 4);
+        assert_eq!(config.retrieval().top_k(), 6);
         assert_eq!(config.retrieval().fact_hops(), 1);
         assert_eq!(config.retrieval().pool(), 20);
         assert_eq!(config.retrieval().rrf_k(), 42.0);

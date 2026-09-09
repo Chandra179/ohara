@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, vectorization, graph extraction, and three-path retrieval baseline are implemented. Worker boot reconciliation, expired-lease recovery, and retry/dead-letter recovery are covered by acceptance tests. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. Retrieval currently returns ranked chunks; LLM synthesis, the query CLI, and operational subcommands remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, vectorization, graph extraction, three-path retrieval baseline, and first `ohara query` operator command are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis and the remaining backup/archive/delete/metrics commands are tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -21,7 +21,7 @@
          ▼                                                          'INDEXED'
  [ Stage 5: Retrieve (GraphRAG) ]
             query normalize → BM25 + vector KNN + graph hops → RRF fusion
-            → cross-encoder rerank (top-50 → top-5)
+            → cross-encoder rerank (configured candidate pool → configured top-k)
             → ranked chunks; LLM synthesis with citations is planned
 ```
 
@@ -55,6 +55,19 @@ make verify
 make build
 ```
 
+## Querying
+
+After ingesting and indexing documents, query the local GraphRAG index:
+
+```text
+make run ARGS='query "how does WAL checkpointing work?"'
+make run ARGS='query "how does WAL checkpointing work?" --top-k 5'
+```
+
+The command runs the configured BM25, vector, and graph paths and prints ranked
+chunks with their immutable `chunk_id` citations. It does not boot the worker or
+call the extraction LLM. The default result count is `[retrieval].top_k`.
+
 Two native prerequisites are also required:
 
 - **OpenSSL development libraries** — the `lbug` crate's bundled engine links
@@ -78,7 +91,7 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── ARCHITECTURE.md        # system design (v2.4) — the source of truth
+│   ├── ARCHITECTURE.md        # system design (v2.6) — the source of truth
 │   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
@@ -87,7 +100,7 @@ ohara/
 │   ├── ports/                 # contract tests — same suite run against every impl of a port
 │   └── integration/           # end-to-end tests via the public library API only
 └── src/
-    ├── main.rs                # binary crate root — thin shell: parse args → ohara::run()
+    ├── main.rs                # binary crate root — thin shell: parse args → library entry point
     ├── lib.rs                 # library crate root — declares the module tree
     ├── config.rs              # settings load + validation into an immutable struct
     ├── control.rs             # CONTROL PLANE facade (SQLite) + SQLite reconciliation helpers
@@ -129,7 +142,7 @@ ohara/
 
 ## What each module does, and why
 
-- **`main.rs` / `lib.rs` (two crates, one package).** The library holds all logic; the binary only parses args and calls `ohara::run()`. Everything becomes testable without spawning a CLI, and future entry points (standalone worker, re-embed tool) come free under `src/bin/`.
+- **`main.rs` / `lib.rs` (two crates, one package).** The library holds all logic; the binary only parses args and calls the worker or operator query entry point. Everything becomes testable without spawning a CLI, and future standalone tools still fit under `src/bin/`.
 - **`config.rs`** — Loads and validates every knob (paths, embedder model + version, per-domain rate limits, LLM keys) into an immutable struct at boot: fail fast at startup, never mid-stage.
 - **`control/` — the control plane.** Owns *all* SQLite access: documents, the job queue, and the audit trail. The queue lives inside the SQLite module because claiming a job must be an atomic SQL statement against a single-writer WAL database. One directory owns the schema; schema changes touch one place.
 - **`engine/` — the fetch engine.** The current implementation gets raw HTML through the plain HTTP leg and exposes capabilities honestly. Future impersonation and Obscura implementations must stay behind the same `Fetcher` port; downstream stages test against a canned fetcher and never require network access.
@@ -153,7 +166,7 @@ ohara/
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
-7. Stabilization: broader retrieval evaluation and the first operator CLI slice; restart, deletion, lease, and retry/dead-letter recovery acceptance is landed
+7. Stabilization: retrieval evaluation and the first operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations; backup and lifecycle commands remain
 8. Obscura leg + full fetch ladder, LLM synthesis, entity-merge tooling, and cost dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

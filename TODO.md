@@ -5,25 +5,30 @@ in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Build-order references are §15
 steps. Anything not listed here is implemented (or a deliberate, documented
 non-goal).
 
-## Stabilization before feature expansion
-These are the next maintenance priorities before tuning retrieval or adding more
-providers. Keep each change behind the existing plane ports and run the full
-verification gates after every slice.
+## Completed stabilization coverage
 
-- Expand the retrieval evaluation set before changing thresholds: add
-  entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and
-  failure/retry cases; record per-path recall, fused MRR, rerank delta, and
-  regression baselines.
-- Boot/restart reconciliation, expired-lease replay, and knowledge-first deletion
-  cleanup across SQLite/FTS/vector/graph stores are covered by the worker
-  acceptance suite.
-- Retry-to-dead-letter classification and `requeue` recovery are covered by the
-  worker acceptance suite.
+The following safeguards are implemented and covered before feature expansion:
+
+- The retrieval evaluator records BM25, vector, and graph recall@20, fused MRR,
+  rerank delta, and named regression floors.
+- Acceptance cases cover typed entity retrieval, one- and two-hop graph context,
+  duplicate content surviving sibling deletion, and cleanup across FTS, vectors,
+  and graph mentions.
+- Quality-gate coverage includes wrong-language and paywall rejection without
+  chaining VECTORIZE.
+- Boot/restart reconciliation, expired-lease replay, retry-to-dead-letter
+  classification, and `requeue` recovery are covered by the worker suite.
 - The `Embedder` port exposes provider input capacity; worker boot rejects a
   chunk budget that would exceed it, preventing silent provider truncation.
-- Finish the first usable operator slice: query/retrieval from the CLI with
-  citations, plus backup, requeue, archive, delete, and basic health/metrics
-  output. Keep these as explicit commands rather than leaking store internals.
+
+## Next priority — operator slice
+
+Keep each change behind the existing plane ports and run the full verification
+gates after every slice.
+
+- Add backup/restore safety first: quiesce the worker, checkpoint SQLite, close
+  LadybugDB, and snapshot the three system-of-record artifacts consistently.
+  Keep the operation explicit and refuse to copy live store files.
 
 ## Embedding migration
 
@@ -54,7 +59,7 @@ outputs, usage counters, boot health check). Remaining:
 - The §11.2 quality-fallback model flow (`llm.fallback_model` is config-only).
 
 ## Ops tooling & CLI (§15 step 8)
-`main.rs` only boots the worker; these subcommands are missing:
+The query command is implemented; these operator commands are missing:
 - `ohara backup` (quiesce + consistent snapshot, §12)
 - `ohara prune` (raw retention budget, §7.9)
 - `ohara requeue --doc <id>`
@@ -62,11 +67,10 @@ outputs, usage counters, boot health check). Remaining:
   audit row, Ladybug fold via `fold_entity` — Stage 4 files `er_review`
   candidates; the merge tool resolves them)
 - `ohara archive <doc>` / `ohara delete <doc>`
-- A query / REPL command (retrieval is currently library/tests-only)
 - Cost / metrics dashboards (§13)
 
-Implementation order for this section: backup/restore safety, query with
-citations, requeue/archive/delete, then ER merge and dashboards.
+Implementation order for this section: backup/restore safety, requeue/archive/
+delete, then ER merge and dashboards. The query/citation slice is landed.
 
 ## Deferred small items
 - Entity GC after deletion (§7.6): entities whose `MENTIONS` degree drops to zero

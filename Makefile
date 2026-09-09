@@ -24,7 +24,7 @@ help:
 		'make test             Run the complete test suite' \
 		'make test-lib         Run library/unit tests' \
 		'make test-integration Run integration tests' \
-		'make test-eval        Run the hermetic retrieval evaluator' \
+		'make test-eval        Run the hermetic retrieval evaluation suite' \
 		'make test-real-eval   Run the ignored model-backed evaluator' \
 		'make doc              Build documentation without dependencies' \
 		'make verify           Run all repository quality gates' \
@@ -61,7 +61,7 @@ test-integration:
 	$(CARGO_CMD) test --test integration
 
 test-eval:
-	$(CARGO_CMD) test --test integration eval_retrieval_baseline_machinery -- --nocapture
+	$(CARGO_CMD) test --test integration 'eval::' -- --nocapture
 
 test-real-eval:
 	$(CARGO_CMD) test --test integration eval_retrieval_baseline_real_models -- --ignored --nocapture

@@ -21,7 +21,7 @@ use std::collections::HashSet;
 
 use ohara::config::Config;
 use ohara::control::{self, NewChunkRow, NewDocument};
-use ohara::knowledge::{ChunkFilter, KnowledgeStore, ModelId, VectorSpace};
+use ohara::knowledge::{ChunkFilter, FactCaps, KnowledgeStore, ModelId, Predicate, VectorSpace};
 use ohara::pipeline::{Embedder, IdentityReranker, Retriever, ScoredChunk, WhatlangNormalizer};
 
 const NOW: &str = "2026-09-06 12:00:00";
@@ -289,9 +289,53 @@ struct Metrics {
     reranked_top5_mrr: f64,
 }
 
+/// Hermetic regression floors for the current retrieval machinery. These are
+/// deliberately separate from production configuration: changing retrieval
+/// thresholds requires a measured evaluation change, not an incidental test
+/// rewrite.
+const MACHINERY_BASELINE: MetricsBaseline = MetricsBaseline {
+    bm25_recall20: 0.95,
+    vector_recall20: 0.90,
+    graph_recall20: 0.90,
+    fused_mrr: 0.70,
+    rerank_delta: 0.0,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct MetricsBaseline {
+    bm25_recall20: f64,
+    vector_recall20: f64,
+    graph_recall20: f64,
+    fused_mrr: f64,
+    rerank_delta: f64,
+}
+
 impl Metrics {
     fn rerank_delta(&self) -> f64 {
         self.reranked_top5_mrr - self.fused_top5_mrr
+    }
+
+    fn assert_at_least(&self, baseline: MetricsBaseline) {
+        assert!(
+            self.bm25_recall20 >= baseline.bm25_recall20,
+            "BM25 regression: {self:?}"
+        );
+        assert!(
+            self.vector_recall20 >= baseline.vector_recall20,
+            "vector regression: {self:?}"
+        );
+        assert!(
+            self.graph_recall20 >= baseline.graph_recall20,
+            "graph regression: {self:?}"
+        );
+        assert!(
+            self.fused_mrr >= baseline.fused_mrr,
+            "fusion regression: {self:?}"
+        );
+        assert!(
+            self.rerank_delta() >= baseline.rerank_delta,
+            "rerank regression: {self:?}"
+        );
     }
 
     fn report(name: &str) -> impl Fn(&Metrics) + '_ {
@@ -436,28 +480,221 @@ async fn eval_retrieval_baseline_machinery() {
 
     let metrics = run_eval(&fixture, &knowledge, &embedder, &queries, &IdentityReranker).await;
     Metrics::report("machinery")(&metrics);
+    metrics.assert_at_least(MACHINERY_BASELINE);
+}
+
+async fn assert_multihop_context(
+    conn: &ohara::control::ControlDb,
+    knowledge: &ohara::knowledge::LadybugStore,
+    topic_doc: &str,
+) -> String {
+    // Multi-hop context is a separate graph contract from the direct
+    // :MENTIONS retrieval path. The first edge is one hop from the query
+    // entity; the second becomes visible only when synthesis asks for two
+    // hops (§8 Stage 5.6).
+    let topic_chunk = control::chunk_signatures(conn, topic_doc)
+        .unwrap()
+        .into_iter()
+        .find(|signature| signature.seq == 0)
+        .expect("evaluation topic has a first chunk")
+        .chunk_id;
+    let second_chunk = control::chunk_signatures(conn, topic_doc)
+        .unwrap()
+        .into_iter()
+        .find(|signature| signature.seq == 1)
+        .expect("evaluation topic has a second chunk")
+        .chunk_id;
+    let caps = FactCaps {
+        max_evidence: 8,
+        max_occurrences: 8,
+    };
+    knowledge
+        .merge_fact(
+            "ent-0",
+            Predicate::DependsOn,
+            "ent-1",
+            &topic_chunk,
+            None,
+            caps,
+        )
+        .await
+        .unwrap();
+    knowledge
+        .merge_fact(
+            "ent-1",
+            Predicate::DependsOn,
+            "ent-2",
+            &second_chunk,
+            None,
+            caps,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        knowledge
+            .facts_within_hops(&["ent-0"], 1)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "one-hop context must stop at the first fact"
+    );
+    assert_eq!(
+        knowledge
+            .facts_within_hops(&["ent-0"], 2)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "two-hop context must include the transitive fact"
+    );
+    topic_chunk
+}
+
+async fn insert_duplicate(
+    fixture: &EvalFixture,
+    conn: &ohara::control::ControlDb,
+    knowledge: &ohara::knowledge::LadybugStore,
+    embedder: &dyn Embedder,
+    topic_chunk: &str,
+) -> String {
+    // Two documents may carry identical content while retaining distinct
+    // cross-store chunk ids. Deleting one must leave the duplicate searchable
+    // through BM25, vectors, and the graph mention path.
+    let original = control::chunks_by_ids(conn, &[topic_chunk])
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("evaluation topic chunk is hydrated");
+    let duplicate_doc = control::insert_new(
+        conn,
+        &fixture.data_dir,
+        &NewDocument {
+            source_url: "https://eval.example/duplicate".to_string(),
+            source_url_normalized: "https://eval.example/duplicate".to_string(),
+            priority: 5,
+            pipeline_version: "0.1.0".to_string(),
+        },
+        NOW,
+    )
+    .unwrap()
+    .doc_id()
+    .to_string();
+    let duplicate_chunk = ohara::text::sha256_hex(&format!("{duplicate_doc}:0"));
+    control::replace_chunks(
+        conn,
+        &duplicate_doc,
+        &[NewChunkRow {
+            chunk_id: duplicate_chunk.clone(),
+            seq: 0,
+            header_path: "wal checkpointing".to_string(),
+            text: original.text.clone(),
+            embed_text: original.text.clone(),
+            token_count: 40,
+            embedding_model: embedder.model_id().to_string(),
+            content_hash: ohara::text::sha256_hex(&original.text),
+        }],
+    )
+    .unwrap();
+    let duplicate_vector = embedder.embed(&[&original.text]).unwrap().remove(0);
+    knowledge
+        .upsert_vectors(
+            VectorSpace::Chunks {
+                model_id: ModelId::new(embedder.model_id().to_string()),
+            },
+            &duplicate_doc,
+            &[duplicate_chunk.as_str()],
+            &[duplicate_vector],
+        )
+        .await
+        .unwrap();
+    knowledge
+        .link_mention(&duplicate_chunk, "ent-0")
+        .await
+        .unwrap();
+    duplicate_chunk
+}
+
+async fn assert_delete_preserves_duplicate(
+    conn: &ohara::control::ControlDb,
+    knowledge: &ohara::knowledge::LadybugStore,
+    embedder: &dyn Embedder,
+    retriever: &Retriever<'_>,
+    topic_doc: &str,
+    topic_chunks: &HashSet<String>,
+    duplicate_chunk: &str,
+) {
+    // Follow the production deletion order: knowledge first, then the SQLite
+    // intent/cascade. This verifies no stale result survives in FTS, vectors,
+    // or graph mentions.
+    knowledge.delete_doc(topic_doc).await.unwrap();
+    control::request_deletion(conn, topic_doc, Some("acceptance test")).unwrap();
+    let report = control::reconcile(conn, NOW, std::time::Duration::ZERO).unwrap();
+    assert_eq!(report.deletions_executed, 1);
+    let deleted_chunk = topic_chunks
+        .iter()
+        .next()
+        .expect("the evaluation topic has chunks");
     assert!(
-        metrics.bm25_recall20 >= 0.95,
-        "BM25 machinery floor: {metrics:?}"
+        !knowledge
+            .has_vector(
+                VectorSpace::Chunks {
+                    model_id: ModelId::new(embedder.model_id().to_string()),
+                },
+                deleted_chunk,
+            )
+            .await
+            .unwrap(),
+        "deletion must remove the topic's vector rows"
     );
     assert!(
-        metrics.vector_recall20 >= 0.9,
-        "vector machinery floor: {metrics:?}"
+        knowledge
+            .chunks_for_entities(&["ent-0"])
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|chunk_id| !topic_chunks.contains(&chunk_id)),
+        "deletion must remove the original graph mention edges"
     );
-    // The graph path resolves the topic entity per query and returns all its
-    // mentioning chunks — the relevant one is always among them (§14).
     assert!(
-        metrics.graph_recall20 >= 0.9,
-        "graph machinery floor: {metrics:?}"
+        knowledge
+            .has_vector(
+                VectorSpace::Chunks {
+                    model_id: ModelId::new(embedder.model_id().to_string()),
+                },
+                duplicate_chunk,
+            )
+            .await
+            .unwrap(),
+        "deleting one duplicate must preserve the other document's vector"
     );
-    assert!(metrics.fused_mrr >= 0.7, "fusion floor: {metrics:?}");
+    let remaining = retriever.query("wal checkpointing", 20).await.unwrap();
+    assert!(
+        remaining
+            .iter()
+            .all(|chunk| !topic_chunks.contains(&chunk.chunk_id))
+            && remaining
+                .iter()
+                .any(|chunk| chunk.chunk_id == duplicate_chunk),
+        "deleted chunks must disappear while duplicate content remains"
+    );
+    let remaining_bm25 = control::search_bm25(conn, "checkpointing", 20).unwrap();
+    assert!(
+        remaining_bm25
+            .iter()
+            .all(|chunk| !topic_chunks.contains(&chunk.chunk_id))
+            && remaining_bm25
+                .iter()
+                .any(|chunk| chunk.chunk_id == duplicate_chunk),
+        "deletion must not leave FTS ghosts or remove the duplicate"
+    );
 }
 
 /// End-to-end retrieval acceptance cases that are not represented by the
-/// single-relevant-chunk golden set: typed entity aliases, graph-backed
-/// retrieval, empty input, and deletion cleanup across every read path.
+/// single-relevant-chunk golden set: typed entity aliases, multi-hop graph
+/// context, duplicate/deletion cleanup, and empty input.
 #[tokio::test]
-async fn retrieval_acceptance_covers_entities_empty_queries_and_deletion() {
+async fn retrieval_acceptance_covers_entities_multihop_duplicates_and_deletion() {
     let embedder = EvalEmbedder;
     let (fixture, knowledge, _queries) = build_corpus(&embedder).await;
     let conn = control::connect(&fixture.store).unwrap();
@@ -497,53 +734,30 @@ async fn retrieval_acceptance_covers_entities_empty_queries_and_deletion() {
         "empty queries must not scan or return arbitrary corpus results"
     );
 
-    // Follow the production deletion order: knowledge first, then the
-    // SQLite intent/cascade. This verifies no stale result survives in FTS,
-    // vectors, or graph mentions.
-    knowledge.delete_doc(&topic_doc).await.unwrap();
-    control::request_deletion(&conn, &topic_doc, Some("acceptance test")).unwrap();
-    let report = control::reconcile(&conn, NOW, std::time::Duration::ZERO).unwrap();
-    assert_eq!(report.deletions_executed, 1);
-    let deleted_chunk = topic_chunks
-        .iter()
-        .next()
-        .expect("the evaluation topic has chunks");
-    assert!(
-        !knowledge
-            .has_vector(
-                VectorSpace::Chunks {
-                    model_id: ModelId::new(embedder.model_id().to_string()),
-                },
-                deleted_chunk,
-            )
-            .await
-            .unwrap(),
-        "deletion must remove the topic's vector rows"
-    );
-    assert!(
-        knowledge
-            .chunks_for_entities(&["ent-0"])
-            .await
-            .unwrap()
-            .is_empty(),
-        "deletion must remove graph mention edges"
-    );
+    let topic_chunk = assert_multihop_context(&conn, &knowledge, &topic_doc).await;
+
+    let duplicate_chunk =
+        insert_duplicate(&fixture, &conn, &knowledge, &embedder, &topic_chunk).await;
     assert!(
         retriever
             .query("wal checkpointing", 20)
             .await
             .unwrap()
             .iter()
-            .all(|chunk| !topic_chunks.contains(&chunk.chunk_id)),
-        "deleted chunks must disappear from every retrieval path"
+            .any(|chunk| chunk.chunk_id == duplicate_chunk),
+        "duplicate content must remain queryable before deletion"
     );
-    assert!(
-        control::search_bm25(&conn, "checkpointing", 20)
-            .unwrap()
-            .iter()
-            .all(|chunk| !topic_chunks.contains(&chunk.chunk_id)),
-        "deletion must not leave FTS ghosts"
-    );
+
+    assert_delete_preserves_duplicate(
+        &conn,
+        &knowledge,
+        &embedder,
+        &retriever,
+        &topic_doc,
+        &topic_chunks,
+        &duplicate_chunk,
+    )
+    .await;
 }
 
 /// The real-model run (§15 step 5's "measured on the golden set"): the pinned
