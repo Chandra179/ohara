@@ -90,6 +90,14 @@ pub fn due_for_recrawl(db: &ControlDb, now_stamp: &str) -> Result<Vec<String>, D
     documents::due_for_recrawl(db.raw(), now_stamp)
 }
 
+/// Archives a document while leaving its chunks queryable.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn archive(db: &ControlDb, doc_id: &str, now_stamp: &str) -> Result<(), DbError> {
+    documents::archive(db.raw(), doc_id, now_stamp)
+}
+
 /// Records deletion intent.
 ///
 /// # Errors

@@ -22,14 +22,17 @@ The following safeguards are implemented and covered before feature expansion:
   chunk budget that would exceed it, preventing silent provider truncation.
 - `ohara query` prints ranked chunks with immutable citations, and `ohara backup`
   writes a staged, non-overwriting snapshot behind the worker runtime lock.
+- `ohara requeue --doc <id>` resets failed/interrupted jobs, `ohara archive <id>`
+  preserves queryable chunks while stopping future work, and `ohara delete <id>`
+  records an idempotent knowledge-first deletion intent.
 
 ## Next priority — operator slice
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
 
-- Add document lifecycle operations next: `requeue`, `archive`, and `delete`,
-  keeping deletion knowledge-first and exposing only control-plane facade types.
+Next implementation priority is the offline entity-merge executor and its
+control-plane audit flow (`ohara er merge`).
 
 ## Embedding migration
 
@@ -60,17 +63,16 @@ outputs, usage counters, boot health check). Remaining:
 - The §11.2 quality-fallback model flow (`llm.fallback_model` is config-only).
 
 ## Ops tooling & CLI (§15 step 8)
-The query and backup commands are implemented; these operator commands are missing:
+The query, backup, and document lifecycle commands are implemented; these
+operator commands are missing:
 - `ohara prune` (raw retention budget, §7.9)
-- `ohara requeue --doc <id>`
 - `ohara er merge` (the §7.8 offline merge executor: alias remap, `entity_merges`
   audit row, Ladybug fold via `fold_entity` — Stage 4 files `er_review`
   candidates; the merge tool resolves them)
-- `ohara archive <doc>` / `ohara delete <doc>`
 - Cost / metrics dashboards (§13)
 
-Implementation order for this section: requeue/archive/delete, then ER merge and
-dashboards. Query/citations and backup/restore snapshot safety are landed.
+Implementation order for this section: ER merge, then prune and metrics.
+Query/citations, backup/restore snapshot safety, and document lifecycle are landed.
 
 ## Deferred small items
 - Entity GC after deletion (§7.6): entities whose `MENTIONS` degree drops to zero

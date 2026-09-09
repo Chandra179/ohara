@@ -292,6 +292,22 @@ pub fn due_for_recrawl(conn: &Connection, now_stamp: &str) -> Result<Vec<String>
     Ok(due)
 }
 
+/// Marks a document archived without touching its indexed content (§6).
+/// Archived documents remain queryable, but the job claim excludes them and
+/// recrawl scheduling already excludes the `ARCHIVED` status.
+///
+/// # Errors
+/// [`DbError::Sqlite`] on statement failure.
+pub fn archive(conn: &Connection, doc_id: &str, now_stamp: &str) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE documents
+            SET status = 'ARCHIVED', last_processed_at = ?2
+          WHERE doc_id = ?1",
+        rusqlite::params![doc_id, now_stamp],
+    )?;
+    Ok(())
+}
+
 /// A pending §7.6 deletion intent: the document row must go, and the knowledge
 /// plane must forget it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,7 +330,8 @@ pub fn request_deletion(
     reason: Option<&str>,
 ) -> Result<(), DbError> {
     conn.execute(
-        "INSERT INTO deletions (doc_id, reason) VALUES (?1, ?2)",
+        "INSERT INTO deletions (doc_id, reason) VALUES (?1, ?2)
+         ON CONFLICT(doc_id) DO NOTHING",
         rusqlite::params![doc_id, reason],
     )?;
     Ok(())

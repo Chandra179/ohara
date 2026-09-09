@@ -38,6 +38,12 @@ pub enum OpsError {
     /// SQLite could not produce the consistent control-plane snapshot.
     #[error("control snapshot: {0}")]
     Control(#[from] control::DbError),
+    /// The requested document is not registered in the control plane.
+    #[error("document not found: {doc_id}")]
+    DocumentNotFound {
+        /// Requested document id.
+        doc_id: String,
+    },
     /// The destination already exists; backups never overwrite an existing snapshot.
     #[error("backup destination already exists: {path:?}")]
     DestinationExists {
@@ -73,6 +79,29 @@ impl BackupReport {
     pub fn destination(&self) -> &Path {
         &self.destination
     }
+}
+
+/// Result of resetting a document's failed or interrupted jobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequeueReport {
+    /// Document whose jobs were reset.
+    pub doc_id: String,
+    /// Number of `DEAD` or `RUNNING` jobs reset to `PENDING`.
+    pub jobs_reset: usize,
+}
+
+/// Result of marking a document archived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveReport {
+    /// Document marked `ARCHIVED`.
+    pub doc_id: String,
+}
+
+/// Result of recording a deletion intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteReport {
+    /// Document whose deletion was requested.
+    pub doc_id: String,
 }
 
 /// Process-wide runtime lock shared by the worker and operator mutations.
@@ -170,6 +199,70 @@ pub fn backup(config: &Config, destination: &Path) -> Result<BackupReport, OpsEr
     }
     fs::rename(&staging, &destination).map_err(|source| io_error(&destination, source))?;
     Ok(BackupReport { destination })
+}
+
+/// Resets a document's failed or interrupted jobs to a fresh retry budget.
+/// Completed stages remain complete; the worker resumes at the first unfinished
+/// stage. The runtime lock prevents a worker claim from racing the reset.
+///
+/// # Errors
+/// [`OpsError::DocumentNotFound`] if `doc_id` is unknown, [`OpsError::RuntimeBusy`]
+/// if the worker is active, or a control-plane error.
+pub fn requeue(config: &Config, doc_id: &str) -> Result<RequeueReport, OpsError> {
+    let (_runtime_lock, db) = open_control(config)?;
+    require_document(&db, doc_id)?;
+    let jobs_reset = control::requeue(&db, doc_id, &control::now())?;
+    Ok(RequeueReport {
+        doc_id: doc_id.to_string(),
+        jobs_reset,
+    })
+}
+
+/// Archives a document while retaining its chunks for query results.
+/// Archived documents cannot be claimed or scheduled for re-crawl.
+///
+/// # Errors
+/// [`OpsError::DocumentNotFound`] if `doc_id` is unknown, [`OpsError::RuntimeBusy`]
+/// if the worker is active, or a control-plane error.
+pub fn archive(config: &Config, doc_id: &str) -> Result<ArchiveReport, OpsError> {
+    let (_runtime_lock, db) = open_control(config)?;
+    require_document(&db, doc_id)?;
+    control::archive(&db, doc_id, &control::now())?;
+    Ok(ArchiveReport {
+        doc_id: doc_id.to_string(),
+    })
+}
+
+/// Records a knowledge-first deletion intent for a document.
+///
+/// The command is intentionally asynchronous: the worker or next boot removes
+/// the document from every knowledge collection before the SQLite cascade runs.
+/// Repeating the command is idempotent.
+///
+/// # Errors
+/// [`OpsError::DocumentNotFound`] if `doc_id` is unknown, [`OpsError::RuntimeBusy`]
+/// if the worker is active, or a control-plane error.
+pub fn delete_document(config: &Config, doc_id: &str) -> Result<DeleteReport, OpsError> {
+    let (_runtime_lock, db) = open_control(config)?;
+    require_document(&db, doc_id)?;
+    control::request_deletion(&db, doc_id, Some(OPERATOR_DELETE_REASON))?;
+    Ok(DeleteReport {
+        doc_id: doc_id.to_string(),
+    })
+}
+
+const OPERATOR_DELETE_REASON: &str = "operator request";
+
+fn open_control(config: &Config) -> Result<(RuntimeLock, control::ControlDb), OpsError> {
+    let runtime_lock = RuntimeLock::acquire(config.data_dir())?;
+    let db = control::connect(config.db_path())?;
+    Ok((runtime_lock, db))
+}
+
+fn require_document(db: &control::ControlDb, doc_id: &str) -> Result<control::Document, OpsError> {
+    control::get(db, doc_id)?.ok_or_else(|| OpsError::DocumentNotFound {
+        doc_id: doc_id.to_string(),
+    })
 }
 
 #[derive(Serialize)]
@@ -283,8 +376,9 @@ mod tests {
 
     use std::fs;
 
-    use super::{OpsError, RuntimeLock, backup};
+    use super::{OpsError, RuntimeLock, archive, backup, delete_document, requeue};
     use crate::config::Config;
+    use crate::control::{self, NewDocument, Stage};
 
     #[test]
     fn runtime_lock_rejects_a_second_owner_and_releases_on_drop() {
@@ -328,5 +422,79 @@ mod tests {
             backup(&config, &data.join("nested-backup")),
             Err(OpsError::DestinationInsideSource { .. })
         ));
+    }
+
+    #[test]
+    fn lifecycle_commands_use_the_control_facade_and_are_idempotent() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let data = dir.path().join("data");
+        let config_path = dir.path().join("ohara.toml");
+        fs::create_dir_all(&data).expect("data directory");
+        fs::write(&config_path, format!("data_dir = {data:?}\n")).expect("config file");
+        let config = Config::load(Some(&config_path)).expect("valid config");
+
+        let db = control::connect(config.db_path()).expect("control store");
+        let doc_id = control::insert_new(
+            &db,
+            config.data_dir(),
+            &NewDocument {
+                source_url: "https://example.com/lifecycle".to_string(),
+                source_url_normalized: "https://example.com/lifecycle".to_string(),
+                priority: 5,
+                pipeline_version: "test".to_string(),
+            },
+            "2026-09-06 12:00:00",
+        )
+        .expect("document")
+        .doc_id()
+        .to_string();
+        let job = control::claim_next(&db, Stage::Scrape, "test", "2026-09-06 12:00:00", 60)
+            .expect("claim")
+            .expect("scrape job");
+        control::dead(
+            &db,
+            job.job_id(),
+            &doc_id,
+            "test failure",
+            "2026-09-06 12:00:00",
+        )
+        .expect("dead job");
+        drop(db);
+
+        let requeued = requeue(&config, &doc_id).expect("requeue");
+        assert_eq!(requeued.jobs_reset, 1);
+        assert_eq!(
+            requeue(&config, &doc_id)
+                .expect("idempotent requeue")
+                .jobs_reset,
+            0
+        );
+
+        let archived = archive(&config, &doc_id).expect("archive");
+        assert_eq!(archived.doc_id, doc_id);
+        let db = control::connect(config.db_path()).expect("control store");
+        assert_eq!(
+            control::get(&db, &doc_id)
+                .expect("document lookup")
+                .unwrap()
+                .status,
+            control::DocStatus::Archived
+        );
+        assert!(
+            control::claim_next(&db, Stage::Scrape, "test", "2026-09-06 12:00:00", 60)
+                .expect("archived jobs are not claimable")
+                .is_none()
+        );
+        drop(db);
+
+        delete_document(&config, &doc_id).expect("delete intent");
+        delete_document(&config, &doc_id).expect("idempotent delete intent");
+        let db = control::connect(config.db_path()).expect("control store");
+        assert_eq!(
+            control::pending_deletions(&db)
+                .expect("pending intents")
+                .len(),
+            1
+        );
     }
 }

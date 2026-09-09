@@ -1,6 +1,6 @@
 # ohara — System Architecture (v2.6)
 
-> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, the operator query command, and staged backup snapshots are implemented, while the remaining fetch legs, synthesis, and lifecycle/metrics tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, the operator query command, staged backup snapshots, and document lifecycle commands are implemented, while the remaining fetch legs, synthesis, ER merge, pruning, and metrics tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -302,15 +302,19 @@ UPDATE jobs
    SET status = 'RUNNING', lease_owner = :worker,
        lease_expires_at = :now + 60 seconds,
        attempts   = attempts + (CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END),
-       last_error = CASE WHEN status = 'RUNNING' THEN 'lease expired'
+ last_error = CASE WHEN status = 'RUNNING' THEN 'lease expired'
                          ELSE last_error END
  WHERE job_id = (
-     SELECT job_id FROM jobs
-      WHERE stage = :stage
-        AND ( (status = 'PENDING'
-               AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
-           OR (status = 'RUNNING' AND lease_expires_at < :now) )
-      ORDER BY priority, created_at, job_id
+     SELECT jobs.job_id FROM jobs
+      JOIN documents ON documents.doc_id = jobs.doc_id
+      LEFT JOIN deletions ON deletions.doc_id = jobs.doc_id
+      WHERE jobs.stage = :stage
+        AND documents.status <> 'ARCHIVED'
+        AND deletions.doc_id IS NULL
+        AND ( (jobs.status = 'PENDING'
+               AND (jobs.next_attempt_at IS NULL OR jobs.next_attempt_at <= :now))
+           OR (jobs.status = 'RUNNING' AND jobs.lease_expires_at < :now) )
+      ORDER BY jobs.priority, jobs.created_at, jobs.job_id
       LIMIT 1)
 RETURNING job_id, doc_id, attempts, params;
 ```
@@ -319,7 +323,7 @@ RETURNING job_id, doc_id, attempts, params;
 - **`attempts` counts ended executions, not claims.** It increments exactly once per ended run: on failure recording, or on expired-lease reclaim (with `last_error = 'lease expired'`). A clean crash mid-lease is therefore punished exactly once, when the lease expires — not twice.
 - **Classification-driven retry:** port errors carry a class (`Retry` / `Permanent` / `Fatal`, §10). `Retry` → `attempts++`, `next_attempt_at = now + jittered backoff`, back to `PENDING` (the `next_attempt_at` predicate above makes backoff real — without it a `PENDING` retry would be immediately reclaimable). `Permanent`, or attempts exhausted → `DEAD`, and the document is set to `FAILED` with `error = last_error`. `Fatal` → stop scheduling, drain, exit non-zero; the boot sweep (§7.3) finishes recovery.
 - **Terminal mapping and recovery:** `DEAD` job ⇒ `documents.status = 'FAILED'`. Recovery is `ohara requeue --doc <id>` (resets that doc's jobs to `PENDING`, `attempts = 0`), or automatic when `pipeline_version` bumps past a failed doc.
-- **`ARCHIVED`:** user-marked state (`ohara archive <doc>`). Excluded from re-crawl scheduling; chunks remain queryable. It is a retention decision, not an execution state.
+- **`ARCHIVED`:** user-marked state (`ohara archive <doc>`). Excluded from job claiming and re-crawl scheduling; chunks remain queryable. It is a retention decision, not an execution state.
 - **Stage 4 progress** is *triplets coverage* (chunks of the doc that already have triplets, §7.7), not per-chunk jobs — there is exactly one EXTRACT job per document. The document goes `INDEXED` when its EXTRACT job is `DONE`.
 - **Concurrency:** single worker loop by default (honest for an embedded tool); the lease protocol makes multi-worker safe when needed. SQLite is the single writer; WAL gives concurrent readers.
 
@@ -616,7 +620,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor and cloud LLM opt-in remain planned
-7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations and `ohara backup` creates staged snapshots; remaining work is requeue/archive/delete, ER merge, and metrics commands
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations, `ohara backup` creates staged snapshots, and `ohara requeue`/`archive`/`delete` implement document lifecycle; remaining work is ER merge, pruning, and metrics commands
 8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, entity-merge executor, and cost dashboards
 
 ---
@@ -755,3 +759,16 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 3. The completed directory is renamed into place only after all artifacts and a
    versioned manifest are written. Existing destinations and destinations inside
    the live data root are refused, and failures clean up the staging directory.
+
+### B.12 — Document lifecycle operator slice (§15 step 8, 2026-09-09)
+
+1. `ohara requeue --doc <id>` is a locked control-plane mutation that resets
+   `DEAD`/`RUNNING` jobs to `PENDING` with `attempts = 0`; completed stages are
+   preserved and the operation is safe to repeat.
+2. `ohara archive <id>` sets `documents.status = 'ARCHIVED'` without deleting
+   chunks. Job claiming and re-crawl scheduling exclude archived documents, so
+   the indexed content remains readable while future work stops.
+3. `ohara delete <id>` writes an idempotent deletion intent and returns. Worker
+   reconciliation performs `KnowledgeStore::delete_doc` first, then deletes the
+   SQLite document row and its cascaded control data; the runtime lock prevents
+   operator/worker races.

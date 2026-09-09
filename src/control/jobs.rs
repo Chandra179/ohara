@@ -23,12 +23,16 @@ UPDATE jobs
                          ELSE last_error END,
        updated_at = ?3
  WHERE job_id = (
-     SELECT job_id FROM jobs
-      WHERE stage = ?4
-        AND ( (status = 'PENDING'
-               AND (next_attempt_at IS NULL OR next_attempt_at <= ?3))
-           OR (status = 'RUNNING' AND lease_expires_at < ?3) )
-      ORDER BY priority, created_at, job_id
+     SELECT jobs.job_id FROM jobs
+      JOIN documents ON documents.doc_id = jobs.doc_id
+      LEFT JOIN deletions ON deletions.doc_id = jobs.doc_id
+      WHERE jobs.stage = ?4
+        AND documents.status <> 'ARCHIVED'
+        AND deletions.doc_id IS NULL
+        AND ( (jobs.status = 'PENDING'
+               AND (jobs.next_attempt_at IS NULL OR jobs.next_attempt_at <= ?3))
+           OR (jobs.status = 'RUNNING' AND jobs.lease_expires_at < ?3) )
+      ORDER BY jobs.priority, jobs.created_at, jobs.job_id
       LIMIT 1)
 RETURNING job_id, doc_id, attempts, max_attempts, params, priority;
 ";
