@@ -192,6 +192,7 @@ pub struct Worker {
     knowledge: Arc<dyn KnowledgeStore>,
     llm: Arc<dyn Llm>,
     id: String,
+    _runtime_lock: crate::ops::RuntimeLock,
 }
 
 /// The default [`Embedder`]: the pinned local ONNX model (§4). Requires the
@@ -290,6 +291,11 @@ fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, crate::BootError> {
     Ok(Arc::new(ollama))
 }
 
+fn runtime_lock(config: &Config) -> Result<crate::ops::RuntimeLock, crate::BootError> {
+    crate::ops::RuntimeLock::acquire(config.data_dir())
+        .map_err(|error| crate::BootError::Worker(error.to_string()))
+}
+
 impl Worker {
     /// Boots a worker with the real ports: engine-plane fetcher (ladder leg 1),
     /// the readability extractor, the pinned local embedder, and the embedded
@@ -300,6 +306,7 @@ impl Worker {
     /// [`crate::BootError`] if the store cannot be opened/migrated, the runtime
     /// handle is unavailable, or any default port cannot be built.
     pub fn new(config: Arc<Config>) -> Result<Self, crate::BootError> {
+        let runtime_lock = runtime_lock(&config)?;
         let fetcher = Arc::new(HttpFetcher::new(crate::engine::HttpFetcherParams {
             user_agent: config.fetcher().user_agent().to_string(),
             timeout: config.fetcher().timeout(),
@@ -313,7 +320,15 @@ impl Worker {
         validate_embedder(&config, embedder.as_ref())?;
         let knowledge = default_knowledge(&config)?;
         let llm = default_llm(&config)?;
-        Self::with_ports(config, fetcher, extractor, embedder, knowledge, llm)
+        Self::with_ports_locked(
+            config,
+            fetcher,
+            extractor,
+            embedder,
+            knowledge,
+            llm,
+            runtime_lock,
+        )
     }
 
     /// Boots a worker with explicit ports (§14 integration: canned fetcher, fake
@@ -332,6 +347,27 @@ impl Worker {
         knowledge: Arc<dyn KnowledgeStore>,
         llm: Arc<dyn Llm>,
     ) -> Result<Self, crate::BootError> {
+        let runtime_lock = runtime_lock(&config)?;
+        Self::with_ports_locked(
+            config,
+            fetcher,
+            extractor,
+            embedder,
+            knowledge,
+            llm,
+            runtime_lock,
+        )
+    }
+
+    fn with_ports_locked(
+        config: Arc<Config>,
+        fetcher: Arc<dyn Fetcher>,
+        extractor: Arc<dyn Extractor>,
+        embedder: Arc<dyn Embedder>,
+        knowledge: Arc<dyn KnowledgeStore>,
+        llm: Arc<dyn Llm>,
+        runtime_lock: crate::ops::RuntimeLock,
+    ) -> Result<Self, crate::BootError> {
         validate_embedder(&config, embedder.as_ref())?;
         let id = format!("worker-{}", std::process::id());
         let conn = control::connect(config.db_path())?;
@@ -348,6 +384,7 @@ impl Worker {
             knowledge,
             llm,
             id,
+            _runtime_lock: runtime_lock,
         })
     }
 

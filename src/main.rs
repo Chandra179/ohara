@@ -2,7 +2,7 @@
 //! worker or operator query entry point. All domain logic remains testable without
 //! spawning a CLI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "ohara — embedded scrape → clean → vectorize → graph → GraphRAG pipeline
@@ -10,11 +10,13 @@ const USAGE: &str = "ohara — embedded scrape → clean → vectorize → graph
 USAGE:
     ohara [--config <path.toml>]
     ohara query <text> [--config <path.toml>] [--top-k <n>]
+    ohara backup <directory> [--config <path.toml>]
 
 OPTIONS:
     --config <path>    TOML config; unset knobs fall back to defaults
     --top-k <n>        Number of ranked chunks to print for query (config default)
     query <text>       Retrieve ranked chunks with chunk-id citations
+    backup <directory> Write a consistent, non-overwriting snapshot
     -h, --help         print this help";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +28,10 @@ enum CliCommand {
         config_path: Option<PathBuf>,
         query: String,
         top_k: Option<usize>,
+    },
+    Backup {
+        config_path: Option<PathBuf>,
+        destination: PathBuf,
     },
 }
 
@@ -39,6 +45,8 @@ enum CliError {
     Boot(#[from] ohara::BootError),
     #[error("query: {0}")]
     Query(#[from] ohara::pipeline::QueryError),
+    #[error("operator: {0}")]
+    Ops(#[from] ohara::ops::OpsError),
 }
 
 fn main() -> ExitCode {
@@ -74,11 +82,15 @@ fn main() -> ExitCode {
             query,
             top_k,
         } => runtime.block_on(query_and_print(config_path, &query, top_k)),
+        CliCommand::Backup {
+            config_path,
+            destination,
+        } => backup_and_print(config_path.as_deref(), &destination),
     };
 
     match result {
         Ok(()) => {
-            eprintln!("ohara: shutdown complete");
+            eprintln!("ohara: command complete");
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -94,7 +106,9 @@ where
 {
     let mut config_path = None;
     let mut query_mode = false;
+    let mut backup_mode = false;
     let mut query_parts = Vec::new();
+    let mut backup_destination = None;
     let mut top_k = None;
     let mut args = args.into_iter();
 
@@ -121,7 +135,12 @@ where
                 }
                 top_k = Some(parsed);
             }
-            "query" if !query_mode && query_parts.is_empty() => query_mode = true,
+            "query" if !query_mode && !backup_mode && query_parts.is_empty() => {
+                query_mode = true;
+            }
+            "backup" if !query_mode && !backup_mode && query_parts.is_empty() => {
+                backup_mode = true;
+            }
             value if query_mode => {
                 if value.starts_with('-') {
                     return Err(CliError::Argument(format!(
@@ -129,6 +148,19 @@ where
                     )));
                 }
                 query_parts.push(value.to_string());
+            }
+            value if backup_mode => {
+                if value.starts_with('-') {
+                    return Err(CliError::Argument(format!(
+                        "unknown backup option {value:?}"
+                    )));
+                }
+                if backup_destination.is_some() {
+                    return Err(CliError::Argument(
+                        "backup accepts one destination directory".to_string(),
+                    ));
+                }
+                backup_destination = Some(value.to_string());
             }
             value => {
                 return Err(CliError::Argument(format!("unknown argument {value:?}")));
@@ -147,6 +179,19 @@ where
             config_path,
             query,
             top_k,
+        }))
+    } else if backup_mode {
+        if top_k.is_some() {
+            return Err(CliError::Argument(
+                "--top-k is only valid with the query command".to_string(),
+            ));
+        }
+        let destination = backup_destination.ok_or_else(|| {
+            CliError::Argument("backup requires a destination directory".to_string())
+        })?;
+        Ok(Some(CliCommand::Backup {
+            config_path,
+            destination: PathBuf::from(destination),
         }))
     } else if top_k.is_some() {
         Err(CliError::Argument(
@@ -183,6 +228,13 @@ async fn query_and_print(
         );
         println!("   {}", result.text.replace('\n', " "));
     }
+    Ok(())
+}
+
+fn backup_and_print(config_path: Option<&Path>, destination: &Path) -> Result<(), CliError> {
+    let config = ohara::config::Config::load(config_path)?;
+    let report = ohara::ops::backup(&config, destination)?;
+    println!("backup written to {}", report.destination().display());
     Ok(())
 }
 
@@ -243,5 +295,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_backup_destination_and_rejects_missing_destination() {
+        assert_eq!(
+            parse_args(
+                ["backup", "/tmp/ohara-backup", "--config", "x.toml"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap(),
+            Some(CliCommand::Backup {
+                config_path: Some(PathBuf::from("x.toml")),
+                destination: PathBuf::from("/tmp/ohara-backup"),
+            })
+        );
+        assert!(parse_args(["backup"].into_iter().map(str::to_string)).is_err());
     }
 }

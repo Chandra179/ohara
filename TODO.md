@@ -20,15 +20,16 @@ The following safeguards are implemented and covered before feature expansion:
   classification, and `requeue` recovery are covered by the worker suite.
 - The `Embedder` port exposes provider input capacity; worker boot rejects a
   chunk budget that would exceed it, preventing silent provider truncation.
+- `ohara query` prints ranked chunks with immutable citations, and `ohara backup`
+  writes a staged, non-overwriting snapshot behind the worker runtime lock.
 
 ## Next priority — operator slice
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
 
-- Add backup/restore safety first: quiesce the worker, checkpoint SQLite, close
-  LadybugDB, and snapshot the three system-of-record artifacts consistently.
-  Keep the operation explicit and refuse to copy live store files.
+- Add document lifecycle operations next: `requeue`, `archive`, and `delete`,
+  keeping deletion knowledge-first and exposing only control-plane facade types.
 
 ## Embedding migration
 
@@ -59,8 +60,7 @@ outputs, usage counters, boot health check). Remaining:
 - The §11.2 quality-fallback model flow (`llm.fallback_model` is config-only).
 
 ## Ops tooling & CLI (§15 step 8)
-The query command is implemented; these operator commands are missing:
-- `ohara backup` (quiesce + consistent snapshot, §12)
+The query and backup commands are implemented; these operator commands are missing:
 - `ohara prune` (raw retention budget, §7.9)
 - `ohara requeue --doc <id>`
 - `ohara er merge` (the §7.8 offline merge executor: alias remap, `entity_merges`
@@ -69,8 +69,8 @@ The query command is implemented; these operator commands are missing:
 - `ohara archive <doc>` / `ohara delete <doc>`
 - Cost / metrics dashboards (§13)
 
-Implementation order for this section: backup/restore safety, requeue/archive/
-delete, then ER merge and dashboards. The query/citation slice is landed.
+Implementation order for this section: requeue/archive/delete, then ER merge and
+dashboards. Query/citations and backup/restore snapshot safety are landed.
 
 ## Deferred small items
 - Entity GC after deletion (§7.6): entities whose `MENTIONS` degree drops to zero

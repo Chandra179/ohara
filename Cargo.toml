@@ -38,6 +38,7 @@ onnx-embedder = ["dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
 [dependencies]
 async-trait = "0.1.92"
 chrono = "0.4.45"
+fs2 = "0.4.3"
 flate2 = "1.1.10"
 html2md = "0.2.17"
 lbug = { version = "0.20.2", optional = true }

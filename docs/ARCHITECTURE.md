@@ -1,6 +1,6 @@
 # ohara — System Architecture (v2.6)
 
-> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, and the first operator query command are implemented, while the remaining fetch legs, synthesis, and lifecycle/backup tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, the operator query command, and staged backup snapshots are implemented, while the remaining fetch legs, synthesis, and lifecycle/metrics tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -585,7 +585,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 - **Stored HTML is data:** raw HTML is never re-rendered in a browser context; cleaning strips scripts before Markdown conversion.
 - **Data egress:** cloud LLM calls send private scraped content off-machine — **opt-in** (`cloud_llm_enabled = false` by default; local Ollama is the default path and nothing leaves the machine). The `Llm` port's cost/token counters double as the egress audit.
 - **At rest:** SQLite + Ladybug + `data/` are plain files; full-disk encryption is the user's OS-level concern (documented, not implemented).
-- **Backups — never copy a live store file.** `ohara backup` coordinates all three artifacts: drain workers → `wal_checkpoint(TRUNCATE)` → `VACUUM INTO` → close the Ladybug handle (clean close = consistent file) → copy the knowledge file + `data/` → reopen. SQLite and Ladybug snapshots must be captured in the same quiesced window or cross-store consistency is lost.
+- **Backups — never copy a live store file.** `ohara backup` acquires the runtime lock so the worker cannot claim or write jobs, runs `wal_checkpoint(TRUNCATE)` → `VACUUM INTO`, copies the closed-process knowledge directory plus `data/` into a staging directory, writes a manifest, and renames the completed snapshot. Existing destinations and destinations inside live `data/` are rejected; restore tooling remains a separate operation. SQLite and Ladybug snapshots are captured in the same quiesced window or cross-store consistency is lost.
 
 ---
 
@@ -616,7 +616,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor and cloud LLM opt-in remain planned
-7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` now exposes ranked chunks with citations; remaining work is backup/requeue/archive/delete, ER merge, and metrics commands
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations and `ohara backup` creates staged snapshots; remaining work is requeue/archive/delete, ER merge, and metrics commands
 8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, entity-merge executor, and cost dashboards
 
 ---
@@ -625,7 +625,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 - `lib.rs` declares `pub mod` planes (backyard style); leaves are private (`mod jobs;`) with `pub(crate)`/`pub(super)` internals (Rust Reference visibility) and facade re-exports (`pub use models::{Document, Job};`).
 - Absolute `crate::` paths (the book's stated preference); `super::` only for parent-sibling access.
-- `main.rs` remains a thin command parser; future operator commands (`ohara backup`, `ohara er merge`, the re-embed tool) should call library services rather than access stores directly. `[features]` gate heavy deps (`ladybug`, `onnx-embedder`).
+- `main.rs` remains a thin command parser; operator commands (`ohara backup`, `ohara er merge`, the re-embed tool) call library services rather than access stores directly. `[features]` gate heavy deps (`ladybug`, `onnx-embedder`).
 - Code style, API design, and lint policy live in [CODE_GUIDE.md](CODE_GUIDE.md) — the Rust API Guidelines and Rust Style Guide applied to ohara.
 
 ## Appendix B — Change log
@@ -742,3 +742,16 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 3. Argument parsing stays in the binary shell; provider/store orchestration and
    retrieval errors remain in the library, preserving the plane boundaries and
    keeping the command testable without a subprocess.
+
+### B.11 — Staged backup safety (§15 step 8, 2026-09-09)
+
+1. The worker and backup command share an OS-level runtime lock. A backup
+   refuses to run while the worker or another mutating operator owns it; the
+   kernel releases the lock on abnormal process exit.
+2. SQLite snapshotting remains owned by `control`: WAL checkpointing and
+   `VACUUM INTO` produce a standalone `ohara.db`, while the operator service
+   copies the closed-process knowledge/data artifacts into a sibling staging
+   directory.
+3. The completed directory is renamed into place only after all artifacts and a
+   versioned manifest are written. Existing destinations and destinations inside
+   the live data root are refused, and failures clean up the staging directory.

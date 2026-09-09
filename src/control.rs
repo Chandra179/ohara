@@ -10,7 +10,7 @@ mod models;
 mod reconcile;
 mod sites;
 
-pub use db::{ControlDb, DbError, connect};
+pub use db::{ControlDb, DbError, backup_to, connect};
 pub use documents::{
     ChunkSignature, ChunkText, CleanResult, DeletionIntent, Document, EnqueueOutcome, NewChunkRow,
     NewDocument,

@@ -83,6 +83,22 @@ pub fn connect(path: &Path) -> Result<ControlDb, DbError> {
     Ok(ControlDb { connection: conn })
 }
 
+/// Captures a consistent SQLite snapshot into a new file.
+///
+/// The caller must already have quiesced the worker and acquired the runtime
+/// lock. The checkpoint removes the WAL before `VACUUM INTO` writes the
+/// snapshot, so the destination never depends on live sidecar files.
+///
+/// # Errors
+/// [`DbError::Sqlite`] if checkpointing or snapshot creation fails.
+pub fn backup_to(db: &ControlDb, destination: &Path) -> Result<(), DbError> {
+    db.connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))?;
+    db.connection
+        .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+    Ok(())
+}
+
 /// The §5 pragmas, on every connection: WAL, `NORMAL` synchronous, `foreign_keys = ON`
 /// (`SQLite` defaults it off — without it the schema's CASCADEs are inert), 5 s busy timeout.
 fn set_pragmas(conn: &Connection) -> Result<(), DbError> {
@@ -216,5 +232,26 @@ mod tests {
             )
             .expect("sqlite_master");
         assert_eq!(jobs, 1);
+    }
+
+    #[test]
+    fn backup_to_writes_a_readable_snapshot() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let source = dir.path().join("source.db");
+        let destination = dir.path().join("backup.db");
+        let db = connect(&source).expect("source store");
+        db.connection
+            .execute("CREATE TABLE backup_probe (value TEXT)", [])
+            .expect("probe table");
+        db.connection
+            .execute("INSERT INTO backup_probe VALUES ('ok')", [])
+            .expect("probe row");
+
+        backup_to(&db, &destination).expect("snapshot");
+        let snapshot = Connection::open(destination).expect("open snapshot");
+        let value: String = snapshot
+            .query_row("SELECT value FROM backup_probe", [], |row| row.get(0))
+            .expect("probe row in snapshot");
+        assert_eq!(value, "ok");
     }
 }

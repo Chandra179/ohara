@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, vectorization, graph extraction, three-path retrieval baseline, and first `ohara query` operator command are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis and the remaining backup/archive/delete/metrics commands are tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, vectorization, graph extraction, three-path retrieval baseline, `ohara query`, and staged `ohara backup` command are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis and the remaining requeue/archive/delete/metrics commands are tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -67,6 +67,17 @@ make run ARGS='query "how does WAL checkpointing work?" --top-k 5'
 The command runs the configured BM25, vector, and graph paths and prints ranked
 chunks with their immutable `chunk_id` citations. It does not boot the worker or
 call the extraction LLM. The default result count is `[retrieval].top_k`.
+
+Create a consistent snapshot while the worker is stopped or quiesced:
+
+```text
+make run ARGS='backup /path/to/ohara-backup'
+```
+
+The backup takes an exclusive runtime lock, checkpoints and vacuums SQLite,
+copies the Ladybug/data artifacts into a staging directory, writes a manifest,
+and renames the completed snapshot into place. Existing destinations are never
+overwritten, and destinations inside the live data root are rejected.
 
 Two native prerequisites are also required:
 
@@ -137,6 +148,7 @@ ohara/
     │   └── retrieve.rs        # Stage 5: three-path retrieval + rerank + QueryNormalizer port
     ├── llm.rs                 # pub trait Llm + the local Ollama provider (structured
                                #   outputs, usage counters, boot health check)
+    ├── ops.rs                 # operator coordination: runtime lock + staged backups
     └── text.rs                # pure text functions: language ID, normalization, tokenizer, unicode
 ```
 
@@ -166,7 +178,7 @@ ohara/
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
-7. Stabilization: retrieval evaluation and the first operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations; backup and lifecycle commands remain
+7. Stabilization: retrieval evaluation and the first operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations and `ohara backup` creates consistent snapshots; lifecycle commands remain
 8. Obscura leg + full fetch ladder, LLM synthesis, entity-merge tooling, and cost dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

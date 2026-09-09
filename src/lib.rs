@@ -58,6 +58,7 @@ pub mod control;
 pub mod engine;
 pub mod knowledge;
 pub mod llm;
+pub mod ops;
 pub mod pipeline;
 pub mod text;
 
