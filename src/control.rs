@@ -15,7 +15,7 @@ pub use documents::{
     ChunkSignature, ChunkText, CleanResult, DeletionIntent, Document, EnqueueOutcome, NewChunkRow,
     NewDocument,
 };
-pub use entities::{NameCandidate, NewTriplet, TripletRow};
+pub use entities::{EntityDetails, EntityMerge, ErReview, NameCandidate, NewTriplet, TripletRow};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
 pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
@@ -328,6 +328,59 @@ pub fn er_review_candidate(
     score: f64,
 ) -> Result<bool, DbError> {
     entities::er_review_candidate(db.raw(), entity_a, entity_b, score)
+}
+
+/// Reads one entity's merge metadata.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn entity_details(db: &ControlDb, entity_id: &str) -> Result<Option<EntityDetails>, DbError> {
+    entities::entity_details(db.raw(), entity_id)
+}
+
+/// Resolves an entity through the merge audit to its current root.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails or the audit is cyclic.
+pub fn resolve_entity(db: &ControlDb, entity_id: &str) -> Result<String, DbError> {
+    entities::resolve_entity(db.raw(), entity_id)
+}
+
+/// Reads all recorded entity merges for knowledge-plane repair.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn entity_merges(db: &ControlDb) -> Result<Vec<EntityMerge>, DbError> {
+    entities::entity_merges(db.raw())
+}
+
+/// Reads pending cross-document entity merge reviews.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn pending_er_reviews(db: &ControlDb) -> Result<Vec<ErReview>, DbError> {
+    entities::pending_er_reviews(db.raw())
+}
+
+/// Records the SQLite half of an offline entity merge.
+///
+/// # Errors
+/// Returns [`DbError`] if the entities are invalid or the write fails.
+pub fn record_entity_merge(
+    db: &ControlDb,
+    loser_id: &str,
+    winner_id: &str,
+    reason: &str,
+) -> Result<bool, DbError> {
+    entities::record_entity_merge(db.raw(), loser_id, winner_id, reason)
+}
+
+/// Marks a review as merged when both sides already resolve to one root.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn mark_er_review_merged(db: &ControlDb, review_id: i64) -> Result<(), DbError> {
+    entities::mark_er_review_merged(db.raw(), review_id)
 }
 
 /// Reads staged triplets for a document.

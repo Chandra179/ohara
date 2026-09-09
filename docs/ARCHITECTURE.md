@@ -1,6 +1,6 @@
 # ohara — System Architecture (v2.6)
 
-> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, the operator query command, staged backup snapshots, and document lifecycle commands are implemented, while the remaining fetch legs, synthesis, ER merge, pruning, and metrics tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.6 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, and the offline ER merge executor are implemented, while the remaining fetch legs, synthesis, pruning, and metrics tooling are explicitly planned. v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -619,9 +619,9 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 3. Fetch ladder leg 1 (HTTP) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
-6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor and cloud LLM opt-in remain planned
-7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations, `ohara backup` creates staged snapshots, and `ohara requeue`/`archive`/`delete` implement document lifecycle; remaining work is ER merge, pruning, and metrics commands
-8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, entity-merge executor, and cost dashboards
+6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor is also landed; cloud LLM opt-in remains planned
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations, `ohara backup` creates staged snapshots, `ohara requeue`/`archive`/`delete` implement document lifecycle, and `ohara er merge` closes the offline entity-review queue; remaining work is pruning and metrics commands
+8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, raw retention pruning, and cost dashboards
 
 ---
 
@@ -772,3 +772,17 @@ A concrete instance of the cost model (the development machine) — the knobs mo
    reconciliation performs `KnowledgeStore::delete_doc` first, then deletes the
    SQLite document row and its cascaded control data; the runtime lock prevents
    operator/worker races.
+
+### B.13 — Offline entity-merge operator slice (§15 step 8, 2026-09-09)
+
+1. `ohara er merge` acquires the same runtime lock as the worker and other
+   operator mutations. `main.rs` only parses and dispatches; `ops.rs` owns the
+   coordination and the `control`/`knowledge` facades own their stores.
+2. Existing `entity_merges` audit rows are replayed before pending reviews, so
+   a crash after the SQLite transaction but before the Ladybug fold is repaired
+   on the next invocation. The operation is safe to repeat.
+3. Each pending review resolves stale ids through the merge audit, chooses the
+   winner by higher `:MENTIONS` degree, then older `created_at`, then stable id,
+   and records the SQLite half before calling `KnowledgeStore::fold_entity`.
+   Typed aliases move to the winner with merge provenance; triplet evidence is
+   intentionally unchanged.

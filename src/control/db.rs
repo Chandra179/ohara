@@ -40,6 +40,46 @@ pub enum DbError {
         /// The expected format.
         fmt: &'static str,
     },
+    /// An entity referenced by an operator merge does not exist.
+    #[error("entity not found: {entity_id}")]
+    EntityNotFound {
+        /// Missing entity id.
+        entity_id: String,
+    },
+    /// An entity cannot be merged into itself.
+    #[error("cannot merge entity {entity_id} into itself")]
+    MergeSelf {
+        /// Repeated entity id.
+        entity_id: String,
+    },
+    /// An entity merge would cross the closed ontology's supertypes.
+    #[error("entity types do not match: {loser_id}={loser_type}, {winner_id}={winner_type}")]
+    EntityTypeMismatch {
+        /// Loser entity id.
+        loser_id: String,
+        /// Loser entity type.
+        loser_type: String,
+        /// Winner entity id.
+        winner_id: String,
+        /// Winner entity type.
+        winner_type: String,
+    },
+    /// The merge audit already records a different winner for the loser.
+    #[error("entity {loser_id} already merges into {existing_winner}, not {requested_winner}")]
+    MergeConflict {
+        /// Loser entity id.
+        loser_id: String,
+        /// Existing winner.
+        existing_winner: String,
+        /// Requested winner.
+        requested_winner: String,
+    },
+    /// The merge audit contains a cycle and cannot be resolved safely.
+    #[error("entity merge cycle at {entity_id}")]
+    MergeCycle {
+        /// Entity id where resolution revisited a node.
+        entity_id: String,
+    },
 }
 
 /// Opaque control-plane database handle.

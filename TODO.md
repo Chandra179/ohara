@@ -25,14 +25,16 @@ The following safeguards are implemented and covered before feature expansion:
 - `ohara requeue --doc <id>` resets failed/interrupted jobs, `ohara archive <id>`
   preserves queryable chunks while stopping future work, and `ohara delete <id>`
   records an idempotent knowledge-first deletion intent.
+- `ohara er merge` replays recorded Ladybug folds, resolves pending review
+  candidates by mention degree/age, remaps aliases, and records `entity_merges`.
 
 ## Next priority — operator slice
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
 
-Next implementation priority is the offline entity-merge executor and its
-control-plane audit flow (`ohara er merge`).
+Next implementation priority is raw retention pruning (`ohara prune`) with a
+knowledge-first deletion policy and acceptance coverage.
 
 ## Embedding migration
 
@@ -63,16 +65,14 @@ outputs, usage counters, boot health check). Remaining:
 - The §11.2 quality-fallback model flow (`llm.fallback_model` is config-only).
 
 ## Ops tooling & CLI (§15 step 8)
-The query, backup, and document lifecycle commands are implemented; these
-operator commands are missing:
+The query, backup, document lifecycle, and ER merge commands are implemented;
+these operator commands are missing:
 - `ohara prune` (raw retention budget, §7.9)
-- `ohara er merge` (the §7.8 offline merge executor: alias remap, `entity_merges`
-  audit row, Ladybug fold via `fold_entity` — Stage 4 files `er_review`
-  candidates; the merge tool resolves them)
 - Cost / metrics dashboards (§13)
 
-Implementation order for this section: ER merge, then prune and metrics.
-Query/citations, backup/restore snapshot safety, and document lifecycle are landed.
+Implementation order for this section: prune, then metrics.
+Query/citations, backup/restore snapshot safety, document lifecycle, and ER
+merge are landed.
 
 ## Deferred small items
 - Entity GC after deletion (§7.6): entities whose `MENTIONS` degree drops to zero

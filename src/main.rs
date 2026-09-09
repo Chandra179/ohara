@@ -14,6 +14,7 @@ USAGE:
     ohara requeue --doc <id> [--config <path.toml>]
     ohara archive <id> [--config <path.toml>]
     ohara delete <id> [--config <path.toml>]
+    ohara er merge [--config <path.toml>]
 
 OPTIONS:
     --config <path>    TOML config; unset knobs fall back to defaults
@@ -23,6 +24,7 @@ OPTIONS:
     requeue --doc <id> Reset failed or interrupted jobs for a document
     archive <id>       Retain a document's chunks but stop future work
     delete <id>        Request knowledge-first document deletion
+    er merge           Execute pending offline entity merges
     -h, --help         print this help";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,6 +52,9 @@ enum CliCommand {
     Delete {
         config_path: Option<PathBuf>,
         doc_id: String,
+    },
+    EntityMerge {
+        config_path: Option<PathBuf>,
     },
 }
 
@@ -123,6 +128,7 @@ fn main() -> ExitCode {
             config_path,
             doc_id,
         } => delete_and_print(config_path.as_deref(), &doc_id),
+        CliCommand::EntityMerge { config_path } => runtime.block_on(merge_and_print(config_path)),
     };
 
     match result {
@@ -142,6 +148,7 @@ enum CliMode {
     Query,
     Backup,
     Lifecycle(LifecycleAction),
+    EntityMerge,
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +159,7 @@ struct CliParser {
     backup_destination: Option<String>,
     lifecycle_doc: Option<String>,
     top_k: Option<usize>,
+    entity_group: bool,
 }
 
 fn parse_args<I>(args: I) -> Result<Option<CliCommand>, CliError>
@@ -190,18 +198,41 @@ impl CliParser {
             "requeue" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Requeue))?,
             "archive" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Archive))?,
             "delete" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Delete))?,
+            "er" => self.select_entity_group()?,
+            "merge" => self.select_entity_merge()?,
             value => self.parse_value(value)?,
         }
         Ok(())
     }
 
     fn select_mode(&mut self, mode: CliMode) -> Result<(), CliError> {
-        if self.mode.is_some() || !self.query_parts.is_empty() {
+        if self.mode.is_some() || !self.query_parts.is_empty() || self.entity_group {
             return Err(CliError::Argument(
                 "multiple commands are not supported".to_string(),
             ));
         }
         self.mode = Some(mode);
+        Ok(())
+    }
+
+    fn select_entity_group(&mut self) -> Result<(), CliError> {
+        if self.mode.is_some() || !self.query_parts.is_empty() || self.entity_group {
+            return Err(CliError::Argument(
+                "multiple commands are not supported".to_string(),
+            ));
+        }
+        self.entity_group = true;
+        Ok(())
+    }
+
+    fn select_entity_merge(&mut self) -> Result<(), CliError> {
+        if !self.entity_group || self.mode.is_some() {
+            return Err(CliError::Argument(
+                "expected `er merge` as a command".to_string(),
+            ));
+        }
+        self.entity_group = false;
+        self.mode = Some(CliMode::EntityMerge);
         Ok(())
     }
 
@@ -248,6 +279,16 @@ impl CliParser {
                 }
                 self.set_lifecycle_doc(value.to_string())?;
             }
+            Some(CliMode::EntityMerge) => {
+                return Err(CliError::Argument(
+                    "er merge does not accept positional arguments".to_string(),
+                ));
+            }
+            None if self.entity_group => {
+                return Err(CliError::Argument(
+                    "expected `merge` after `er`".to_string(),
+                ));
+            }
             None => return Err(CliError::Argument(format!("unknown argument {value:?}"))),
         }
         Ok(())
@@ -272,6 +313,10 @@ impl CliParser {
             Some(CliMode::Query) => self.finish_query(),
             Some(CliMode::Backup) => self.finish_backup(),
             Some(CliMode::Lifecycle(action)) => self.finish_lifecycle(action),
+            Some(CliMode::EntityMerge) => self.finish_entity_merge(),
+            None if self.entity_group => Err(CliError::Argument(
+                "expected `merge` after `er`".to_string(),
+            )),
             None if self.top_k.is_some() => Err(CliError::Argument(
                 "--top-k is only valid with the query command".to_string(),
             )),
@@ -326,6 +371,18 @@ impl CliParser {
             },
         };
         Ok(Some(command))
+    }
+
+    fn finish_entity_merge(self) -> Result<Option<CliCommand>, CliError> {
+        reject_top_k(self.top_k)?;
+        if self.lifecycle_doc.is_some() || self.backup_destination.is_some() {
+            return Err(CliError::Argument(
+                "er merge does not accept positional arguments".to_string(),
+            ));
+        }
+        Ok(Some(CliCommand::EntityMerge {
+            config_path: self.config_path,
+        }))
     }
 }
 
@@ -416,6 +473,16 @@ fn delete_and_print(config_path: Option<&Path>, doc_id: &str) -> Result<(), CliE
     let config = ohara::config::Config::load(config_path)?;
     let report = ohara::ops::delete_document(&config, doc_id)?;
     println!("deletion requested for {}", report.doc_id);
+    Ok(())
+}
+
+async fn merge_and_print(config_path: Option<PathBuf>) -> Result<(), CliError> {
+    let config = ohara::config::Config::load(config_path.as_deref())?;
+    let report = ohara::ops::merge_entities(&config).await?;
+    println!(
+        "examined {} review(s), recorded {} merge(s), replayed {} fold(s)",
+        report.reviews_examined, report.merges_recorded, report.folds_replayed
+    );
     Ok(())
 }
 
@@ -524,5 +591,22 @@ mod tests {
             })
         );
         assert!(parse_args(["requeue"].into_iter().map(str::to_string)).is_err());
+    }
+
+    #[test]
+    fn parses_entity_merge_command() {
+        assert_eq!(
+            parse_args(
+                ["er", "merge", "--config", "x.toml"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap(),
+            Some(CliCommand::EntityMerge {
+                config_path: Some(PathBuf::from("x.toml")),
+            })
+        );
+        assert!(parse_args(["er"].into_iter().map(str::to_string)).is_err());
+        assert!(parse_args(["merge"].into_iter().map(str::to_string)).is_err());
     }
 }

@@ -13,6 +13,8 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::control;
+#[cfg(feature = "ladybug")]
+use crate::knowledge::KnowledgeStore;
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RUNTIME_LOCK_NAME: &str = ".ohara.lock";
@@ -38,6 +40,12 @@ pub enum OpsError {
     /// SQLite could not produce the consistent control-plane snapshot.
     #[error("control snapshot: {0}")]
     Control(#[from] control::DbError),
+    /// The knowledge plane could not complete an operator mutation.
+    #[error("knowledge store: {0}")]
+    Knowledge(#[from] crate::knowledge::KnowledgeError),
+    /// Entity merge requires the embedded `LadybugDB` implementation.
+    #[error("entity merge requires the `ladybug` feature")]
+    KnowledgeFeatureDisabled,
     /// The requested document is not registered in the control plane.
     #[error("document not found: {doc_id}")]
     DocumentNotFound {
@@ -102,6 +110,17 @@ pub struct ArchiveReport {
 pub struct DeleteReport {
     /// Document whose deletion was requested.
     pub doc_id: String,
+}
+
+/// Summary of one offline entity-resolution merge run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EntityMergeReport {
+    /// Pending review rows examined.
+    pub reviews_examined: usize,
+    /// New SQLite merge audit rows recorded.
+    pub merges_recorded: usize,
+    /// Knowledge-plane folds replayed, including repair folds.
+    pub folds_replayed: usize,
 }
 
 /// Process-wide runtime lock shared by the worker and operator mutations.
@@ -251,6 +270,107 @@ pub fn delete_document(config: &Config, doc_id: &str) -> Result<DeleteReport, Op
     })
 }
 
+/// Executes the offline entity-resolution merge queue.
+///
+/// The runtime lock makes the operator mutation exclusive with the worker. The
+/// control-plane audit is written before each Ladybug fold, and every existing
+/// audit row is replayed first so an interrupted cross-store operation heals on
+/// the next invocation. Pending candidates choose the entity with the higher
+/// `:MENTIONS` degree; ties use the older control-plane row and finally the
+/// stable id for deterministic ordering.
+///
+/// # Errors
+/// [`OpsError::RuntimeBusy`] if the worker is active, [`OpsError::Control`] for
+/// invalid control-plane state, [`OpsError::Knowledge`] for a fold failure, or
+/// [`OpsError::KnowledgeFeatureDisabled`] without the embedded store feature.
+pub async fn merge_entities(config: &Config) -> Result<EntityMergeReport, OpsError> {
+    let (_runtime_lock, db) = open_control(config)?;
+    #[cfg(feature = "ladybug")]
+    {
+        let store = crate::knowledge::LadybugStore::open(
+            &config.data_dir().join("ladybug"),
+            config.embedder().dim(),
+        )?;
+        execute_entity_merges(&db, &store).await
+    }
+    #[cfg(not(feature = "ladybug"))]
+    {
+        let _ = db;
+        Err(OpsError::KnowledgeFeatureDisabled)
+    }
+}
+
+#[cfg(feature = "ladybug")]
+async fn execute_entity_merges(
+    db: &control::ControlDb,
+    store: &dyn KnowledgeStore,
+) -> Result<EntityMergeReport, OpsError> {
+    let mut report = EntityMergeReport::default();
+
+    for merge in control::entity_merges(db)? {
+        store.fold_entity(&merge.loser_id, &merge.winner_id).await?;
+        report.folds_replayed += 1;
+    }
+
+    for review in control::pending_er_reviews(db)? {
+        report.reviews_examined += 1;
+        let entity_a = control::resolve_entity(db, &review.entity_a)?;
+        let entity_b = control::resolve_entity(db, &review.entity_b)?;
+        if entity_a == entity_b {
+            control::mark_er_review_merged(db, review.id)?;
+            continue;
+        }
+
+        let details_a = required_entity(db, &entity_a)?;
+        let details_b = required_entity(db, &entity_b)?;
+        let mentions_a = store.chunks_for_entities(&[entity_a.as_str()]).await?.len();
+        let mentions_b = store.chunks_for_entities(&[entity_b.as_str()]).await?.len();
+        let (winner, loser) =
+            choose_merge_direction(&details_a, mentions_a, &details_b, mentions_b);
+
+        if control::record_entity_merge(db, loser, winner, ER_MERGE_REASON)? {
+            report.merges_recorded += 1;
+        }
+        store.fold_entity(loser, winner).await?;
+        report.folds_replayed += 1;
+    }
+
+    Ok(report)
+}
+
+#[cfg(feature = "ladybug")]
+fn required_entity(
+    db: &control::ControlDb,
+    entity_id: &str,
+) -> Result<control::EntityDetails, OpsError> {
+    control::entity_details(db, entity_id)?.ok_or_else(|| {
+        OpsError::Control(control::DbError::EntityNotFound {
+            entity_id: entity_id.to_string(),
+        })
+    })
+}
+
+#[cfg(feature = "ladybug")]
+fn choose_merge_direction<'a>(
+    a: &'a control::EntityDetails,
+    mentions_a: usize,
+    b: &'a control::EntityDetails,
+    mentions_b: usize,
+) -> (&'a str, &'a str) {
+    if mentions_a > mentions_b
+        || (mentions_a == mentions_b
+            && (a.created_at.as_str(), a.entity_id.as_str())
+                <= (b.created_at.as_str(), b.entity_id.as_str()))
+    {
+        (&a.entity_id, &b.entity_id)
+    } else {
+        (&b.entity_id, &a.entity_id)
+    }
+}
+
+#[cfg(feature = "ladybug")]
+const ER_MERGE_REASON: &str = "offline er merge";
+
 const OPERATOR_DELETE_REASON: &str = "operator request";
 
 fn open_control(config: &Config) -> Result<(RuntimeLock, control::ControlDb), OpsError> {
@@ -376,9 +496,13 @@ mod tests {
 
     use std::fs;
 
-    use super::{OpsError, RuntimeLock, archive, backup, delete_document, requeue};
+    use super::{
+        OpsError, RuntimeLock, archive, backup, delete_document, execute_entity_merges, requeue,
+    };
     use crate::config::Config;
     use crate::control::{self, NewDocument, Stage};
+    #[cfg(feature = "ladybug")]
+    use crate::knowledge::{EntityRecord, EntityType, KnowledgeStore, LadybugStore};
 
     #[test]
     fn runtime_lock_rejects_a_second_owner_and_releases_on_drop() {
@@ -496,5 +620,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[cfg(feature = "ladybug")]
+    #[test]
+    fn entity_merge_uses_mentions_for_winner_and_repairs_the_graph() {
+        let db = control::testing::boot();
+        control::ensure_entity(&db, "loser", "Ada", "PERSON", None).expect("loser");
+        control::ensure_entity(&db, "winner", "Ada Lovelace", "PERSON", None).expect("winner");
+        control::upsert_alias(&db, "ada", "PERSON", "loser").expect("alias");
+        control::er_review_candidate(&db, "loser", "winner", 0.91).expect("review");
+
+        let store = LadybugStore::in_memory(4).expect("knowledge store");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for (id, name) in [("loser", "Ada"), ("winner", "Ada Lovelace")] {
+                store
+                    .upsert_entity(&EntityRecord {
+                        entity_id: id.to_string(),
+                        canonical_name: name.to_string(),
+                        entity_type: EntityType::Person,
+                        subtype: None,
+                    })
+                    .await
+                    .expect("entity node");
+            }
+            store
+                .link_mention("chunk-loser", "loser")
+                .await
+                .expect("mention");
+            store
+                .link_mention("chunk-winner-1", "winner")
+                .await
+                .expect("mention");
+            store
+                .link_mention("chunk-winner-2", "winner")
+                .await
+                .expect("mention");
+
+            let report = execute_entity_merges(&db, &store).await.expect("merge");
+            assert_eq!(report.reviews_examined, 1);
+            assert_eq!(report.merges_recorded, 1);
+            assert_eq!(
+                control::resolve_entity(&db, "loser").expect("resolved loser"),
+                "winner"
+            );
+            assert_eq!(
+                store
+                    .chunks_for_entities(&["winner"])
+                    .await
+                    .expect("winner mentions")
+                    .len(),
+                3
+            );
+            assert!(
+                store
+                    .chunks_for_entities(&["loser"])
+                    .await
+                    .expect("loser mentions")
+                    .is_empty()
+            );
+        });
     }
 }
