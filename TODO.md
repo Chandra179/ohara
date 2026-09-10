@@ -37,21 +37,22 @@ The following safeguards are implemented and covered before feature expansion:
   vectors, graph links, folds, traversal, and deletion semantics.
 - The engine-owned fetch ladder now has deterministic leg selection and
   escalation on anti-bot or JavaScript-required outcomes; the default runtime
-  still wires only the plain HTTP provider until legs 2–3 land.
+  wires plain HTTP plus the browser-profile impersonation provider; Obscura
+  remains the next unimplemented leg.
 - Site policies now drive conditional re-crawls: due SCRAPE jobs are re-queued,
   validators produce HTTP 304 outcomes, and adaptive intervals are capped by
   fetcher configuration.
 
-## Next priority — fetch ladder legs 2–3
+## Next priority — Obscura fetch leg and provider hardening
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
 
 The bounded Stage 5.6 synthesis slice is implemented through the existing `Llm`
-port. The ladder composition and deterministic escalation seam are now landed;
-the remaining production-reliability work is to add the impersonation leg, the
-versioned Obscura subprocess protocol, and real provider wiring while preserving
-the `Fetcher` port. Keep each leg independently testable.
+port. The ladder composition, deterministic escalation seam, and browser-profile
+impersonation leg are landed. The remaining production-reliability work is the
+versioned Obscura subprocess protocol and deeper provider contract coverage while
+preserving the `Fetcher` port. Keep each leg independently testable.
 
 ## Embedding migration
 
@@ -69,14 +70,14 @@ entities (typed aliases + `EntityNames` KNN) are done. Remaining:
   the `Llm` port, structured output is citation-validated, and unavailable or
   ungrounded synthesis falls back to ranked chunks.
 
-## Fetch ladder legs 2–3 (§15 step 7)
-The engine-owned ladder is implemented, but only leg 1 (plain HTTP,
-`engine/http.rs`) is wired by the default runtime. This is now the next
-implementation priority for provider work.
-- Leg 2: impersonation client.
+## Fetch ladder leg 3 (§15 step 7)
+The engine-owned ladder and legs 1–2 are wired by the default runtime.
+- Leg 2: browser-profile impersonation client — landed; it reuses the hardened
+  HTTP transport and declares `stealth` without claiming JavaScript support.
 - Leg 3: Obscura subprocess (JS rendering + stealth) — `engine/obscura.rs` is a
   placeholder; implement the versioned JSON subprocess protocol.
-- Ladder escalation logic that composes the legs on anti-bot / JS-shell signals.
+- Add reusable provider contract tests for redirect/SSRF, policy limits, and
+  error mapping before adding the Obscura implementation.
 
 ## `Llm` port leftovers
 Local Ollama is done (OpenAI-compatible completions, JSON-schema structured

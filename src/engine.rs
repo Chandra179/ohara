@@ -3,6 +3,7 @@
 //! remain behind the same port (§1.2.2).
 
 mod http;
+mod impersonate;
 mod ladder;
 mod obscura;
 mod robots;
@@ -10,6 +11,7 @@ mod robots;
 use std::time::Duration;
 
 pub use http::{HttpFetcher, HttpFetcherParams};
+pub use impersonate::ImpersonationFetcher;
 pub use ladder::FetchLadder;
 
 use async_trait::async_trait;

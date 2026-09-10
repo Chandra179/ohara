@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::BootError;
 use crate::config::Config;
-use crate::engine::{FetchLadder, Fetcher, HttpFetcher, HttpFetcherParams};
+use crate::engine::{
+    FetchLadder, FetchLeg, Fetcher, HttpFetcher, HttpFetcherParams, ImpersonationFetcher,
+};
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
 
@@ -42,7 +44,21 @@ pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
         max_body_bytes: config.fetcher().max_body_bytes(),
         max_redirects: config.fetcher().max_redirects(),
     })?);
-    let fetcher = Arc::new(FetchLadder::single(plain));
+    let impersonated = Arc::new(ImpersonationFetcher::new(
+        HttpFetcherParams {
+            user_agent: config.fetcher().user_agent().to_string(),
+            timeout: config.fetcher().timeout(),
+            rate_limit: config.rate_limit(),
+            allow_private_hosts: config.fetcher().allow_private_hosts(),
+            max_body_bytes: config.fetcher().max_body_bytes(),
+            max_redirects: config.fetcher().max_redirects(),
+        },
+        config.fetcher().impersonation_user_agent().to_string(),
+    )?);
+    let fetcher = Arc::new(FetchLadder::new(vec![
+        (FetchLeg::Plain, plain),
+        (FetchLeg::Impersonate, impersonated),
+    ])?);
     let extractor = Arc::new(ReadabilityExtractor);
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;

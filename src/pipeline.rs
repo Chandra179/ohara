@@ -147,8 +147,9 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Boots a worker with the real ports: engine-plane fetcher (ladder leg 1),
-    /// the readability extractor, the pinned local embedder, and the embedded
+    /// Boots a worker with the real ports: engine-plane fetch ladder (HTTP plus
+    /// browser-profile impersonation), the readability extractor, the pinned
+    /// local embedder, and the embedded
     /// `LadybugDB` knowledge store. Callers create the data directories first
     /// ([`run`] does).
     ///

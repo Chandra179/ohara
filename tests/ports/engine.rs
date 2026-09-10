@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use ohara::engine::{FetchCapabilities, Fetcher, HttpFetcher, HttpFetcherParams, NormalizedUrl};
+use ohara::engine::{
+    FetchCapabilities, Fetcher, HttpFetcher, HttpFetcherParams, ImpersonationFetcher, NormalizedUrl,
+};
 
 #[test]
 fn normalized_urls_are_stable_dedup_keys() {
@@ -32,6 +34,30 @@ fn http_fetcher_exposes_its_actual_capabilities_through_the_port() {
         FetchCapabilities {
             js_rendering: false,
             stealth: false,
+        }
+    );
+}
+
+#[test]
+fn impersonation_fetcher_exposes_browser_profile_capabilities_through_the_port() {
+    let fetcher = ImpersonationFetcher::new(
+        HttpFetcherParams {
+            user_agent: "ohara/port-test".to_string(),
+            timeout: Duration::from_secs(1),
+            rate_limit: Duration::ZERO,
+            allow_private_hosts: true,
+            max_body_bytes: 1024,
+            max_redirects: 2,
+        },
+        "Mozilla/5.0 port-test".to_string(),
+    )
+    .unwrap();
+    let port: &dyn Fetcher = &fetcher;
+    assert_eq!(
+        port.capabilities(),
+        FetchCapabilities {
+            js_rendering: false,
+            stealth: true,
         }
     );
 }

@@ -1,7 +1,8 @@
 //! Stage 1 — Scrape (§8): politeness + robots via the [`Fetcher`] port → raw
 //! payload → `data/raw/<doc_id>.html.gz` → fetch metadata on the document row.
 //! The milestone (`SCRAPED`) and the CLEAN chaining happen in the completion
-//! transaction, not here. Ladder escalation (legs 2–3) arrives with §15 step 7.
+//! transaction, not here. `FetchLadder` owns provider selection and escalation;
+//! this stage only translates the control-plane site hint into engine policy.
 
 use std::time::Duration;
 

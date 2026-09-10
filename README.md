@@ -2,17 +2,17 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, citation-preserving LLM synthesis, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, raw retention pruning, and a read-only operator metrics snapshot are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. Durable LLM cost accounting, quality fallback, cloud providers, and dashboards remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, citation-preserving LLM synthesis, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, raw retention pruning, and a read-only operator metrics snapshot are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The fetch ladder now wires plain HTTP and browser-profile impersonation; the Obscura subprocess remains planned. Durable LLM cost accounting, quality fallback, cloud providers, and dashboards remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-The engine-owned `FetchLadder` now provides deterministic selection and
-escalation; the default runtime still wires only HTTP leg 1 while impersonation
-and Obscura providers remain planned.
+The engine-owned `FetchLadder` provides deterministic selection and escalation;
+the default runtime wires HTTP leg 1 and browser-profile impersonation leg 2,
+while the Obscura provider remains planned.
 
 ## How it works
 
 ```
  [ Stage 1: Scrape ] ──► raw HTML (gz) ──► SQLite 'SCRAPED'
-         │          FetchLadder → HTTP fetcher (leg 1; later providers planned)
+         │          FetchLadder → HTTP → impersonation (Obscura planned)
          ▼
  [ Stage 2: Clean ] ──► normalized Markdown ──► SQLite 'CLEANED'
          │          readability → html2md → sanitize → hash/dedup → quality gate
@@ -33,7 +33,7 @@ and Obscura providers remain planned.
 
 | Component | Choice | Role |
 | :--- | :--- | :--- |
-| Scraper engine | `FetchLadder` + `reqwest` HTTP fetcher | Ladder selection/escalation is implemented; HTTP leg 1 is wired with robots, politeness, redirects, and SSRF protection; impersonation and Obscura remain planned providers behind `Fetcher` |
+| Scraper engine | `FetchLadder` + `reqwest` HTTP fetchers | Ladder selection/escalation and legs 1–2 are wired with robots, politeness, redirects, and SSRF protection; Obscura remains a planned provider behind `Fetcher` |
 | Control plane | SQLite (WAL, via `rusqlite`) | Job queue, document state machine, dedup hashes, audit log |
 | Cleaning | `readability` + `html2md` | Boilerplate removal, HTML → Markdown |
 | Text utilities | `whatlang`, Unicode normalization | Language ID and deterministic surface-form normalization; domain-dictionary correction is planned |
@@ -183,9 +183,10 @@ ohara/
     │   └── models.rs          #   row types + the §6 state machine's shape knowledge
     ├── engine.rs              # ENGINE PLANE facade — pub trait Fetcher (the port)
     ├── engine/
-    │   ├── http.rs            #   implemented ladder leg 1: plain HTTP
+    │   ├── http.rs            #   shared hardened HTTP transport
+    │   ├── impersonate.rs     #   implemented ladder leg 2: browser profile
     │   ├── ladder.rs          #   deterministic leg selection and escalation
-    │   └── obscura.rs         #   reserved placeholder for a future ladder leg
+    │   └── obscura.rs         #   reserved placeholder for the future JS leg
     ├── knowledge.rs           # KNOWLEDGE PLANE facade — pub trait KnowledgeStore (the port)
     ├── knowledge/
     │   ├── vectors.rs         #   LadybugStore: vector collections (FLOAT[n] node tables,
@@ -224,7 +225,7 @@ ohara/
 - **`main.rs` / `lib.rs` (two crates, one package).** The library holds all logic; the binary only parses args and calls the worker or operator query entry point. Everything becomes testable without spawning a CLI, and future standalone tools still fit under `src/bin/`.
 - **`config.rs`** — Loads and validates every knob (paths, embedder model + version, per-domain rate limits, LLM keys) into an immutable struct at boot: fail fast at startup, never mid-stage.
 - **`control/` — the control plane.** Owns *all* SQLite access: documents, the job queue, and the audit trail. The queue lives inside the SQLite module because claiming a job must be an atomic SQL statement against a single-writer WAL database. One directory owns the schema; schema changes touch one place.
-- **`engine/` — the fetch engine.** `FetchLadder` owns neutral leg selection and deterministic escalation while each provider remains behind `Fetcher`. The current default gets raw HTML through the plain HTTP leg and exposes capabilities honestly. Future impersonation and Obscura implementations must stay behind the same port; downstream stages test against canned fetchers and never require network access.
+- **`engine/` — the fetch engine.** `FetchLadder` owns neutral leg selection and deterministic escalation while each provider remains behind `Fetcher`. The default runtime wires plain HTTP and browser-profile impersonation; both share SSRF, redirect, robots, body-limit, and politeness enforcement. Obscura remains a separate future provider; downstream stages test against canned fetchers and never require network access.
 - **`knowledge/` — the knowledge plane.** Owns *all* LadybugDB access (vectors + graph). Because SQLite and LadybugDB cannot share a transaction, `pipeline/recovery.rs` owns the cross-store boot ordering while each plane keeps its datastore-specific operations testable.
 - **`pipeline.rs` + `pipeline/` — orchestration and stages.** The scheduler claims jobs and `pipeline/execution.rs` centralizes dispatch, panic isolation, retry/dead-letter classification, and atomic audit transitions. Stage-specific context types expose only the ports each stage can use. `pipeline/runtime.rs` assembles default providers, `pipeline/recovery.rs` orders cross-store repair, `pipeline/extraction_contract.rs` isolates Stage 4's provider-facing contract from graph side effects, and `pipeline/synthesis.rs` isolates Stage 5.6's prompt/schema/citation contract. Query startup lives in `pipeline/query.rs`; stages take their dependencies as traits, which makes them unit-testable in isolation.
 - **`llm.rs`** — The single LLM port: provider impls, retry/backoff, token/cost counters, prompt templates. Three stages call LLMs; without one port, cost accounting and the data-governance decision (what content leaves the machine) scatter everywhere.
@@ -241,7 +242,8 @@ ohara/
 
 1. Scaffold the crate: module tree, config, migrations, worker-loop skeleton
 2. Control store: documents + jobs (lease claiming)
-3. Fetch ladder leg 1 (HTTP) + Stages 1–2 (clean, dedup, quality gate)
+3. Fetch ladder legs 1–2 (HTTP + browser-profile impersonation) + Stages 1–2
+   (clean, dedup, quality gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)

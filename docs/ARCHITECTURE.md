@@ -1,6 +1,6 @@
-# ohara — System Architecture (v2.10)
+# ohara — System Architecture (v2.11)
 
-> **Status:** design of record and implementation status. v2.10 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, citation-preserving bounded synthesis, conditional re-crawling, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, offline ER merge, raw retention pruning, a read-only control/raw metrics snapshot, and engine-owned fetch-ladder composition are implemented. The default runtime still wires only HTTP leg 1; impersonation and Obscura providers, durable LLM cost accounting, quality fallback, cloud provider, and dashboards remain explicitly planned. v2.9 added citation-preserving retrieval synthesis; v2.8 added the operator metrics snapshot; v2.7 added the architecture seam cleanup; v2.6 added maintainability and backend-integrity hardening; v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.11 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, citation-preserving bounded synthesis, conditional re-crawling, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, offline ER merge, raw retention pruning, a read-only control/raw metrics snapshot, and engine-owned fetch-ladder composition with plain HTTP plus browser-profile impersonation are implemented. The Obscura provider, durable LLM cost accounting, quality fallback, cloud provider, and dashboards remain explicitly planned. v2.10 added the fetch-ladder composition seam; v2.9 added citation-preserving retrieval synthesis; v2.8 added the operator metrics snapshot; v2.7 added the architecture seam cleanup; v2.6 added maintainability and backend-integrity hardening; v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -13,7 +13,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Plane | Implementation | Responsibility |
 | :--- | :--- | :--- |
 | **Control** | SQLite (WAL) | Document state machine, job queue, dedup hashes, BM25 index, audit trail |
-| **Engine** | HTTP fetcher (ladder leg 1); future legs behind the same port | Network fetching, SSRF/robots/politeness policy, and future JS rendering |
+| **Engine** | HTTP fetchers (plain + browser-profile impersonation); Obscura future leg | Network fetching, SSRF/robots/politeness policy, and future JS rendering |
 | **Knowledge** | LadybugDB | Exact in-engine cosine KNN plus property graph with openCypher; HNSW remains a future implementation |
 
 ### 1.2 Design principles
@@ -52,7 +52,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 
 | Component | Choice | Pinning / risk posture |
 | :--- | :--- | :--- |
-| Scraper | `reqwest` HTTP client | Implemented ladder leg 1 behind `Fetcher`; robots, politeness, redirects, and SSRF checks are in place. Impersonation and Obscura are planned port implementations |
+| Scraper | `reqwest` HTTP clients | Implemented ladder legs 1–2 behind `Fetcher`; both share robots, politeness, redirects, and SSRF checks. Obscura remains a planned port implementation |
 | Control store | SQLite via `rusqlite` (bundled), WAL | Stable; migrations versioned in `migrations/` |
 | Cleaning | `readability` (Rust) + `html2md` | Behind `Extractor` port; swap = alternate impl |
 | Text utils | `whatlang`, Unicode normalization | Pure language detection and surface-form normalization; domain-dictionary correction is planned |
@@ -356,7 +356,7 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 ### Stage 1 — Scrape
 
-- **Target fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → impersonated client → Obscura (JS + stealth). `FetchLadder` now owns neutral leg selection and escalation on anti-bot/JavaScript-required outcomes; the default runtime ships only the plain HTTP provider, while impersonation and Obscura remain provider implementations to add.
+- **Target fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → browser-profile impersonated client → Obscura (JS + stealth). `FetchLadder` owns neutral leg selection and escalation on anti-bot/JavaScript-required outcomes; the default runtime wires the first two providers, while Obscura remains a separate provider implementation to add. The impersonation leg changes the browser-facing request profile but does not claim TLS fingerprint impersonation or JavaScript execution.
 - **URL normalization** (load-bearing for `source_url_normalized` dedup — specified, not folklore): lowercase scheme/host, punycode IDN, drop default ports and fragments, sort query parameters, strip configurable tracking params (`utm_*`, `fbclid`, `gclid`, …), absolutize relative URLs against `final_url`. Implemented once in the `NormalizedUrl` newtype with fixture tests.
 - `FetchedDoc { html, js_executed, final_url, status, content_type, etag, last_modified, fetched_at }` — the contract is "return what you fetched, labeled" (§9), and the pipeline escalates when the label says rendering didn't happen. The validators ride along for §7.5 conditional re-crawl.
 - **Per-fetch policy:** the port takes `fetch_with_policy(url, &FetchPolicy)` and may take `FetchValidators` for conditional requests — the stage reads the control plane (`sites.rate_limit_ms`, the robots toggle, and validators) and the fetcher enforces (§8 politeness floor is `max(impl default, policy)`); plain `fetch(url)` applies the default. Robots rules use a per-host cache; an unreadable robots.txt is cached as disallow-all (conservative RFC 9309).
@@ -631,12 +631,12 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 1. Scaffold crate (module tree, `config.rs`, migrations, worker-loop skeleton)
 2. Control store: documents + jobs with lease claiming + stage chaining
-3. Fetch ladder leg 1 (HTTP) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
+3. Fetch ladder legs 1–2 (HTTP + browser-profile impersonation) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction and `HyDE`
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor is also landed; cloud LLM opt-in remains planned
 7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` synthesizes bounded answers with citations and falls back to ranked chunks, `ohara backup` creates staged snapshots, `ohara requeue`/`archive`/`delete` implement document lifecycle, `ohara er merge` closes the offline entity-review queue, `ohara prune` enforces raw retention, and `ohara metrics` reports durable control/raw usage state
-8. Remaining feature work: impersonation and Obscura fetch providers, durable LLM usage/cost accounting, quality fallback, cloud providers, and dashboards
+8. Remaining feature work: Obscura fetch provider, durable LLM usage/cost accounting, quality fallback, cloud providers, and dashboards
 
 ---
 
@@ -855,6 +855,19 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 2. `FetchLadder` composes providers in deterministic order, passes conditional
    validators only to the first attempted leg, escalates only on `AntiBot` or
    `JavaScriptRequired`, and preserves permanent errors without blind fallback.
-3. The default runtime wraps the existing HTTP provider in a single-leg ladder;
-   impersonation and Obscura providers remain separate implementations and are
-   not advertised before they are wired.
+3. The default runtime wraps the HTTP providers in a ladder; the impersonation
+   provider is now wired as leg 2, while Obscura remains separate until its
+   subprocess protocol is implemented.
+
+### B.18 — Browser-profile impersonation leg (§15 step 7, 2026-09-10)
+
+1. `ImpersonationFetcher` reuses the hardened HTTP transport with a configurable
+   browser User-Agent and navigation headers. It declares `stealth: true` and
+   `js_rendering: false`; TLS fingerprint impersonation and JavaScript remain
+   outside this provider's contract.
+2. The default runtime wires plain HTTP followed by impersonation in
+   `FetchLadder`. Site hints can start at either leg, and anti-bot errors from
+   plain HTTP escalate into the browser profile.
+3. `FetchPolicy::rate_limit` is now an effective per-fetch floor: the HTTP
+   transport uses the greater of its global default and the site override,
+   including robots requests and redirect hops.

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use reqwest::dns::{Name, Resolve, Resolving};
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode};
 
 use super::robots::Robots;
@@ -47,6 +48,7 @@ pub struct HttpFetcher {
     rate_limit: Duration,
     max_body_bytes: usize,
     max_redirects: usize,
+    capabilities: FetchCapabilities,
     robots: Mutex<HashMap<String, Arc<RobotsDecision>>>,
     last_hit: Mutex<HashMap<String, Instant>>,
 }
@@ -88,21 +90,65 @@ impl HttpFetcher {
     /// [`FetchError::Protocol`] if the TLS/HTTP client cannot be built — a boot
     /// problem, not a fetch problem.
     pub fn new(params: HttpFetcherParams) -> Result<Self, FetchError> {
-        let client = Client::builder()
-            .user_agent(params.user_agent)
-            .timeout(params.timeout)
+        Self::new_with_profile(params, None)
+    }
+
+    /// Builds a browser-profile variant for the impersonation ladder leg. It
+    /// shares the plain provider's DNS validation, redirects, robots, body
+    /// limits, and politeness implementation; only its request profile and
+    /// declared capability differ.
+    pub(crate) fn new_impersonated(
+        params: HttpFetcherParams,
+        browser_user_agent: String,
+    ) -> Result<Self, FetchError> {
+        if browser_user_agent.is_empty() {
+            return Err(FetchError::Protocol(
+                "impersonation user-agent must be non-empty".to_string(),
+            ));
+        }
+        let browser_user_agent = browser_user_agent.into_boxed_str();
+        Self::new_with_profile(params, Some(&browser_user_agent))
+    }
+
+    fn new_with_profile(
+        params: HttpFetcherParams,
+        impersonation_user_agent: Option<&str>,
+    ) -> Result<Self, FetchError> {
+        let HttpFetcherParams {
+            user_agent: plain_user_agent,
+            timeout,
+            rate_limit,
+            allow_private_hosts,
+            max_body_bytes,
+            max_redirects,
+        } = params;
+        let capabilities = FetchCapabilities {
+            js_rendering: false,
+            stealth: impersonation_user_agent.is_some(),
+        };
+        let mut builder = Client::builder()
+            .user_agent(impersonation_user_agent.unwrap_or(plain_user_agent.as_str()))
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(ValidatingResolver {
-                allow_private_hosts: params.allow_private_hosts,
-            }))
+                allow_private_hosts,
+            }));
+        let headers = if capabilities.stealth {
+            browser_headers()
+        } else {
+            plain_headers()
+        };
+        builder = builder.default_headers(headers);
+        let client = builder
             .build()
             .map_err(|e| FetchError::Protocol(format!("http client build failed: {e}")))?;
         Ok(Self {
             client,
-            timeout_secs: params.timeout.as_secs(),
-            rate_limit: params.rate_limit,
-            max_body_bytes: params.max_body_bytes,
-            max_redirects: params.max_redirects,
+            timeout_secs: timeout.as_secs(),
+            rate_limit,
+            max_body_bytes,
+            max_redirects,
+            capabilities,
             robots: Mutex::new(HashMap::new()),
             last_hit: Mutex::new(HashMap::new()),
         })
@@ -113,12 +159,10 @@ impl HttpFetcher {
         &self,
         url: &NormalizedUrl,
         validators: Option<&FetchValidators>,
+        policy: &FetchPolicy,
     ) -> Result<reqwest::Response, FetchError> {
-        self.politeness_wait(url).await;
-        let mut request = self.client.get(url.as_url().clone()).header(
-            reqwest::header::ACCEPT,
-            "text/html,application/xhtml+xml,*/*;q=0.8",
-        );
+        self.politeness_wait(url, policy.rate_limit).await;
+        let mut request = self.client.get(url.as_url().clone());
         if let Some(etag) = validators.and_then(|v| v.etag.as_deref()) {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -134,7 +178,8 @@ impl HttpFetcher {
 
     /// §8 politeness: never faster than the effective floor to one host. The
     /// slot is reserved *before* sleeping, so concurrent fetches serialize.
-    async fn politeness_wait(&self, url: &NormalizedUrl) {
+    async fn politeness_wait(&self, url: &NormalizedUrl, policy_rate_limit: Duration) {
+        let rate_limit = self.rate_limit.max(policy_rate_limit);
         let wait = {
             let mut last = self
                 .last_hit
@@ -142,7 +187,7 @@ impl HttpFetcher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = Instant::now();
             let wait = last.get(url.host_str()).map_or(Duration::ZERO, |t| {
-                self.rate_limit.saturating_sub(now.duration_since(*t))
+                rate_limit.saturating_sub(now.duration_since(*t))
             });
             last.insert(url.host_str().to_string(), now);
             wait
@@ -158,6 +203,7 @@ impl HttpFetcher {
     async fn robots_decision(
         &self,
         url: &NormalizedUrl,
+        policy: &FetchPolicy,
     ) -> Result<Arc<RobotsDecision>, FetchError> {
         let key = match url.as_url().port() {
             Some(port) => format!("{}://{}:{port}", url.as_url().scheme(), url.host_str()),
@@ -173,7 +219,7 @@ impl HttpFetcher {
         }
         let robots_url = format!("{key}/robots.txt");
         let decision = match NormalizedUrl::parse(&robots_url) {
-            Ok(robots_url) => match self.request_once(&robots_url, None).await {
+            Ok(robots_url) => match self.request_once(&robots_url, None, policy).await {
                 Ok(response) => match response.status() {
                     StatusCode::NOT_FOUND | StatusCode::GONE => {
                         Arc::new(RobotsDecision::allow_all())
@@ -209,11 +255,12 @@ impl HttpFetcher {
         &self,
         url: &NormalizedUrl,
         validators: Option<&FetchValidators>,
+        policy: &FetchPolicy,
     ) -> Result<(reqwest::Response, NormalizedUrl), FetchError> {
         let mut current = url.clone();
         let mut first_hop = validators;
         for _ in 0..=self.max_redirects {
-            let response = self.request_once(&current, first_hop).await?;
+            let response = self.request_once(&current, first_hop, policy).await?;
             if !response.status().is_redirection() {
                 return Ok((response, current));
             }
@@ -315,10 +362,7 @@ impl HttpFetcher {
 #[async_trait]
 impl Fetcher for HttpFetcher {
     fn capabilities(&self) -> FetchCapabilities {
-        FetchCapabilities {
-            js_rendering: false,
-            stealth: false,
-        }
+        self.capabilities
     }
 
     async fn fetch_with_policy(
@@ -337,7 +381,7 @@ impl Fetcher for HttpFetcher {
         validators: &FetchValidators,
     ) -> Result<FetchedDoc, FetchError> {
         if policy.robots {
-            let decision = self.robots_decision(url).await?;
+            let decision = self.robots_decision(url, policy).await?;
             let mut path_and_query = url.as_url().path().to_string();
             if let Some(query) = url.as_url().query() {
                 path_and_query.push('?');
@@ -347,9 +391,57 @@ impl Fetcher for HttpFetcher {
                 return Err(FetchError::Protocol(format!("robots.txt disallows {url}")));
             }
         }
-        let (response, final_url) = self.follow(url, Some(validators)).await?;
+        let (response, final_url) = self.follow(url, Some(validators), policy).await?;
         self.finish(response, &final_url).await
     }
+}
+
+fn browser_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    headers.insert(
+        reqwest::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        reqwest::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        reqwest::header::UPGRADE_INSECURE_REQUESTS,
+        HeaderValue::from_static("1"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("document"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("navigate"),
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("none"),
+    );
+    headers
+}
+
+fn plain_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,*/*;q=0.8"),
+    );
+    headers
 }
 
 /// §12: only globally-routable addresses are fetchable. `is_global` covers
@@ -545,6 +637,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn browser_profile_adds_navigation_headers() {
+        let headers = browser_headers();
+        assert_eq!(
+            headers.get(reqwest::header::ACCEPT_LANGUAGE),
+            Some(&HeaderValue::from_static("en-US,en;q=0.9"))
+        );
+        assert_eq!(
+            headers.get("sec-fetch-mode"),
+            Some(&HeaderValue::from_static("navigate"))
+        );
+        assert_eq!(
+            headers.get(reqwest::header::UPGRADE_INSECURE_REQUESTS),
+            Some(&HeaderValue::from_static("1"))
+        );
+    }
+
     #[tokio::test]
     async fn fetch_returns_a_labeled_document() {
         let (addr, server) = serve_script(&[
@@ -671,6 +780,33 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(240),
             "second request must wait for the §8 politeness floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_fetch_rate_limit_is_at_least_the_global_floor() {
+        let (addr, _server) = serve_script(&[
+            page("HTTP/1.1 200 OK", "", "one"),
+            page("HTTP/1.1 200 OK", "", "two"),
+        ]);
+        let fetcher = fetcher(true, Duration::ZERO);
+        let policy = FetchPolicy {
+            start_leg: crate::engine::FetchLeg::Plain,
+            rate_limit: Duration::from_millis(250),
+            robots: false,
+        };
+        let started = Instant::now();
+        fetcher
+            .fetch_with_policy(&url_on(addr, "/one"), &policy)
+            .await
+            .unwrap();
+        fetcher
+            .fetch_with_policy(&url_on(addr, "/two"), &policy)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(240),
+            "site policy must raise the effective per-host floor"
         );
     }
 

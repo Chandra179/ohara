@@ -105,6 +105,10 @@ pub(crate) mod defaults {
         env!("CARGO_PKG_VERSION"),
         " (https://github.com/Chandra179/ohara)"
     );
+    /// Pinned browser-profile User-Agent for the impersonation leg. Operators
+    /// can replace it when a target requires a different browser family.
+    pub const IMPERSONATION_USER_AGENT: &str =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
 }
 
 /// Boot failures from [`Config::load`] — fail fast at boot, never mid-stage (§10).
@@ -195,6 +199,8 @@ pub struct FetcherConfig {
     timeout: Duration,
     /// Honest User-Agent header (§8).
     user_agent: String,
+    /// Browser-profile User-Agent used by the impersonation ladder leg.
+    impersonation_user_agent: String,
     /// §12 override for tests and intranets; defaults to refused.
     allow_private_hosts: bool,
     /// Maximum accepted response body in bytes.
@@ -277,6 +283,7 @@ struct RawFetcher {
     robots: Option<bool>,
     timeout_secs: Option<u64>,
     user_agent: Option<String>,
+    impersonation_user_agent: Option<String>,
     allow_private_hosts: Option<bool>,
     max_body_bytes: Option<usize>,
     max_redirects: Option<usize>,
@@ -293,6 +300,9 @@ fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
         user_agent: raw
             .and_then(|f| f.user_agent.clone())
             .unwrap_or_else(|| defaults::USER_AGENT.to_string()),
+        impersonation_user_agent: raw
+            .and_then(|f| f.impersonation_user_agent.clone())
+            .unwrap_or_else(|| defaults::IMPERSONATION_USER_AGENT.to_string()),
         allow_private_hosts: raw
             .and_then(|f| f.allow_private_hosts)
             .unwrap_or(defaults::FETCH_ALLOW_PRIVATE_HOSTS),
@@ -817,6 +827,10 @@ impl FetcherConfig {
         check(
             !self.user_agent.is_empty(),
             "fetcher.user_agent must be non-empty (§8: honest User-Agent)",
+        )?;
+        check(
+            !self.impersonation_user_agent.is_empty(),
+            "fetcher.impersonation_user_agent must be non-empty",
         )
     }
 
@@ -836,6 +850,12 @@ impl FetcherConfig {
     #[must_use]
     pub fn user_agent(&self) -> &str {
         &self.user_agent
+    }
+
+    /// Browser-profile User-Agent used by the impersonation ladder leg.
+    #[must_use]
+    pub fn impersonation_user_agent(&self) -> &str {
+        &self.impersonation_user_agent
     }
 
     /// Whether private/loopback targets are fetchable (§12 override; default no).
@@ -1150,6 +1170,12 @@ mod tests {
         assert_eq!(config.fetcher().timeout(), Duration::from_secs(30));
         assert!(config.fetcher().user_agent().starts_with("ohara/"));
         assert!(
+            config
+                .fetcher()
+                .impersonation_user_agent()
+                .starts_with("Mozilla/5.0")
+        );
+        assert!(
             !config.fetcher().allow_private_hosts(),
             "§12: SSRF guard on"
         );
@@ -1164,11 +1190,12 @@ mod tests {
     #[test]
     fn fetcher_overrides_apply() {
         let config = Config::load_from_str(
-            "[fetcher]\nrobots = false\ntimeout_secs = 5\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\nmax_recrawl_seconds = 7200\n",
+            "[fetcher]\nrobots = false\ntimeout_secs = 5\nimpersonation_user_agent = \"browser-test\"\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\nmax_recrawl_seconds = 7200\n",
         )
         .expect("valid config");
         assert!(!config.fetcher().robots());
         assert_eq!(config.fetcher().timeout(), Duration::from_secs(5));
+        assert_eq!(config.fetcher().impersonation_user_agent(), "browser-test");
         assert!(config.fetcher().allow_private_hosts());
         assert_eq!(config.fetcher().max_body_bytes(), 2048);
         assert_eq!(config.fetcher().max_redirects(), 2);
