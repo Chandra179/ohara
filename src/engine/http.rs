@@ -585,6 +585,7 @@ mod tests {
             .fetch_with_policy(
                 &url_on(addr, "/anything"),
                 &FetchPolicy {
+                    start_leg: crate::engine::FetchLeg::Plain,
                     rate_limit: Duration::ZERO,
                     robots: false,
                 },
@@ -695,6 +696,7 @@ mod tests {
             .fetch_with_policy(
                 &url_on(addr, "/slow"),
                 &FetchPolicy {
+                    start_leg: crate::engine::FetchLeg::Plain,
                     rate_limit: Duration::ZERO,
                     robots: false,
                 },

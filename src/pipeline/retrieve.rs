@@ -4,7 +4,8 @@
 //! [`Reranker`] (§1.3), plus the baseline implementations.
 //!
 //! §8 Stage 5 items that remain for later steps: symspell domain-dictionary
-//! correction, optional `HyDE`, and synthesis via the `Llm` port (§15 step 8).
+//! correction and optional `HyDE`. Citation-preserving synthesis is owned by
+//! [`super::synthesis`] after this module assembles the retrieval context.
 //!
 //! The graph path (§8 Stage 5.2–5.3) runs whenever the knowledge store declares
 //! `graph_traversal` — query entities come from typed aliases plus
@@ -17,7 +18,7 @@ use async_trait::async_trait;
 use crate::Class;
 use crate::config::RetrievalConfig;
 use crate::control::{self, ControlDb, DbError};
-use crate::knowledge::{KnowledgeError, KnowledgeStore, ModelId, ScoredHit, VectorSpace};
+use crate::knowledge::{Fact, KnowledgeError, KnowledgeStore, ModelId, ScoredHit, VectorSpace};
 use crate::pipeline::Embedder;
 use crate::text::normalize_surface_form;
 
@@ -42,6 +43,16 @@ pub struct ScoredChunk {
     pub text: String,
     /// Current relevance score (fused rank or reranker score).
     pub score: f32,
+}
+
+/// Retrieved material passed to Stage 5.6 synthesis: ranked chunks plus the
+/// bounded graph facts connected to query entities.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetrievedContext {
+    /// Ranked chunk sources, including immutable `chunk_id` citations.
+    pub chunks: Vec<ScoredChunk>,
+    /// Labeled graph facts near the query entities.
+    pub facts: Vec<Fact>,
 }
 
 /// The query-normalization port (§9): pure; `normalize(q) -> (lang, q')`.
@@ -389,6 +400,22 @@ impl<'a> Retriever<'a> {
         query: &str,
         top_k: usize,
     ) -> Result<Vec<ScoredChunk>, RetrieveError> {
+        Ok(self.query_context(query, top_k).await?.chunks)
+    }
+
+    /// Retrieves ranked chunks and graph facts for Stage 5.6 synthesis.
+    ///
+    /// The graph entity resolution is performed once and reused for both the
+    /// graph candidate path and fact context. Facts are sorted by their stable
+    /// identity so provider prompts do not depend on backend iteration order.
+    ///
+    /// # Errors
+    /// [`RetrieveError`] when a required retrieval path or graph read fails.
+    pub async fn query_context(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<RetrievedContext, RetrieveError> {
         let (_lang, normalized) = self.normalizer.normalize(query);
 
         // Path 1 — BM25 via the trigger-synced chunks_fts (§8: embeddings are
@@ -402,9 +429,15 @@ impl<'a> Retriever<'a> {
         // Path 3 — graph (§8 Stage 5.3): chunks that mention the query's
         // entities. Capability-gated: a store without graph traversal keeps
         // the two-path baseline rather than failing the query.
+        let graph_enabled = self.knowledge.capabilities().graph_traversal;
+        let entities = if graph_enabled {
+            self.query_entities(&normalized).await?
+        } else {
+            Vec::new()
+        };
         let mut paths = vec![bm25, vector];
-        if self.knowledge.capabilities().graph_traversal {
-            paths.push(self.graph_path(&normalized).await?);
+        if graph_enabled {
+            paths.push(self.graph_path(&entities).await?);
         }
 
         // Fusion (§8 Stage 5.4): configured RRF → configured candidate pool.
@@ -419,7 +452,22 @@ impl<'a> Retriever<'a> {
             Ok(reranked) => reranked,
             Err(_degraded) => pool,
         };
-        Ok(ranked.into_iter().take(top_k).collect())
+        let chunks = ranked.into_iter().take(top_k).collect();
+        let mut facts = if graph_enabled && !entities.is_empty() {
+            let ids: Vec<&str> = entities.iter().map(|e| e.entity_id.as_str()).collect();
+            self.knowledge
+                .facts_within_hops(&ids, self.retrieval.fact_hops())
+                .await?
+        } else {
+            Vec::new()
+        };
+        facts.sort_by(|a, b| {
+            a.subject_id
+                .cmp(&b.subject_id)
+                .then_with(|| a.predicate.as_str().cmp(b.predicate.as_str()))
+                .then_with(|| a.object_id.cmp(&b.object_id))
+        });
+        Ok(RetrievedContext { chunks, facts })
     }
 
     /// Query entities (§8 Stage 5.2): each normalized query term is looked up
@@ -512,8 +560,10 @@ impl<'a> Retriever<'a> {
     ///
     /// # Errors
     /// [`RetrieveError`] on store or embedding failure.
-    async fn graph_path(&self, normalized: &str) -> Result<Vec<(String, String)>, RetrieveError> {
-        let entities = self.query_entities(normalized).await?;
+    async fn graph_path(
+        &self,
+        entities: &[QueryEntity],
+    ) -> Result<Vec<(String, String)>, RetrieveError> {
         if entities.is_empty() {
             return Ok(Vec::new());
         }

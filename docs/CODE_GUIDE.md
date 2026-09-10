@@ -11,7 +11,7 @@
 | API shape & naming | [API Guidelines](https://rust-lang.github.io/api-guidelines/checklist.html) | code review, this guide's checklist |
 | Module tree, visibility | Rust Book ch07, ARCHITECTURE Appendix A | compiler + review |
 | Errors, panics | Rust Book ch09, ARCHITECTURE §10 | compiler + contract tests |
-| Design decisions | ARCHITECTURE.md (v2.7) | — |
+| Design decisions | ARCHITECTURE.md (v2.10) | — |
 
 ---
 

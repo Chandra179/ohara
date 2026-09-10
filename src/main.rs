@@ -21,7 +21,7 @@ USAGE:
 OPTIONS:
     --config <path>    TOML config; unset knobs fall back to defaults
     --top-k <n>        Number of ranked chunks to print for query (config default)
-    query <text>       Retrieve ranked chunks with chunk-id citations
+    query <text>       Synthesize a cited answer; fall back to ranked chunks
     backup <directory> Write a consistent, non-overwriting snapshot
     requeue --doc <id> Reset failed or interrupted jobs for a document
     archive <id>       Retain a document's chunks but stop future work
@@ -545,12 +545,18 @@ async fn query_and_print(
 ) -> Result<(), CliError> {
     let config = ohara::config::Config::load(config_path.as_deref())?;
     let top_k = top_k.unwrap_or(config.retrieval().top_k());
-    let results = ohara::pipeline::query(config, query, top_k).await?;
-    if results.is_empty() {
+    let response = ohara::pipeline::answer(config, query, top_k).await?;
+    if let Some(answer) = response.answer {
+        println!("answer: {answer}");
+        println!("citations: {}", response.citations.join(", "));
+        return Ok(());
+    }
+    if response.chunks.is_empty() {
         println!("no results");
         return Ok(());
     }
-    for (rank, result) in results.iter().enumerate() {
+    eprintln!("synthesis unavailable; showing ranked chunks");
+    for (rank, result) in response.chunks.iter().enumerate() {
         println!(
             "{}. score={:.4} citation={}",
             rank + 1,

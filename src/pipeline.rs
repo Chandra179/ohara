@@ -13,6 +13,7 @@ mod recovery;
 mod retrieve;
 mod runtime;
 mod scrape;
+mod synthesis;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -31,12 +32,13 @@ pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, Readabi
 #[cfg(feature = "onnx-embedder")]
 pub use embed::LocalEmbedder;
 pub use embed::{EmbedError, Embedder};
-pub use query::{QueryError, query};
+pub use query::{QueryError, QueryResponse, answer, query};
 #[cfg(feature = "onnx-embedder")]
 pub use retrieve::LocalReranker;
 pub use retrieve::{
     IdentityReranker, Lang, QueryEntity, QueryEntitySource, QueryNormalizer, RerankError, Reranker,
-    RetrieveError, Retriever, ScoredChunk, WhatlangNormalizer, fts_match_expression,
+    RetrieveError, RetrievedContext, Retriever, ScoredChunk, WhatlangNormalizer,
+    fts_match_expression,
 };
 
 /// What a stage body reports on success (§10: domain outcomes are values, not

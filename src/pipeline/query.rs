@@ -1,12 +1,18 @@
 //! Operator query orchestration. Keeping this startup path separate from the
 //! worker loop makes its provider lifecycle and error taxonomy local.
 
+use std::sync::Arc;
+
 use crate::config::Config;
-use crate::control;
+use crate::control::{self, ControlDb};
 use crate::knowledge::ModelId;
 
-use super::runtime::query_ports;
+use super::retrieve::RetrievedContext;
+use super::runtime::{QueryPorts, query_ports};
+use super::synthesis;
 use super::{IdentityReranker, Retriever, ScoredChunk, WhatlangNormalizer};
+
+pub use super::synthesis::QueryResponse;
 
 /// Operator query failures. Provider construction failures are reported as boot
 /// errors so the CLI and the worker share the same startup diagnostics.
@@ -35,6 +41,9 @@ pub enum QueryError {
     /// The retrieval paths failed after startup.
     #[error("query retrieval: {0}")]
     Retrieve(#[from] super::RetrieveError),
+    /// The control plane could not hydrate synthesis metadata.
+    #[error("query control store: {0}")]
+    Control(#[from] crate::control::DbError),
 }
 
 /// Runs the operator retrieval path with the configured local providers.
@@ -49,20 +58,53 @@ pub async fn query(
     query_text: &str,
     top_k: usize,
 ) -> Result<Vec<ScoredChunk>, QueryError> {
-    if query_text.trim().is_empty() {
-        return Err(QueryError::Empty);
-    }
-    if top_k == 0 {
-        return Err(QueryError::InvalidTopK);
-    }
+    Ok(retrieve_context(config, query_text, top_k)
+        .await?
+        .context
+        .chunks)
+}
 
-    let config = std::sync::Arc::new(config);
-    if top_k > config.retrieval().pool() {
-        return Err(QueryError::TopKExceedsPool {
-            requested: top_k,
-            pool: config.retrieval().pool(),
-        });
-    }
+/// Runs retrieval and then attempts bounded, citation-preserving LLM synthesis.
+///
+/// Synthesis failures are deliberately values at this interactive boundary:
+/// the ranked chunks are returned when the endpoint is unavailable, rate
+/// limited, or returns malformed/ungrounded JSON. Retrieval failures still
+/// propagate because they indicate a broken required path.
+///
+/// # Errors
+/// [`QueryError`] for invalid input, provider startup, retrieval, or control
+/// metadata failures needed to render the synthesis context.
+pub async fn answer(
+    config: Config,
+    query_text: &str,
+    top_k: usize,
+) -> Result<QueryResponse, QueryError> {
+    let session = retrieve_context(config, query_text, top_k).await?;
+    synthesis::run(
+        &session.config,
+        &session.conn,
+        session.ports.llm.as_ref(),
+        query_text,
+        session.context,
+    )
+    .await
+    .map_err(QueryError::Control)
+}
+
+struct QuerySession {
+    config: Arc<Config>,
+    conn: ControlDb,
+    ports: QueryPorts,
+    context: RetrievedContext,
+}
+
+async fn retrieve_context(
+    config: Config,
+    query_text: &str,
+    top_k: usize,
+) -> Result<QuerySession, QueryError> {
+    validate_query(&config, query_text, top_k)?;
+    let config = Arc::new(config);
     std::fs::create_dir_all(config.data_dir())?;
     if let Some(parent) = config.db_path().parent() {
         std::fs::create_dir_all(parent)?;
@@ -81,9 +123,30 @@ pub async fn query(
         ModelId::new(config.knowledge().read_model()),
         config.retrieval().clone(),
     );
-
-    retriever
-        .query(query_text, top_k)
+    let context = retriever
+        .query_context(query_text, top_k)
         .await
-        .map_err(QueryError::Retrieve)
+        .map_err(QueryError::Retrieve)?;
+    Ok(QuerySession {
+        config,
+        conn,
+        ports,
+        context,
+    })
+}
+
+fn validate_query(config: &Config, query_text: &str, top_k: usize) -> Result<(), QueryError> {
+    if query_text.trim().is_empty() {
+        return Err(QueryError::Empty);
+    }
+    if top_k == 0 {
+        return Err(QueryError::InvalidTopK);
+    }
+    if top_k > config.retrieval().pool() {
+        return Err(QueryError::TopKExceedsPool {
+            requested: top_k,
+            pool: config.retrieval().pool(),
+        });
+    }
+    Ok(())
 }

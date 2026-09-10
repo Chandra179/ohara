@@ -40,6 +40,8 @@ pub(crate) mod defaults {
     pub const LLM_BASE_URL: &str = "http://localhost:11434";
     /// Pinned extraction model (§11.2).
     pub const LLM_EXTRACTION_MODEL: &str = "phi4-mini:latest";
+    /// Default model used for bounded retrieval synthesis (§8 Stage 5.6).
+    pub const LLM_SYNTHESIS_MODEL: &str = "phi4-mini:latest";
     /// Cloud LLM egress is opt-in (§12).
     pub const LLM_CLOUD_ENABLED: bool = false;
     /// §8 Stage 4.2: normalized-name similarity floor for same-supertype
@@ -91,6 +93,10 @@ pub(crate) mod defaults {
     pub const RETRIEVAL_RRF_K: f32 = 60.0;
     /// Minimum confidence for language classification on queries.
     pub const QUERY_DETECTION_CONFIDENCE_FLOOR: f64 = 0.5;
+    /// Maximum rendered retrieval context in Unicode scalar values (§8 Stage 5.6).
+    pub const RETRIEVAL_SYNTHESIS_CONTEXT_CHARS: usize = 12_000;
+    /// Maximum completion tokens requested for retrieval synthesis.
+    pub const RETRIEVAL_SYNTHESIS_MAX_TOKENS: u32 = 512;
     /// Ollama liveness probe timeout (§2 boot gate).
     pub const LLM_HEALTH_TIMEOUT_SECS: u64 = 10;
     /// Honest User-Agent (§8): identifies the crawler and its owner.
@@ -204,6 +210,7 @@ pub struct FetcherConfig {
 pub struct LlmConfig {
     base_url: url::Url,
     extraction_model: String,
+    synthesis_model: String,
     fallback_model: Option<String>,
     cloud_llm_enabled: bool,
     health_timeout: Duration,
@@ -231,6 +238,8 @@ pub struct RetrievalConfig {
     top_k: usize,
     rrf_k: f32,
     detection_confidence_floor: f64,
+    synthesis_context_chars: usize,
+    synthesis_max_tokens: u32,
 }
 
 /// Raw TOML mirror — `deny_unknown_fields` so a typo'd knob fails at boot, not never.
@@ -342,6 +351,7 @@ struct RawKnowledge {
 struct RawLlm {
     base_url: Option<String>,
     extraction_model: Option<String>,
+    synthesis_model: Option<String>,
     fallback_model: Option<String>,
     cloud_llm_enabled: Option<bool>,
     health_timeout_secs: Option<u64>,
@@ -366,6 +376,8 @@ struct RawRetrieval {
     top_k: Option<usize>,
     rrf_k: Option<f32>,
     detection_confidence_floor: Option<f64>,
+    synthesis_context_chars: Option<usize>,
+    synthesis_max_tokens: Option<u32>,
 }
 
 fn build_er(raw: Option<&RawEr>) -> ErConfig {
@@ -400,6 +412,12 @@ fn build_retrieval(raw: Option<&RawRetrieval>) -> RetrievalConfig {
         detection_confidence_floor: raw
             .detection_confidence_floor
             .unwrap_or(defaults::QUERY_DETECTION_CONFIDENCE_FLOOR),
+        synthesis_context_chars: raw
+            .synthesis_context_chars
+            .unwrap_or(defaults::RETRIEVAL_SYNTHESIS_CONTEXT_CHARS),
+        synthesis_max_tokens: raw
+            .synthesis_max_tokens
+            .unwrap_or(defaults::RETRIEVAL_SYNTHESIS_MAX_TOKENS),
     }
 }
 
@@ -466,6 +484,10 @@ fn build_llm(raw: Option<&RawLlm>) -> Result<LlmConfig, ConfigError> {
             .extraction_model
             .clone()
             .unwrap_or_else(|| defaults::LLM_EXTRACTION_MODEL.to_string()),
+        synthesis_model: raw
+            .synthesis_model
+            .clone()
+            .unwrap_or_else(|| defaults::LLM_SYNTHESIS_MODEL.to_string()),
         fallback_model: raw.fallback_model.clone(),
         cloud_llm_enabled: raw.cloud_llm_enabled.unwrap_or(defaults::LLM_CLOUD_ENABLED),
         health_timeout: Duration::from_secs(
@@ -895,6 +917,10 @@ impl LlmConfig {
             "llm.extraction_model must be non-empty",
         )?;
         check(
+            !self.synthesis_model.is_empty(),
+            "llm.synthesis_model must be non-empty",
+        )?;
+        check(
             !self.health_timeout.is_zero(),
             "llm.health_timeout_secs must be > 0",
         )?;
@@ -917,6 +943,12 @@ impl LlmConfig {
     #[must_use]
     pub fn extraction_model(&self) -> &str {
         &self.extraction_model
+    }
+
+    /// Pinned retrieval-synthesis model (§8 Stage 5.6).
+    #[must_use]
+    pub fn synthesis_model(&self) -> &str {
+        &self.synthesis_model
     }
 
     /// Optional quality-fallback model (§11.2: `llama3.1:8b-instruct-q4_K_M`).
@@ -1007,6 +1039,14 @@ impl RetrievalConfig {
                 && self.detection_confidence_floor >= 0.0
                 && self.detection_confidence_floor <= 1.0,
             "retrieval.detection_confidence_floor must be in [0, 1]",
+        )?;
+        check(
+            self.synthesis_context_chars > 0,
+            "retrieval.synthesis_context_chars must be > 0 (§8 Stage 5.6)",
+        )?;
+        check(
+            self.synthesis_max_tokens > 0,
+            "retrieval.synthesis_max_tokens must be > 0 (§8 Stage 5.6)",
         )
     }
 
@@ -1052,6 +1092,18 @@ impl RetrievalConfig {
     pub fn detection_confidence_floor(&self) -> f64 {
         self.detection_confidence_floor
     }
+
+    /// Maximum rendered chunk/fact context for retrieval synthesis.
+    #[must_use]
+    pub fn synthesis_context_chars(&self) -> usize {
+        self.synthesis_context_chars
+    }
+
+    /// Maximum completion tokens requested for retrieval synthesis.
+    #[must_use]
+    pub fn synthesis_max_tokens(&self) -> u32 {
+        self.synthesis_max_tokens
+    }
 }
 
 #[cfg(test)]
@@ -1075,6 +1127,7 @@ mod tests {
         assert_eq!(config.embedder().dim(), 384);
         assert_eq!(config.knowledge().read_model(), "bge-small-en-v1.5");
         assert_eq!(config.llm().extraction_model(), "phi4-mini:latest");
+        assert_eq!(config.llm().synthesis_model(), "phi4-mini:latest");
         assert!(!config.llm().cloud_llm_enabled());
         assert_eq!(config.target_languages(), ["en"]);
         assert!(
@@ -1222,9 +1275,11 @@ mod tests {
         assert_eq!(config.retrieval().pool(), 50);
         assert_eq!(config.retrieval().rrf_k(), 60.0);
         assert_eq!(config.retrieval().detection_confidence_floor(), 0.5);
+        assert_eq!(config.retrieval().synthesis_context_chars(), 12_000);
+        assert_eq!(config.retrieval().synthesis_max_tokens(), 512);
 
         let config = Config::load_from_str(
-            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\npool = 20\ntop_k = 6\nrrf_k = 42.0\ndetection_confidence_floor = 0.7\n",
+            "[retrieval]\nentity_embedding_threshold = 0.8\nmax_query_entities = 4\nfact_hops = 1\npool = 20\ntop_k = 6\nrrf_k = 42.0\ndetection_confidence_floor = 0.7\nsynthesis_context_chars = 8000\nsynthesis_max_tokens = 256\n[llm]\nsynthesis_model = \"llama3.2:latest\"\n",
         )
         .expect("valid");
         assert_eq!(config.retrieval().entity_embedding_threshold(), 0.8);
@@ -1234,6 +1289,9 @@ mod tests {
         assert_eq!(config.retrieval().pool(), 20);
         assert_eq!(config.retrieval().rrf_k(), 42.0);
         assert_eq!(config.retrieval().detection_confidence_floor(), 0.7);
+        assert_eq!(config.retrieval().synthesis_context_chars(), 8_000);
+        assert_eq!(config.retrieval().synthesis_max_tokens(), 256);
+        assert_eq!(config.llm().synthesis_model(), "llama3.2:latest");
     }
 
     #[test]
@@ -1253,5 +1311,13 @@ mod tests {
         let err =
             Config::load_from_str("[retrieval]\nmax_query_entities = 0").expect_err("must fail");
         assert!(matches!(err, ConfigError::Validation(m) if m.contains("max_query_entities")));
+
+        let err = Config::load_from_str("[retrieval]\nsynthesis_context_chars = 0")
+            .expect_err("must fail");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("synthesis_context_chars")));
+
+        let err =
+            Config::load_from_str("[retrieval]\nsynthesis_max_tokens = 0").expect_err("must fail");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("synthesis_max_tokens")));
     }
 }

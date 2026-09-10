@@ -1,6 +1,6 @@
-# ohara — System Architecture (v2.8)
+# ohara — System Architecture (v2.10)
 
-> **Status:** design of record and implementation status. v2.8 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, conditional re-crawling, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, offline ER merge, raw retention pruning, and a read-only control/raw metrics snapshot are implemented, while the remaining fetch legs, synthesis, durable LLM cost accounting, and dashboards are explicitly planned. v2.7 added the architecture seam cleanup; v2.6 added maintainability and backend-integrity hardening; v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.10 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, citation-preserving bounded synthesis, conditional re-crawling, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, offline ER merge, raw retention pruning, a read-only control/raw metrics snapshot, and engine-owned fetch-ladder composition are implemented. The default runtime still wires only HTTP leg 1; impersonation and Obscura providers, durable LLM cost accounting, quality fallback, cloud provider, and dashboards remain explicitly planned. v2.9 added citation-preserving retrieval synthesis; v2.8 added the operator metrics snapshot; v2.7 added the architecture seam cleanup; v2.6 added maintainability and backend-integrity hardening; v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -33,7 +33,8 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
                  ┌──────────── pipeline.rs (scheduler) ─────────────┐
                  │ pipeline/{execution,runtime,recovery,            │
                  │            scrape,clean,chunk,embed,extract,     │
-                 │            extraction_contract,retrieve}         │
+                 │            extraction_contract,retrieve,         │
+                 │            synthesis}                            │
                  ▼                  ▼                ▼                ▼
           control.rs          engine.rs        knowledge.rs        llm.rs
           (SQLite)      ports▶(Fetcher)  ports▶(KnowledgeStore) ports▶(Llm)
@@ -58,7 +59,7 @@ ohara is an embedded, zero-daemon, in-process pipeline: web scraping → clean-t
 | Knowledge store | LadybugDB (successor to Kùzu; embedded, columnar, openCypher) via the `lbug` crate (pinned 0.20.2) | **Young continuation of a wound-down project.** Behind `KnowledgeStore` port. **§2 build gates verified empirically against lbug 0.20.2 (2026-09-06):** (a) *transaction model* — MVCC snapshot reads run concurrently with the single write transaction; a second concurrent writer is refused (maps to `KnowledgeError::Unavailable`, Retry) — the single-worker default already serializes writers, so the actor-task contingency is not needed; (b) *edge-rewire/fold (§7.8)* — `CREATE`+`DELETE`+node deletion in one `BEGIN`/`COMMIT` verified. The bundled engine ships **no HNSW** (`query_hnsw_index` is absent); Phase 4 ships exact KNN via the in-engine `array_cosine_similarity` scalar — the HNSW index is a drop-in swap behind the same port (§11). Note: `lbug` links OpenSSL at link time (`libssl-dev` is a build prerequisite) |
 | Embedder | BAAI `bge-small-en-v1.5` via ONNX (`fastembed` 6.0.2 + `ort`, fp32; tokenizer via `tokenizers`/`hf-hub` — rustls-only features, never native-tls) | **Pinned by name + version** (variant incl. quantization); recorded per chunk; see §4, §11.1. Model + tokenizer files fetched once from the HF hub into `data/models/` (fail-fast at boot), offline afterwards. Behind the `Embedder` port; the port exposes tokenizer counting and input capacity so chunk budgets are measured and bounded in the model's own tokenizer (§4) |
 | Reranker | `bge-reranker-base` ONNX **int8** (Xenova export, ~280 MB) plus the identity baseline | Behind `Reranker`; the local model is feature-gated and cached under `data/models`; identity is the deterministic fallback |
-| LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned extraction model `phi4-mini:latest` (§11.2) | Behind `Llm`; graph extraction, usage counters, and boot health checks are implemented. Synthesis and cloud providers remain planned; §12 governs egress |
+| LLM | **Ollama (local, default)** — OpenAI-compatible endpoint, user-run; pinned extraction/synthesis model `phi4-mini:latest` (§11.2) | Behind `Llm`; graph extraction, bounded citation-preserving synthesis, usage counters, and boot health checks are implemented. Quality fallback and cloud providers remain planned; §12 governs egress |
 
 **Rule:** any dependency whose API is not its own standard (Obscura, LadybugDB, embedder runtime) must be reachable only through its port facade. No other module may name the vendor's types.
 
@@ -96,7 +97,7 @@ The same logical row in both stores is always the same row, because every cross-
 
 ---
 
-## 5. Control-plane schema (SQLite, v2.7)
+## 5. Control-plane schema (SQLite, v2.10)
 
 **Connection pragmas** — set on *every* connection in `control/db.rs`: `foreign_keys = ON` (SQLite defaults it **off**; without it the CASCADEs below are inert), `journal_mode = WAL`, `synchronous = NORMAL`, `busy_timeout = 5000`.
 
@@ -355,7 +356,7 @@ SQLite and LadybugDB have **no shared transaction**. The protocol makes every cr
 
 ### Stage 1 — Scrape
 
-- **Target fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → impersonated client → Obscura (JS + stealth). The current implementation ships only plain HTTP; escalation triggers and `sites.fetch_hint` are reserved for the remaining ladder legs.
+- **Target fetcher ladder** (selection per request, escalating on signals): plain HTTP (fast, cheap) → impersonated client → Obscura (JS + stealth). `FetchLadder` now owns neutral leg selection and escalation on anti-bot/JavaScript-required outcomes; the default runtime ships only the plain HTTP provider, while impersonation and Obscura remain provider implementations to add.
 - **URL normalization** (load-bearing for `source_url_normalized` dedup — specified, not folklore): lowercase scheme/host, punycode IDN, drop default ports and fragments, sort query parameters, strip configurable tracking params (`utm_*`, `fbclid`, `gclid`, …), absolutize relative URLs against `final_url`. Implemented once in the `NormalizedUrl` newtype with fixture tests.
 - `FetchedDoc { html, js_executed, final_url, status, content_type, etag, last_modified, fetched_at }` — the contract is "return what you fetched, labeled" (§9), and the pipeline escalates when the label says rendering didn't happen. The validators ride along for §7.5 conditional re-crawl.
 - **Per-fetch policy:** the port takes `fetch_with_policy(url, &FetchPolicy)` and may take `FetchValidators` for conditional requests — the stage reads the control plane (`sites.rate_limit_ms`, the robots toggle, and validators) and the fetcher enforces (§8 politeness floor is `max(impl default, policy)`); plain `fetch(url)` applies the default. Robots rules use a per-host cache; an unreadable robots.txt is cached as disallow-all (conservative RFC 9309).
@@ -397,7 +398,7 @@ The stage body in `pipeline/extract.rs` owns orchestration and side effects. Its
 
 ### Stage 5 — Retrieval (GraphRAG)
 
-*The three-path baseline is implemented (§15 steps 5–6): language detection, query entities from typed aliases and `EntityNames` KNN, BM25 + vector + capability-gated graph paths, RRF, degradation-aware reranking, the golden-set harness, and the `ohara query` operator entry point. The CLI returns ranked chunks with immutable `chunk_id` citations; it deliberately does not call the extraction LLM. Symspell, HyDE, and LLM synthesis are not implemented yet. The current reproducible machinery baseline reports recall@20 = 1.000 for each path, fused MRR = 0.723, and rerank delta = 0.000. The stabilization acceptance matrix also covers entity-aware queries, multi-hop graph context, duplicate/deletion behavior, wrong-language and paywall quality gates, and failure/retry recovery.*
+*The three-path baseline and Stage 5.6 synthesis are implemented (§15 steps 5–7): language detection, query entities from typed aliases and `EntityNames` KNN, BM25 + vector + capability-gated graph paths, RRF, degradation-aware reranking, bounded graph-fact context, structured LLM output validation, immutable `chunk_id` citations, the golden-set harness, and the `ohara query` operator entry point. The CLI returns a synthesized answer when the configured LLM is available and valid; unavailable, rate-limited, malformed, or ungrounded synthesis degrades to ranked chunks. Symspell and HyDE remain planned. The current reproducible machinery baseline reports recall@20 = 1.000 for each path, fused MRR = 0.723, and rerank delta = 0.000. The stabilization acceptance matrix also covers entity-aware queries, multi-hop graph context, duplicate/deletion behavior, wrong-language and paywall quality gates, and failure/retry recovery.*
 
 1. **Query preprocessing:** whatlang language detection is implemented and confidence-gated at 0.5 — short technical queries that fall below the floor are treated as English. Symspell domain correction and optional HyDE remain planned because they need evaluation before changing query text or latency.
 2. **Query entities:** typed alias match against `entity_aliases` — a homograph alias returns **all** its type-variants and lets rerank/graph context disambiguate — plus embedding KNN over the `EntityNames` collection above a threshold.
@@ -410,10 +411,10 @@ The stage body in `pipeline/extract.rs` owns orchestration and side effects. Its
     ORDER BY bm25(chunks_fts) LIMIT 50;
    ```
 
-   vector KNN over `VectorSpace::Chunks { read_model }` (`k=50`); graph path via `chunks_for_entities` and `:MENTIONS`. `facts_within_hops` is reserved for the planned synthesis context.
+   vector KNN over `VectorSpace::Chunks { read_model }` (`k=50`); graph path via `chunks_for_entities` and `:MENTIONS`. The same resolved entities feed `facts_within_hops` for synthesis context.
 4. **Fusion:** Reciprocal Rank Fusion (k=60) across the three lists → top-50 candidates.
 5. **Rerank:** `Reranker` port over the 50-candidate pool → top-5. Reranking is **fallible and degrades, never fails the query**: on `RerankError` the fusion order is returned as-is and the failure is counted. The local ONNX reranker is available behind the feature flag; the identity reranker is the deterministic baseline and fallback.
-6. **Synthesis (planned):** `Llm` port; context = top chunks + graph facts rendered as a labeled fact list; citations = `chunk_id`s. The current library returns ranked chunks and does not synthesize an answer.
+6. **Synthesis:** `Llm` port; context = top chunks + graph facts rendered as a labeled fact list under configured character/token bounds. Ollama receives a strict JSON schema with `answer` and `citations`; the library rejects empty answers or citations outside immutable chunk/evidence ids and returns ranked chunks on any provider or validation failure.
 7. **Evaluation:** the current machinery harness measures recall@20 per path, fused MRR, and rerank delta. Expand it with entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases before changing thresholds. If an HNSW implementation is introduced later, its recall becomes an additional acceptance gate.
 
 ---
@@ -429,6 +430,7 @@ The trait keyword gives *signature* substitutability; LSP requires *behavioral* 
 | Port | Hides | Key contract (postconditions) | Swap candidates |
 | :--- | :--- | :--- | :--- |
 | `Fetcher` (`engine.rs`) | HTTP client; future ladder implementations | Fetched-or-labeled HTML; unified `FetchError` taxonomy; honest `capabilities()` | HTTP ↔ impersonation ↔ chromiumoxide ↔ Obscura |
+| `FetchLadder` (`engine/ladder.rs`) | Leg selection and escalation | Starts at the requested capability, escalates only on anti-bot/JavaScript-required outcomes, stops on permanent errors | Any ordered set of `Fetcher` legs |
 | `KnowledgeStore` (`knowledge.rs`) | LadybugDB | All vector ops are `VectorSpace`-scoped; deterministic upserts; delete→KNN postcondition across every collection; filtered KNN results satisfy the filter (impl may over-fetch) | LadybugDB ↔ Kùzu ↔ vector-lib + SQLite edges |
 | `Embedder` (`pipeline/embed.rs`) | ONNX runtime | Order-preserving batch; `model_id()`/`dim()` are instance state; provider swap ≠ model swap | fastembed ↔ raw ONNX ↔ API (equal model) |
 | `Reranker` (`pipeline/retrieve.rs`) | Local ONNX bge reranker or identity baseline | Returns all candidates sorted by relevance, descending; **fallible** | ONNX bge ↔ API ↔ identity |
@@ -561,7 +563,7 @@ The performance story is **LLM-dominated**; everything else is rounding error. I
 | Summaries | 1k calls | — | ~$0.5–1 |
 | **Triplet extraction** | **15k calls** (~700 in / 150 out tok) | Ollama `phi4-mini`: **GPU ≈ 4–7 h**; all-CPU fallback ≈ 1 day with parallelism (§11.2) | **~$5–8** |
 | Entity resolution | in-process | ms-scale | — |
-| Retrieval (per query) | 3 paths + rerank | ~50–300 ms | future synthesis only |
+| Retrieval (per query) | 3 paths + rerank + optional synthesis | ~50–300 ms before LLM generation | synthesis latency/model-dependent |
 
 - Rerank realism: the local int8 bge reranker over 50 × 400-token pairs is expected to be 100–500 ms on the reference CPU; the identity implementation remains available as a deterministic baseline and fallback.
 - Levers: extraction batch size, per-stage concurrency, local Ollama extraction (free, no data egress — wall-clock bound; parallel requests/batched prompts help), prompt versioning to avoid re-paying extraction after prompt tweaks (`triplets.model` guards this). Pin the chosen Ollama model by name + version like any other model (§1.2.7); a model change is an extraction migration, not a config flip.
@@ -580,7 +582,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 - **Device:** i5-13420H (8C/12T, AVX2 + AVX_VNNI, no AVX-512/AMX), 15 GB RAM, RTX 4050 Mobile 6 GB VRAM (proprietary 595 driver, Ubuntu prebuilt signed kernel modules — no DKMS), ~565 GB free disk, Ollama local.
 - **Accelerator split — LLM on GPU, everything else on CPU.** The GPU belongs to the LLM (Ollama) and to nothing else: ohara itself contains no GPU code — knowledge plane, embedder, and reranker stay CPU/int8, because a CUDA EP adds hundreds of MB of dependency weight to an embedded tool for wins the cost model doesn't need. The all-CPU fallback profile remains valid for driver-less machines: extraction ≈ 1 day per 15k chunks with parallelism.
-- **Pinned on this profile:** embedder `bge-small-en-v1.5` fp32 in-process (~130 MB; 15k chunks ≈ 2–4 min on 12 threads); optional bge-reranker-base **int8** (~280 MB, VNNI-accelerated); extraction LLM **`phi4-mini:latest`** via Ollama on GPU — fits 6 GB VRAM with headroom, tolerates `OLLAMA_NUM_PARALLEL = 2–4`, 15k calls ≈ **4–7 h**. Retrieval currently stops at ranked chunks and does not call the LLM; synthesis, quality fallback, and cloud LLM remain future work (§12).
+- **Pinned on this profile:** embedder `bge-small-en-v1.5` fp32 in-process (~130 MB; 15k chunks ≈ 2–4 min on 12 threads); optional bge-reranker-base **int8** (~280 MB, VNNI-accelerated); extraction and synthesis LLM **`phi4-mini:latest`** via Ollama on GPU — fits 6 GB VRAM with headroom, tolerates `OLLAMA_NUM_PARALLEL = 2–4`, 15k extraction calls ≈ **4–7 h**. Retrieval synthesis is bounded by `[retrieval].synthesis_context_chars` and `[retrieval].synthesis_max_tokens`; quality fallback and cloud LLM remain future work (§12).
 - **Knowledge-plane RAM envelope:** 10⁴ chunks ≈ 15–30 MB; 10⁵ ≈ 150–300 MB; 10⁶ ≈ 1.5–2.5 GB. On 15 GB total, the practical ceiling is ~10⁶ chunks with Ollama loaded — well past the realistic personal-corpus range.
 - **Disk:** worst case at 10⁵ docs (raw + clean + both stores + models) ≈ 20–30 GB.
 - **Driver hygiene (learned the hard way):** prefer Ubuntu's prebuilt signed module packages (`linux-modules-nvidia-*`) over DKMS on stock kernels, keep `linux-headers-$(uname -r)` installed with the HWE meta aligned, and know that the one observed failure mode was a kernel update outrunning the NVIDIA module package. The proprietary stack is pinned away and reinstalled deliberately — never left half-present.
@@ -631,10 +633,10 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 2. Control store: documents + jobs with lease claiming + stage chaining
 3. Fetch ladder leg 1 (HTTP) + `sites` table + robots/politeness + Stages 1–2 (clean, dedup, quality + language gate)
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
-5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
+5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction and `HyDE`
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor is also landed; cloud LLM opt-in remains planned
-7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations, `ohara backup` creates staged snapshots, `ohara requeue`/`archive`/`delete` implement document lifecycle, `ohara er merge` closes the offline entity-review queue, `ohara prune` enforces raw retention, and `ohara metrics` reports durable control/raw usage state
-8. Remaining feature work: LLM retrieval synthesis, durable LLM cost accounting, Obscura and the full fetch ladder, and dashboards
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` synthesizes bounded answers with citations and falls back to ranked chunks, `ohara backup` creates staged snapshots, `ohara requeue`/`archive`/`delete` implement document lifecycle, `ohara er merge` closes the offline entity-review queue, `ohara prune` enforces raw retention, and `ohara metrics` reports durable control/raw usage state
+8. Remaining feature work: impersonation and Obscura fetch providers, durable LLM usage/cost accounting, quality fallback, cloud providers, and dashboards
 
 ---
 
@@ -707,7 +709,7 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 1. **Query entities resolve aliases over phrase windows, not single terms.** Entity surface names are frequently multi-word ("wal checkpointing"), so single-term alias lookups could never hit them. The alias pass tries every contiguous phrase window of the normalized query, longest first; `seen`-set dedup keeps one row per entity no matter how many windows hit it. Embedding hits (whole-query `EntityNames` KNN above the floor) sort behind exact alias hits.
 2. **Query entities are deliberately not type-filtered.** The `EntityNames` collection spans supertypes (§9: one collection) and a query names no type — §8 Stage 5.2's homograph rule returns *all* type-variants (`lookup_alias_all_types`) and disambiguation moves downstream (rerank scores the chunks; graph context weighs the facts).
 3. **The graph path is a capability-gated third fusion list.** `query` checks `KsCapabilities::graph_traversal`: on, the `:MENTIONS` chunks of the query entities join BM25 + vector in RRF (deterministic chunk-id order — the store returns an unordered set); off, the two-path baseline answers without failing the query (§9 honest capabilities). `rrf_fuse` generalized from a 2-tuple to N lists.
-4. **`Retriever::new` now takes the `[retrieval]` config section**: `entity_embedding_threshold` (0.75), `max_query_entities` (8), `fact_hops` (1..=2, validated) — the store stays config-free; `facts_within_hops` context for synthesis (Stage 5.6, not yet built) will read `fact_hops` when it lands.
+4. **`Retriever::new` now takes the `[retrieval]` config section**: `entity_embedding_threshold` (0.75), `max_query_entities` (8), `fact_hops` (1..=2, validated), synthesis context character bound, and synthesis completion-token bound — the store stays config-free; `facts_within_hops` feeds the bounded Stage 5.6 context.
 5. **Eval harness grew per-path graph recall** (`graph_recall20` in the golden-set report) and its corpus seeds the §8 Stage 4 write shape (CONCEPT entities, typed aliases, name vectors, `:MENTIONS` edges). The reproducible machinery run currently reports all-path recall@20 = 1.000, fused MRR = 0.723, and rerank delta 0.000. The ignored real-model run remains a separate, network/model-dependent benchmark.
 6. **`InMemoryKnowledge` (test fake) now declares `graph_traversal: true`** — its reads mirror the real store (§14), so the fake was under-declaring. `without_graph()` is the explicit capability-off variant for degradation tests.
 
@@ -830,3 +832,29 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 3. LLM usage persistence, cost estimates, stage latency/throughput counters,
    and dashboard/export integration remain separate planned work so this slice
    does not introduce a new datastore or vendor dependency.
+
+### B.16 — Citation-preserving retrieval synthesis (§15 step 7, 2026-09-10)
+
+1. `Retriever::query_context` resolves graph entities once, reuses them for the
+   `:MENTIONS` path, and reads bounded-hop `Fact` context in deterministic
+   identity order. Existing `Retriever::query` remains a ranked-chunk API.
+2. `pipeline/synthesis.rs` owns the operator synthesis contract: it renders top
+   chunks and labeled graph facts through the `Llm` port, requests strict JSON,
+   and accepts only non-empty answers whose citations are exact chunk or fact
+   evidence ids. `pipeline/query.rs` only assembles providers and orchestrates
+   retrieval. The query path does not health-check Ollama at startup.
+3. Any LLM unavailability, rate limit, malformed response, or unknown citation
+   returns the ranked sources unchanged. `[llm].synthesis_model`,
+   `[retrieval].synthesis_context_chars`, and
+   `[retrieval].synthesis_max_tokens` keep behavior-changing limits in config.
+
+### B.17 — Fetch-ladder composition (§15 step 7, 2026-09-10)
+
+1. `FetchLeg` and `FetchPolicy::start_leg` keep ladder selection engine-neutral;
+   the pipeline translates `sites.fetch_hint` at the plane boundary.
+2. `FetchLadder` composes providers in deterministic order, passes conditional
+   validators only to the first attempted leg, escalates only on `AntiBot` or
+   `JavaScriptRequired`, and preserves permanent errors without blind fallback.
+3. The default runtime wraps the existing HTTP provider in a single-leg ladder;
+   impersonation and Obscura providers remain separate implementations and are
+   not advertised before they are wired.

@@ -203,7 +203,7 @@ pub struct EntityRecord {
 /// A fact edge between entities — the entity-level aggregation of `triplets`
 /// (§8 Stage 4). Identity is `(subject_id, predicate, object_id)`; multiple chunks
 /// asserting the same fact merge into one edge with `support_count`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Fact {
     /// Subject entity id.
     pub subject_id: String,

@@ -20,8 +20,10 @@ The following safeguards are implemented and covered before feature expansion:
   classification, and `requeue` recovery are covered by the worker suite.
 - The `Embedder` port exposes provider input capacity; worker boot rejects a
   chunk budget that would exceed it, preventing silent provider truncation.
-- `ohara query` prints ranked chunks with immutable citations, and `ohara backup`
-  writes a staged, non-overwriting snapshot behind the worker runtime lock.
+- `ohara query` synthesizes a bounded answer from top chunks and labeled graph
+  facts with exact immutable citations, and falls back to ranked chunks when the
+  LLM is unavailable or ungrounded. `ohara backup` writes a staged,
+  non-overwriting snapshot behind the worker runtime lock.
 - `ohara requeue --doc <id>` resets failed/interrupted jobs, `ohara archive <id>`
   preserves queryable chunks while stopping future work, and `ohara delete <id>`
   records an idempotent knowledge-first deletion intent.
@@ -33,21 +35,23 @@ The following safeguards are implemented and covered before feature expansion:
 - Worker execution, provider assembly, extraction validation, and cross-store
   recovery each have a focused module; the knowledge-port contract suite covers
   vectors, graph links, folds, traversal, and deletion semantics.
+- The engine-owned fetch ladder now has deterministic leg selection and
+  escalation on anti-bot or JavaScript-required outcomes; the default runtime
+  still wires only the plain HTTP provider until legs 2–3 land.
 - Site policies now drive conditional re-crawls: due SCRAPE jobs are re-queued,
   validators produce HTTP 304 outcomes, and adaptive intervals are capped by
   fetcher configuration.
 
-## Next priority — LLM retrieval synthesis
+## Next priority — fetch ladder legs 2–3
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
 
-The next user-facing retrieval slice is synthesis through the existing `Llm`
-port (§8 Stage 5.6): render the top chunks and labeled graph facts into a
-bounded context, return answer text with immutable `chunk_id` citations, and
-degrade to ranked chunks when the LLM is unavailable. The operator metrics
-snapshot is implemented; durable LLM usage persistence and dashboards remain
-separate observability work.
+The bounded Stage 5.6 synthesis slice is implemented through the existing `Llm`
+port. The ladder composition and deterministic escalation seam are now landed;
+the remaining production-reliability work is to add the impersonation leg, the
+versioned Obscura subprocess protocol, and real provider wiring while preserving
+the `Fetcher` port. Keep each leg independently testable.
 
 ## Embedding migration
 
@@ -61,11 +65,14 @@ The three-path baseline (BM25 + vector + **graph** + RRF + rerank) and query
 entities (typed aliases + `EntityNames` KNN) are done. Remaining:
 - symspell domain-dictionary correction.
 - Optional `HyDE`.
-- Synthesis via the `Llm` port (§8 Stage 5.6): context = top chunks + graph
-  facts rendered as a labeled fact list; citations = `chunk_id`s.
+- Synthesis is landed: top chunks and bounded graph facts are rendered through
+  the `Llm` port, structured output is citation-validated, and unavailable or
+  ungrounded synthesis falls back to ranked chunks.
 
 ## Fetch ladder legs 2–3 (§15 step 7)
-Only leg 1 (plain HTTP, `engine/http.rs`) is built.
+The engine-owned ladder is implemented, but only leg 1 (plain HTTP,
+`engine/http.rs`) is wired by the default runtime. This is now the next
+implementation priority for provider work.
 - Leg 2: impersonation client.
 - Leg 3: Obscura subprocess (JS rendering + stealth) — `engine/obscura.rs` is a
   placeholder; implement the versioned JSON subprocess protocol.
@@ -83,8 +90,8 @@ these operator commands are missing:
 - Durable LLM usage persistence and cost / metrics dashboards (§13)
 
 `ohara prune` and the read-only `ohara metrics` snapshot are implemented.
-Query/citations, backup/restore snapshot safety, document lifecycle, and ER
-merge are landed.
+Query/citations/synthesis fallback, backup/restore snapshot safety, document
+lifecycle, and ER merge are landed.
 
 ## Deferred small items
 - Entity GC after deletion (§7.6): entities whose `MENTIONS` degree drops to zero

@@ -3,12 +3,14 @@
 //! remain behind the same port (§1.2.2).
 
 mod http;
+mod ladder;
 mod obscura;
 mod robots;
 
 use std::time::Duration;
 
 pub use http::{HttpFetcher, HttpFetcherParams};
+pub use ladder::FetchLadder;
 
 use async_trait::async_trait;
 
@@ -155,12 +157,28 @@ pub enum UrlError {
     Scheme(String),
 }
 
+/// A fetch-ladder leg (§8 Stage 1). The value is engine-neutral so the pipeline
+/// can translate a control-plane site hint without making the engine depend on
+/// SQLite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FetchLeg {
+    /// Plain HTTP: fast and cheap, but no JavaScript or stealth support.
+    Plain,
+    /// Browser-profile HTTP impersonation without JavaScript execution.
+    Impersonate,
+    /// JavaScript-rendering and stealth subprocess.
+    Browser,
+}
+
 /// Per-fetch policy handed to a [`Fetcher`] by the stage (§8 Stage 1): the stage
 /// reads the control plane (`sites` overrides, config toggles) — the fetcher
 /// enforces. `rate_limit` is a *floor addition*: the impl never fetches faster
 /// than its own default or this value, whichever is larger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FetchPolicy {
+    /// Minimum ladder capability to use for this request. A composite fetcher
+    /// starts at this leg and may escalate when the response requires it.
+    pub start_leg: FetchLeg,
     /// Minimum spacing between requests to one host (§8 politeness); `ZERO` keeps
     /// the impl's own default.
     pub rate_limit: Duration,
@@ -171,6 +189,7 @@ pub struct FetchPolicy {
 impl Default for FetchPolicy {
     fn default() -> Self {
         Self {
+            start_leg: FetchLeg::Plain,
             rate_limit: Duration::ZERO,
             robots: true,
         }
@@ -244,6 +263,12 @@ pub enum FetchError {
         /// The missing URL.
         url: String,
     },
+    /// The response is a JavaScript shell and requires a rendering-capable leg.
+    #[error("javascript rendering required for {url}")]
+    JavaScriptRequired {
+        /// The URL whose response requires rendering.
+        url: String,
+    },
     /// The peer or subprocess violated the protocol (external behavior is data, §10).
     /// Also covers §12 SSRF refusals and unsupported content types — retried within
     /// the attempt budget, then dead.
@@ -258,9 +283,10 @@ impl FetchError {
     #[must_use]
     pub fn class(&self) -> Class {
         match self {
-            FetchError::AntiBot { .. } | FetchError::Timeout { .. } | FetchError::Protocol(_) => {
-                Class::Retry
-            }
+            FetchError::AntiBot { .. }
+            | FetchError::JavaScriptRequired { .. }
+            | FetchError::Timeout { .. }
+            | FetchError::Protocol(_) => Class::Retry,
             FetchError::NotFound { .. } => Class::Permanent,
         }
     }

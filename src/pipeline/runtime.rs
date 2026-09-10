@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::BootError;
 use crate::config::Config;
-use crate::engine::{Fetcher, HttpFetcher, HttpFetcherParams};
+use crate::engine::{FetchLadder, Fetcher, HttpFetcher, HttpFetcherParams};
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
 
@@ -29,11 +29,12 @@ pub(crate) struct WorkerPorts {
 pub(crate) struct QueryPorts {
     pub(crate) embedder: Arc<dyn Embedder>,
     pub(crate) knowledge: Arc<dyn KnowledgeStore>,
+    pub(crate) llm: Arc<dyn Llm>,
 }
 
 /// Assembles the default worker adapters and validates their shared contracts.
 pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
-    let fetcher = Arc::new(HttpFetcher::new(HttpFetcherParams {
+    let plain = Arc::new(HttpFetcher::new(HttpFetcherParams {
         user_agent: config.fetcher().user_agent().to_string(),
         timeout: config.fetcher().timeout(),
         rate_limit: config.rate_limit(),
@@ -41,6 +42,7 @@ pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
         max_body_bytes: config.fetcher().max_body_bytes(),
         max_redirects: config.fetcher().max_redirects(),
     })?);
+    let fetcher = Arc::new(FetchLadder::single(plain));
     let extractor = Arc::new(ReadabilityExtractor);
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
@@ -60,10 +62,22 @@ pub(crate) fn query_ports(config: &Config) -> Result<QueryPorts, BootError> {
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
     let knowledge = default_knowledge(config)?;
+    let llm = query_llm(config)?;
     Ok(QueryPorts {
         embedder,
         knowledge,
+        llm,
     })
+}
+
+/// Assembles the query LLM without the worker's boot health gate. Retrieval
+/// remains useful while Ollama is stopped; synthesis then degrades to ranked
+/// chunks at the query boundary (§8 Stage 5.6).
+fn query_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
+    Ok(Arc::new(crate::llm::Ollama::new(
+        config.llm().base_url().clone(),
+        config.llm().health_timeout(),
+    )?))
 }
 
 #[cfg(feature = "onnx-embedder")]

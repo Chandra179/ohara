@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use crate::Class;
-use crate::control::{self, ClaimedJob};
-use crate::engine::{FetchError, FetchPolicy, FetchValidators, NormalizedUrl};
+use crate::control::{self, ClaimedJob, LadderHint};
+use crate::engine::{FetchError, FetchLeg, FetchPolicy, FetchValidators, NormalizedUrl};
 
 use super::execution::ScrapeContext;
 use super::{StageError, StageOutcome};
@@ -31,6 +31,10 @@ pub(super) fn run(ctx: &ScrapeContext<'_>, job: &ClaimedJob) -> Result<StageOutc
     // fetcher's own default; the ladder hint guides escalation in §15 step 7.
     let site = control::site_policy(ctx.conn, url.host_str())?;
     let policy = FetchPolicy {
+        start_leg: site
+            .as_ref()
+            .and_then(|site| site.fetch_hint)
+            .map_or(FetchLeg::Plain, fetch_leg),
         rate_limit: site
             .as_ref()
             .and_then(|s| s.rate_limit_ms)
@@ -100,6 +104,17 @@ pub(super) fn run(ctx: &ScrapeContext<'_>, job: &ClaimedJob) -> Result<StageOutc
         &now,
     )?;
     Ok(StageOutcome::Advance)
+}
+
+/// Translates the control-plane site hint into the engine-plane ladder value.
+/// The engine never imports SQLite types; this is the pipeline boundary where
+/// the two planes exchange a small domain value.
+fn fetch_leg(hint: LadderHint) -> FetchLeg {
+    match hint {
+        LadderHint::Plain => FetchLeg::Plain,
+        LadderHint::Impersonate => FetchLeg::Impersonate,
+        LadderHint::Browser => FetchLeg::Browser,
+    }
 }
 
 /// The §10 mapping for fetch failures: `NotFound` cannot succeed on retry; the
