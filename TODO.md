@@ -27,6 +27,9 @@ The following safeguards are implemented and covered before feature expansion:
   records an idempotent knowledge-first deletion intent.
 - `ohara er merge` replays recorded Ladybug folds, resolves pending review
   candidates by mention degree/age, remaps aliases, and records `entity_merges`.
+- `ohara metrics` reports document milestones, queue state, retained audit
+  outcomes, pending ER reviews, recrawl backlog, and raw-payload usage in text
+  or JSON form while holding the runtime lock.
 - Worker execution, provider assembly, extraction validation, and cross-store
   recovery each have a focused module; the knowledge-port contract suite covers
   vectors, graph links, folds, traversal, and deletion semantics.
@@ -34,10 +37,17 @@ The following safeguards are implemented and covered before feature expansion:
   validators produce HTTP 304 outcomes, and adaptive intervals are capped by
   fetcher configuration.
 
-## Next priority — metrics
+## Next priority — LLM retrieval synthesis
 
 Keep each change behind the existing plane ports and run the full verification
 gates after every slice.
+
+The next user-facing retrieval slice is synthesis through the existing `Llm`
+port (§8 Stage 5.6): render the top chunks and labeled graph facts into a
+bounded context, return answer text with immutable `chunk_id` citations, and
+degrade to ranked chunks when the LLM is unavailable. The operator metrics
+snapshot is implemented; durable LLM usage persistence and dashboards remain
+separate observability work.
 
 ## Embedding migration
 
@@ -70,9 +80,9 @@ outputs, usage counters, boot health check). Remaining:
 ## Ops tooling & CLI (§15 step 8)
 The query, backup, document lifecycle, and ER merge commands are implemented;
 these operator commands are missing:
-- Cost / metrics dashboards (§13)
+- Durable LLM usage persistence and cost / metrics dashboards (§13)
 
-`ohara prune` is implemented. The next operator slice is metrics.
+`ohara prune` and the read-only `ohara metrics` snapshot are implemented.
 Query/citations, backup/restore snapshot safety, document lifecycle, and ER
 merge are landed.
 

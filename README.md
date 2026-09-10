@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, and raw retention pruning are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis and metrics remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, raw retention pruning, and a read-only operator metrics snapshot are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The shipped fetcher is HTTP-only (ladder leg 1); the Obscura subprocess and additional ladder legs are planned. LLM synthesis, durable LLM cost accounting, and dashboards remain tracked in [TODO.md](TODO.md). The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## How it works
 
@@ -117,6 +117,17 @@ retention policy. Both knobs are disabled unless configured; `--dry-run` shows
 the selection without deleting files. Pruning requires the same runtime lock
 as the worker and other operator commands.
 
+Inspect the current control-plane and raw-payload metrics:
+
+```text
+make run ARGS='metrics'
+make run ARGS='metrics --json'
+```
+
+Metrics reads document milestones, queue state, retained stage events, pending
+ER reviews, recrawl backlog, and `data/raw` usage while holding the shared
+runtime lock. JSON output is suitable for scripts; it does not mutate stores.
+
 Two native prerequisites are also required:
 
 - **OpenSSL development libraries** — the `lbug` crate's bundled engine links
@@ -140,7 +151,7 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── ARCHITECTURE.md        # system design (v2.7) — the source of truth
+│   ├── ARCHITECTURE.md        # system design (v2.8) — the source of truth
 │   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
@@ -158,6 +169,7 @@ ohara/
     │   ├── documents.rs       #   document registry, lifecycle state, deletion intents
     │   ├── entities.rs        #   Stage 4 registry: triplets, entities/aliases, ER review + merge audit
     │   ├── jobs.rs            #   job queue: lease claim, stage chaining, requeue
+    │   ├── metrics.rs         #   durable document, queue, audit, ER, and recrawl aggregates
     │   ├── reconcile.rs       #   §7.3 audit-retention portion of the boot sweep
     │   └── models.rs          #   row types + the §6 state machine's shape knowledge
     ├── engine.rs              # ENGINE PLANE facade — pub trait Fetcher (the port)
@@ -189,8 +201,9 @@ ohara/
     │   └── retrieve.rs        # Stage 5: three-path retrieval + rerank + QueryNormalizer port
     ├── llm.rs                 # pub trait Llm + the local Ollama provider (structured
                                #   outputs, usage counters, boot health check)
-    ├── ops.rs                 # operator facade: lock, backups, lifecycle, and pruning
+    ├── ops.rs                 # operator facade: lock, metrics, backups, lifecycle, and pruning
     │   ├── entity_merge.rs    # offline ER merge orchestration
+    │   ├── metrics.rs         # read-only control/raw usage snapshot
     │   └── prune.rs           # raw-retention selection and safe unlinking
     └── text.rs                # pure text functions: language ID, normalization, tokenizer, unicode
 ```
@@ -221,7 +234,7 @@ ohara/
 4. Chunker + local embedder + vector collections + `chunks_fts` — landed; LadybugDB currently uses exact KNN and keeps HNSW as a future port-compatible swap
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
-7. Stabilization: retrieval evaluation and the operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations, `ohara backup` creates consistent snapshots, `requeue`/`archive`/`delete` manage document lifecycle, `er merge` closes the offline merge queue, and `prune` enforces raw retention; metrics remain
-8. Obscura leg + full fetch ladder, LLM synthesis, and cost dashboards
+7. Stabilization: retrieval evaluation and the operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` prints ranked chunks with citations, `ohara backup` creates consistent snapshots, `requeue`/`archive`/`delete` manage document lifecycle, `er merge` closes the offline merge queue, `prune` enforces raw retention, and `metrics` reports durable control/raw usage state
+8. Obscura leg + full fetch ladder, LLM synthesis, durable LLM cost accounting, and dashboards
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.

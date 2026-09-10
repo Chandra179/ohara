@@ -1,6 +1,6 @@
-# ohara — System Architecture (v2.7)
+# ohara — System Architecture (v2.8)
 
-> **Status:** design of record and implementation status. v2.7 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, conditional re-crawling, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, offline ER merge, and raw retention pruning are implemented, while the remaining fetch legs, synthesis, and metrics tooling are explicitly planned. v2.6 added maintainability and backend-integrity hardening; v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
+> **Status:** design of record and implementation status. v2.8 reconciles the target GraphRAG design with the current code: the core pipeline through graph retrieval, conditional re-crawling, the stabilization acceptance matrix, the operator query command, staged backup snapshots, document lifecycle commands, offline ER merge, raw retention pruning, and a read-only control/raw metrics snapshot are implemented, while the remaining fetch legs, synthesis, durable LLM cost accounting, and dashboards are explicitly planned. v2.7 added the architecture seam cleanup; v2.6 added maintainability and backend-integrity hardening; v2.5 added the stabilization evaluation matrix; v2.4 added the embedder input-capacity contract; v2.3 added recovery acceptance and the control-plane audit facade; v2.2 superseded v2.1 and folded in the post-v2 architecture/data review: vector namespaces on the knowledge port, FTS5 schema, entity identity and merge protocol, typed aliases, fact-edge aggregation, queue ordering, deletion intent, and ops hardening.
 
 ---
 
@@ -603,7 +603,14 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 
 - `tracing` spans per job/stage with `doc_id`; `RUST_LOG` filtered by module.
 - `stage_events` is the audit table of record (transitions, retries, errors, panics).
-- Counters exported via a metrics handle: docs/sec per stage, tokens in/out, cost estimate per doc, queue depth per stage, `er_review` pending count, documents due for re-crawl, `data/raw` disk usage (against the retention budget, §7.10), and an HNSW tombstone ratio if an HNSW implementation is introduced.
+- `ohara metrics` reads a lock-protected snapshot of document milestones, queue
+  depth by stage/status, retained audit outcomes, pending `er_review` rows,
+  documents due for re-crawl, and `data/raw` disk usage against the retention
+  budget (§7.10). `--json` provides deterministic machine-readable output.
+- The remaining metrics work is a durable usage sink for LLM calls (tokens in/out
+  and cost estimates per document), stage throughput/latency counters, and a
+  dashboard/export layer. An HNSW tombstone ratio is added if an HNSW
+  implementation is introduced.
 
 ---
 
@@ -626,8 +633,8 @@ A concrete instance of the cost model (the development machine) — the knobs mo
 4. Chunker + local embedder + vector collections + `chunks_fts` — **landed; the Ladybug build gates (§2) passed empirically** (MVCC reads with one writer; fold in one transaction; exact KNN via `array_cosine_similarity` until an HNSW index is swapped in)
 5. Retrieval baseline: FTS5 + vector + graph + rerank — **landed, measured on the machinery golden set** (BM25, vector, and graph recall@20 = 1.000; fused MRR = 0.723; rerank delta is tracked). Not yet built: symspell correction, `HyDE`, and LLM synthesis
 6. Stage 4: extraction, entity resolution, graph path — **landed**. Write side: per-chunk LLM extraction with JSON-schema structured outputs against the local Ollama provider, §8 matrix validation with audited drops, the §7.7 triplet cost cache, conservative type-consistent entity resolution — typed aliases, same-supertype name + embedding similarity, `er_review` for near-ties — and capped fact-edge aggregation via the `merge_fact` port. Read side: Stage 5 query entities and the graph path are the third fusion list. The offline `ohara er merge` executor is also landed; cloud LLM opt-in remains planned
-7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations, `ohara backup` creates staged snapshots, `ohara requeue`/`archive`/`delete` implement document lifecycle, `ohara er merge` closes the offline entity-review queue, and `ohara prune` enforces raw retention; remaining work is metrics
-8. Remaining feature work: Obscura and the full fetch ladder, LLM synthesis, and cost dashboards
+7. Stabilization and operator slice: **restart/deletion/lease/retry/dead-letter acceptance landed**, and the evaluation matrix now covers entity-aware, multi-hop, duplicate/deletion, wrong-language, paywall, and failure/retry cases; `ohara query` exposes ranked chunks with citations, `ohara backup` creates staged snapshots, `ohara requeue`/`archive`/`delete` implement document lifecycle, `ohara er merge` closes the offline entity-review queue, `ohara prune` enforces raw retention, and `ohara metrics` reports durable control/raw usage state
+8. Remaining feature work: LLM retrieval synthesis, durable LLM cost accounting, Obscura and the full fetch ladder, and dashboards
 
 ---
 
@@ -811,3 +818,15 @@ A concrete instance of the cost model (the development machine) — the knobs mo
    vector collections and document mentions. The in-memory test implementation
    mirrors those graph postconditions instead of silently accepting no-op folds
    or leaving document mentions behind.
+
+### B.15 — Operator metrics snapshot (§15 step 7, 2026-09-10)
+
+1. `control/metrics.rs` owns aggregate reads over documents, jobs,
+   `stage_events`, entity-review state, and recrawl due dates; it returns domain
+   DTOs without exposing SQLite handles.
+2. `ops/metrics.rs` composes the control snapshot with regular-file usage below
+   `data/raw` and configured retention limits while holding the shared runtime
+   lock. The operator command is read-only and supports text or `--json` output.
+3. LLM usage persistence, cost estimates, stage latency/throughput counters,
+   and dashboard/export integration remain separate planned work so this slice
+   does not introduce a new datastore or vendor dependency.

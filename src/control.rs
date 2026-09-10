@@ -6,6 +6,7 @@ mod db;
 mod documents;
 mod entities;
 mod jobs;
+mod metrics;
 mod models;
 mod reconcile;
 mod sites;
@@ -16,6 +17,7 @@ pub use documents::{
     NewDocument, RawRetentionCandidate,
 };
 pub use entities::{EntityDetails, EntityMerge, ErReview, NameCandidate, NewTriplet, TripletRow};
+pub use metrics::MetricsSnapshot;
 pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
 pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
@@ -97,6 +99,14 @@ pub fn mark_quality_rejected(
 /// Returns [`DbError`] if the control-plane query fails.
 pub fn due_for_recrawl(db: &ControlDb, now_stamp: &str) -> Result<Vec<String>, DbError> {
     documents::due_for_recrawl(db.raw(), now_stamp)
+}
+
+/// Reads durable control-plane metrics for an operator snapshot.
+///
+/// # Errors
+/// Returns [`DbError`] when an aggregate query fails.
+pub fn metrics(db: &ControlDb, now_stamp: &str) -> Result<MetricsSnapshot, DbError> {
+    metrics::snapshot(db.raw(), now_stamp)
 }
 
 /// Re-queues due SCRAPE jobs while preserving live work.

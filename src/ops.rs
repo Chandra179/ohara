@@ -5,6 +5,7 @@
 //! `SQLite` snapshot semantics remain owned by `control`.
 
 mod entity_merge;
+mod metrics;
 mod prune;
 
 use std::fs::{self, File, OpenOptions};
@@ -23,6 +24,7 @@ const RUNTIME_LOCK_NAME: &str = ".ohara.lock";
 #[cfg(all(feature = "ladybug", test))]
 pub(super) use entity_merge::execute_entity_merges;
 pub use entity_merge::merge_entities;
+pub use metrics::{MetricsReport, metrics};
 pub use prune::{PruneReport, prune};
 
 /// Operator failures.

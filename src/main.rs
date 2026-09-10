@@ -15,6 +15,7 @@ USAGE:
     ohara archive <id> [--config <path.toml>]
     ohara delete <id> [--config <path.toml>]
     ohara prune [--dry-run] [--config <path.toml>]
+    ohara metrics [--json] [--config <path.toml>]
     ohara er merge [--config <path.toml>]
 
 OPTIONS:
@@ -27,6 +28,8 @@ OPTIONS:
     delete <id>        Request knowledge-first document deletion
     prune              Apply configured raw-payload retention policy
     --dry-run          Show prune selection without deleting files
+    metrics            Show queue, audit, entity-review, recrawl, and raw usage metrics
+    --json             Render metrics as machine-readable JSON
     er merge           Execute pending offline entity merges
     -h, --help         print this help";
 
@@ -60,6 +63,10 @@ enum CliCommand {
         config_path: Option<PathBuf>,
         dry_run: bool,
     },
+    Metrics {
+        config_path: Option<PathBuf>,
+        json: bool,
+    },
     EntityMerge {
         config_path: Option<PathBuf>,
     },
@@ -84,6 +91,8 @@ enum CliError {
     Query(#[from] ohara::pipeline::QueryError),
     #[error("operator: {0}")]
     Ops(#[from] ohara::ops::OpsError),
+    #[error("output: {0}")]
+    Output(#[from] serde_json::Error),
 }
 
 fn main() -> ExitCode {
@@ -139,6 +148,9 @@ fn main() -> ExitCode {
             config_path,
             dry_run,
         } => prune_and_print(config_path.as_deref(), dry_run),
+        CliCommand::Metrics { config_path, json } => {
+            metrics_and_print(config_path.as_deref(), json)
+        }
         CliCommand::EntityMerge { config_path } => runtime.block_on(merge_and_print(config_path)),
     };
 
@@ -160,6 +172,7 @@ enum CliMode {
     Backup,
     Lifecycle(LifecycleAction),
     Prune,
+    Metrics,
     EntityMerge,
 }
 
@@ -172,6 +185,7 @@ struct CliParser {
     lifecycle_doc: Option<String>,
     top_k: Option<usize>,
     dry_run: bool,
+    json: bool,
     entity_group: bool,
 }
 
@@ -212,9 +226,11 @@ impl CliParser {
             "archive" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Archive))?,
             "delete" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Delete))?,
             "prune" => self.select_mode(CliMode::Prune)?,
+            "metrics" => self.select_mode(CliMode::Metrics)?,
             "er" => self.select_entity_group()?,
             "merge" => self.select_entity_merge()?,
             "--dry-run" => self.parse_dry_run()?,
+            "--json" => self.parse_json()?,
             value => self.parse_value(value)?,
         }
         Ok(())
@@ -279,6 +295,21 @@ impl CliParser {
         Ok(())
     }
 
+    fn parse_json(&mut self) -> Result<(), CliError> {
+        if self.mode != Some(CliMode::Metrics) {
+            return Err(CliError::Argument(
+                "--json is only valid with metrics".to_string(),
+            ));
+        }
+        if self.json {
+            return Err(CliError::Argument(
+                "metrics accepts --json at most once".to_string(),
+            ));
+        }
+        self.json = true;
+        Ok(())
+    }
+
     fn parse_value(&mut self, value: &str) -> Result<(), CliError> {
         match self.mode {
             Some(CliMode::Query) => {
@@ -312,6 +343,11 @@ impl CliParser {
             Some(CliMode::Prune) => {
                 return Err(CliError::Argument(
                     "prune does not accept positional arguments".to_string(),
+                ));
+            }
+            Some(CliMode::Metrics) => {
+                return Err(CliError::Argument(
+                    "metrics does not accept positional arguments".to_string(),
                 ));
             }
             Some(CliMode::EntityMerge) => {
@@ -349,12 +385,16 @@ impl CliParser {
             Some(CliMode::Backup) => self.finish_backup(),
             Some(CliMode::Lifecycle(action)) => self.finish_lifecycle(action),
             Some(CliMode::Prune) => self.finish_prune(),
+            Some(CliMode::Metrics) => self.finish_metrics(),
             Some(CliMode::EntityMerge) => self.finish_entity_merge(),
             None if self.entity_group => Err(CliError::Argument(
                 "expected `merge` after `er`".to_string(),
             )),
             None if self.top_k.is_some() => Err(CliError::Argument(
                 "--top-k is only valid with the query command".to_string(),
+            )),
+            None if self.json => Err(CliError::Argument(
+                "--json is only valid with the metrics command".to_string(),
             )),
             None => Ok(Some(CliCommand::Worker {
                 config_path: self.config_path,
@@ -363,6 +403,7 @@ impl CliParser {
     }
 
     fn finish_query(self) -> Result<Option<CliCommand>, CliError> {
+        reject_json(self.json)?;
         let query = self.query_parts.join(" ");
         if query.trim().is_empty() {
             return Err(CliError::Argument(
@@ -378,6 +419,7 @@ impl CliParser {
 
     fn finish_backup(self) -> Result<Option<CliCommand>, CliError> {
         reject_top_k(self.top_k)?;
+        reject_json(self.json)?;
         let destination = self.backup_destination.ok_or_else(|| {
             CliError::Argument("backup requires a destination directory".to_string())
         })?;
@@ -389,6 +431,7 @@ impl CliParser {
 
     fn finish_lifecycle(self, action: LifecycleAction) -> Result<Option<CliCommand>, CliError> {
         reject_top_k(self.top_k)?;
+        reject_json(self.json)?;
         let doc_id = self.lifecycle_doc.ok_or_else(|| {
             CliError::Argument("lifecycle command requires a document id".to_string())
         })?;
@@ -411,6 +454,7 @@ impl CliParser {
 
     fn finish_prune(self) -> Result<Option<CliCommand>, CliError> {
         reject_top_k(self.top_k)?;
+        reject_json(self.json)?;
         if self.lifecycle_doc.is_some() || self.backup_destination.is_some() {
             return Err(CliError::Argument(
                 "prune does not accept a document id or destination".to_string(),
@@ -422,8 +466,22 @@ impl CliParser {
         }))
     }
 
+    fn finish_metrics(self) -> Result<Option<CliCommand>, CliError> {
+        reject_top_k(self.top_k)?;
+        if self.lifecycle_doc.is_some() || self.backup_destination.is_some() {
+            return Err(CliError::Argument(
+                "metrics does not accept a document id or destination".to_string(),
+            ));
+        }
+        Ok(Some(CliCommand::Metrics {
+            config_path: self.config_path,
+            json: self.json,
+        }))
+    }
+
     fn finish_entity_merge(self) -> Result<Option<CliCommand>, CliError> {
         reject_top_k(self.top_k)?;
+        reject_json(self.json)?;
         if self.lifecycle_doc.is_some() || self.backup_destination.is_some() {
             return Err(CliError::Argument(
                 "er merge does not accept positional arguments".to_string(),
@@ -459,6 +517,16 @@ fn reject_top_k(top_k: Option<usize>) -> Result<(), CliError> {
     if top_k.is_some() {
         Err(CliError::Argument(
             "--top-k is only valid with the query command".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_json(json: bool) -> Result<(), CliError> {
+    if json {
+        Err(CliError::Argument(
+            "--json is only valid with the metrics command".to_string(),
         ))
     } else {
         Ok(())
@@ -549,6 +617,54 @@ fn prune_and_print(config_path: Option<&Path>, dry_run: bool) -> Result<(), CliE
     );
     if !report.policy_active {
         println!("no raw retention limits configured; nothing selected");
+    }
+    Ok(())
+}
+
+fn metrics_and_print(config_path: Option<&Path>, json: bool) -> Result<(), CliError> {
+    let config = ohara::config::Config::load(config_path)?;
+    let report = ohara::ops::metrics(&config)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!("captured at {}", report.control.captured_at);
+    println!("documents:");
+    for (status, count) in &report.control.documents_by_status {
+        println!("  {status}: {count}");
+    }
+    println!("jobs:");
+    for (stage, statuses) in &report.control.jobs_by_stage_status {
+        let summary = statuses
+            .iter()
+            .map(|(status, count)| format!("{status}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {stage}: {summary}");
+    }
+    println!("audit outcomes:");
+    for (outcome, count) in &report.control.events_by_outcome {
+        println!("  {outcome}: {count}");
+    }
+    println!("audit stages:");
+    for (stage, count) in &report.control.events_by_stage {
+        println!("  {stage}: {count}");
+    }
+    println!("pending ER reviews: {}", report.control.pending_er_reviews);
+    println!(
+        "documents due for recrawl: {}",
+        report.control.due_for_recrawl
+    );
+    println!(
+        "raw payloads: {} file(s), {} byte(s)",
+        report.raw_files, report.raw_bytes
+    );
+    if let Some(limit) = report.raw_max_bytes {
+        println!("raw byte limit: {limit}");
+    }
+    if let Some(limit) = report.raw_max_age_days {
+        println!("raw age limit: {limit} day(s)");
     }
     Ok(())
 }
@@ -693,6 +809,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_metrics_with_optional_json_output() {
+        assert_eq!(
+            parse_args(
+                ["metrics", "--json", "--config", "x.toml"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap(),
+            Some(CliCommand::Metrics {
+                config_path: Some(PathBuf::from("x.toml")),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_args(["metrics"].into_iter().map(str::to_string)).unwrap(),
+            Some(CliCommand::Metrics {
+                config_path: None,
+                json: false,
+            })
+        );
+        assert!(parse_args(["metrics", "extra"].into_iter().map(str::to_string)).is_err());
+        assert!(parse_args(["--json"].into_iter().map(str::to_string)).is_err());
     }
 
     #[test]
