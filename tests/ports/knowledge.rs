@@ -255,3 +255,47 @@ async fn delete_doc_removes_document_chunks_and_mentions_but_keeps_other_docs() 
         ["chunk-b"]
     );
 }
+
+#[tokio::test]
+async fn deleting_an_unreferenced_entity_removes_its_name_vector() {
+    let store = LadybugStore::in_memory(3).unwrap();
+    let port: &dyn KnowledgeStore = &store;
+    port.upsert_entity(&entity("unused", "Unused", EntityType::Concept))
+        .await
+        .unwrap();
+    port.upsert_vectors(
+        VectorSpace::EntityNames,
+        "",
+        &["unused"],
+        &[vec![1.0, 0.0, 0.0]],
+    )
+    .await
+    .unwrap();
+
+    assert!(port.delete_entity("unused").await.unwrap());
+    assert!(!port.delete_entity("unused").await.unwrap());
+    assert!(
+        !port
+            .has_vector(VectorSpace::EntityNames, "unused")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_referenced_entity_is_retained() {
+    let store = LadybugStore::in_memory(3).unwrap();
+    let port: &dyn KnowledgeStore = &store;
+    port.upsert_entity(&entity("used", "Used", EntityType::Concept))
+        .await
+        .unwrap();
+    port.link_mention("chunk-used", "used").await.unwrap();
+
+    assert!(!port.delete_entity("used").await.unwrap());
+    assert!(
+        port.chunks_for_entities(&["used"])
+            .await
+            .unwrap()
+            .contains(&"chunk-used".to_string())
+    );
+}

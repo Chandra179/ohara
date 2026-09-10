@@ -13,7 +13,7 @@ use super::OpsError;
 /// Operator-facing metrics snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MetricsReport {
-    /// Durable SQLite metrics, flattened into the operator JSON object.
+    /// Durable `SQLite` metrics, flattened into the operator JSON object.
     #[serde(flatten)]
     pub control: control::MetricsSnapshot,
     /// Number of regular files currently below `data/raw`.
@@ -27,11 +27,11 @@ pub struct MetricsReport {
 }
 
 /// Reads a metrics snapshot while holding the same runtime lock as operator
-/// mutations. The command is read-only, but the lock keeps SQLite and raw-file
+/// mutations. The command is read-only, but the lock keeps `SQLite` and raw-file
 /// observations from racing a worker or prune operation.
 ///
 /// # Errors
-/// Returns [`OpsError`] if the runtime is busy, SQLite cannot be read, or the
+/// Returns [`OpsError`] if the runtime is busy, `SQLite` cannot be read, or the
 /// raw directory cannot be inspected.
 pub fn metrics(config: &Config) -> Result<MetricsReport, OpsError> {
     let (_runtime_lock, db) = super::open_control(config)?;

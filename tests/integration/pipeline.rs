@@ -867,6 +867,10 @@ async fn worker_drives_a_document_from_new_to_indexed() {
     struct ScriptedLlm;
     #[async_trait::async_trait]
     impl ohara::llm::Llm for ScriptedLlm {
+        fn provider_name(&self) -> &'static str {
+            "scripted"
+        }
+
         async fn complete(
             &self,
             _req: ohara::llm::CompletionRequest,
@@ -879,10 +883,6 @@ async fn worker_drives_a_document_from_new_to_indexed() {
                 prompt_tokens: 40,
                 completion_tokens: 30,
             })
-        }
-
-        fn usage(&self) -> ohara::llm::LlmUsage {
-            ohara::llm::LlmUsage::default()
         }
     }
 
@@ -980,6 +980,10 @@ async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
     struct ScriptedLlm;
     #[async_trait::async_trait]
     impl ohara::llm::Llm for ScriptedLlm {
+        fn provider_name(&self) -> &'static str {
+            "scripted"
+        }
+
         async fn complete(
             &self,
             _req: ohara::llm::CompletionRequest,
@@ -992,10 +996,6 @@ async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
                 prompt_tokens: 40,
                 completion_tokens: 30,
             })
-        }
-
-        fn usage(&self) -> ohara::llm::LlmUsage {
-            ohara::llm::LlmUsage::default()
         }
     }
 

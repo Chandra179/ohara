@@ -1,8 +1,6 @@
-//! The single LLM port (§9, §1.3): provider impls behind one trait, so cost
-//! accounting and the data-governance decision (§12 egress) live in exactly one
-//! place. Local Ollama is the default; cloud is opt-in (§12).
-
-use std::sync::Mutex;
+//! The single LLM port (§9, §1.3): provider implementations expose one stable
+//! completion Interface, while egress policy and usage recording stay at the
+//! pipeline boundary. Local Ollama is the default; cloud is opt-in (§12).
 
 use async_trait::async_trait;
 
@@ -35,18 +33,6 @@ pub struct CompletionResponse {
     pub completion_tokens: u64,
 }
 
-/// Cumulative token/call counters — the cost-model input (§11) and the egress
-/// audit (§12).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LlmUsage {
-    /// Completed calls.
-    pub calls: u64,
-    /// Sum of prompt tokens.
-    pub prompt_tokens: u64,
-    /// Sum of completion tokens.
-    pub completion_tokens: u64,
-}
-
 /// LLM failures (§2, §9). Mid-run endpoint unavailability is Transient (backoff) —
 /// health is checked at boot, but can lapse mid-run (§2).
 #[derive(Debug, thiserror::Error)]
@@ -76,18 +62,19 @@ impl LlmError {
     }
 }
 
-/// The LLM port (§9): completion with usage accounting. Cost counters advance on
-/// every call, success or failure — a failed call still consumed egress.
+/// The LLM port (§9): completion with provider identity. Durable usage accounting
+/// is recorded by the pipeline usage-ledger Module so this plane stays free of
+/// control-store dependencies.
 #[async_trait]
 pub trait Llm: Send + Sync {
+    /// Stable provider name stored with each completion attempt.
+    fn provider_name(&self) -> &str;
+
     /// Completes `req`.
     ///
     /// # Errors
     /// [`LlmError`] per its taxonomy and retry classes.
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError>;
-
-    /// Cumulative usage counters.
-    fn usage(&self) -> LlmUsage;
 }
 
 /// The local Ollama provider (§2): an OpenAI-compatible endpoint the user runs
@@ -98,7 +85,6 @@ pub trait Llm: Send + Sync {
 pub struct Ollama {
     base: url::Url,
     client: reqwest::Client,
-    usage: Mutex<LlmUsage>,
     health_timeout: std::time::Duration,
 }
 
@@ -118,7 +104,6 @@ impl Ollama {
         Ok(Self {
             base: base_url,
             client,
-            usage: Mutex::new(LlmUsage::default()),
             health_timeout,
         })
     }
@@ -149,18 +134,6 @@ impl Ollama {
                 "ollama health probe got HTTP {code}"
             ))),
         }
-    }
-
-    /// Adds one call's token counts to the cumulative usage (a failed call still
-    /// consumed egress, §12).
-    fn record_usage(&self, prompt: u64, completion: u64) {
-        let mut usage = self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        usage.calls += 1;
-        usage.prompt_tokens += prompt;
-        usage.completion_tokens += completion;
     }
 }
 
@@ -254,6 +227,10 @@ impl Ollama {
 
 #[async_trait]
 impl Llm for Ollama {
+    fn provider_name(&self) -> &'static str {
+        "ollama"
+    }
+
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let url = self
             .base
@@ -292,34 +269,17 @@ impl Llm for Ollama {
         match status {
             200 => {
                 let parsed = Self::parse_chat(&bytes)?;
-                self.record_usage(parsed.prompt_tokens, parsed.completion_tokens);
                 Ok(parsed)
             }
-            429 => {
-                self.record_usage(0, 0);
-                Err(LlmError::RateLimited)
-            }
-            404 => {
-                self.record_usage(0, 0);
-                Err(LlmError::Unavailable(format!(
-                    "model {:?} not found on the endpoint",
-                    req.model
-                )))
-            }
-            code => {
-                self.record_usage(0, 0);
-                Err(LlmError::Unavailable(format!(
-                    "completion endpoint answered HTTP {code}"
-                )))
-            }
+            429 => Err(LlmError::RateLimited),
+            404 => Err(LlmError::Unavailable(format!(
+                "model {:?} not found on the endpoint",
+                req.model
+            ))),
+            code => Err(LlmError::Unavailable(format!(
+                "completion endpoint answered HTTP {code}"
+            ))),
         }
-    }
-
-    fn usage(&self) -> LlmUsage {
-        *self
-            .usage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -331,15 +291,15 @@ pub struct NoLlm;
 
 #[async_trait]
 impl Llm for NoLlm {
+    fn provider_name(&self) -> &'static str {
+        "none"
+    }
+
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let _ = req;
         Err(LlmError::Unavailable(
             "no LLM provider is wired (graph_enabled = false, §6)".to_string(),
         ))
-    }
-
-    fn usage(&self) -> LlmUsage {
-        LlmUsage::default()
     }
 }
 
@@ -404,6 +364,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LlmError::Unavailable(_)), "got {err:?}");
-        assert_eq!(NoLlm.usage(), LlmUsage::default());
+        assert_eq!(NoLlm.provider_name(), "none");
     }
 }

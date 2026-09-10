@@ -486,6 +486,24 @@ impl KnowledgeStore for LadybugStore {
         Ok(())
     }
 
+    /// Deletes the graph node first, then its entity-name vector. A retry after
+    /// a partial cross-store failure is safe because both halves are idempotent.
+    async fn delete_entity(&self, entity_id: &str) -> Result<bool, KnowledgeError> {
+        let deleted = match super::graph::delete_entity(self, entity_id)? {
+            super::graph::EntityDeleteOutcome::Deleted => true,
+            super::graph::EntityDeleteOutcome::Absent => false,
+            super::graph::EntityDeleteOutcome::Referenced => return Ok(false),
+        };
+        let conn = self.conn()?;
+        let table = self.ensure_collection(&conn, &VectorSpace::EntityNames)?;
+        conn.query(&format!(
+            "MATCH (v:{table} {{id: {}}}) DELETE v",
+            cypher_str(entity_id)
+        ))
+        .map_err(|e| backend(&e))?;
+        Ok(deleted)
+    }
+
     async fn chunks_for_entities(&self, ids: &[&str]) -> Result<Vec<String>, KnowledgeError> {
         super::graph::chunks_for_entities(self, ids)
     }

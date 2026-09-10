@@ -11,10 +11,20 @@ use rusqlite::Connection;
 const TS_FMT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// Migration files, applied in order; the filename stem is the schema version.
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial",
-    include_str!("../../migrations/0001_initial.sql"),
-)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial",
+        include_str!("../../migrations/0001_initial.sql"),
+    ),
+    (
+        "0002_llm_usage",
+        include_str!("../../migrations/0002_llm_usage.sql"),
+    ),
+    (
+        "0003_entity_gc",
+        include_str!("../../migrations/0003_entity_gc.sql"),
+    ),
+];
 
 /// Control-plane errors.
 #[derive(Debug, thiserror::Error)]
@@ -262,7 +272,10 @@ mod tests {
                 row.get(0)
             })
             .expect("schema_migrations");
-        assert_eq!(versions, 1, "exactly one migration recorded");
+        assert_eq!(
+            versions, 3,
+            "exactly one row per applied migration recorded"
+        );
         let jobs: i64 = conn
             .raw()
             .query_row(

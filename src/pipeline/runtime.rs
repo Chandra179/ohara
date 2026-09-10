@@ -11,6 +11,7 @@ use crate::BootError;
 use crate::config::Config;
 use crate::engine::{
     FetchLadder, FetchLeg, Fetcher, HttpFetcher, HttpFetcherParams, ImpersonationFetcher,
+    ObscuraFetcher,
 };
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
@@ -36,29 +37,23 @@ pub(crate) struct QueryPorts {
 
 /// Assembles the default worker adapters and validates their shared contracts.
 pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
-    let plain = Arc::new(HttpFetcher::new(HttpFetcherParams {
-        user_agent: config.fetcher().user_agent().to_string(),
-        timeout: config.fetcher().timeout(),
-        rate_limit: config.rate_limit(),
-        allow_private_hosts: config.fetcher().allow_private_hosts(),
-        max_body_bytes: config.fetcher().max_body_bytes(),
-        max_redirects: config.fetcher().max_redirects(),
-    })?);
+    let params = http_params(config);
+    let plain = Arc::new(HttpFetcher::new(params.clone())?);
     let impersonated = Arc::new(ImpersonationFetcher::new(
-        HttpFetcherParams {
-            user_agent: config.fetcher().user_agent().to_string(),
-            timeout: config.fetcher().timeout(),
-            rate_limit: config.rate_limit(),
-            allow_private_hosts: config.fetcher().allow_private_hosts(),
-            max_body_bytes: config.fetcher().max_body_bytes(),
-            max_redirects: config.fetcher().max_redirects(),
-        },
+        params.clone(),
         config.fetcher().impersonation_user_agent().to_string(),
     )?);
-    let fetcher = Arc::new(FetchLadder::new(vec![
+    let mut legs: Vec<(FetchLeg, Arc<dyn Fetcher>)> = vec![
         (FetchLeg::Plain, plain),
         (FetchLeg::Impersonate, impersonated),
-    ])?);
+    ];
+    if let Some(command) = config.fetcher().obscura_command() {
+        legs.push((
+            FetchLeg::Browser,
+            Arc::new(ObscuraFetcher::new(command.to_path_buf(), params)?),
+        ));
+    }
+    let fetcher = Arc::new(FetchLadder::new(legs)?);
     let extractor = Arc::new(ReadabilityExtractor);
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
@@ -71,6 +66,17 @@ pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
         knowledge,
         llm,
     })
+}
+
+fn http_params(config: &Config) -> HttpFetcherParams {
+    HttpFetcherParams {
+        user_agent: config.fetcher().user_agent().to_string(),
+        timeout: config.fetcher().timeout(),
+        rate_limit: config.rate_limit(),
+        allow_private_hosts: config.fetcher().allow_private_hosts(),
+        max_body_bytes: config.fetcher().max_body_bytes(),
+        max_redirects: config.fetcher().max_redirects(),
+    }
 }
 
 /// Assembles the default adapters required by the operator query path.

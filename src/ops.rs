@@ -4,6 +4,7 @@
 //! `knowledge`: it coordinates the runtime lock and artifact snapshot, while
 //! `SQLite` snapshot semantics remain owned by `control`.
 
+mod entity_gc;
 mod entity_merge;
 mod metrics;
 mod prune;
@@ -21,6 +22,7 @@ use crate::control;
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const RUNTIME_LOCK_NAME: &str = ".ohara.lock";
 
+pub use entity_gc::{EntityGcReport, collect_entity_garbage};
 #[cfg(all(feature = "ladybug", test))]
 pub(super) use entity_merge::execute_entity_merges;
 pub use entity_merge::merge_entities;
@@ -51,7 +53,7 @@ pub enum OpsError {
     /// The knowledge plane could not complete an operator mutation.
     #[error("knowledge store: {0}")]
     Knowledge(#[from] crate::knowledge::KnowledgeError),
-    /// Entity merge requires the embedded `LadybugDB` implementation.
+    /// Entity maintenance requires the embedded `LadybugDB` implementation.
     #[error("entity merge requires the `ladybug` feature")]
     KnowledgeFeatureDisabled,
     /// The requested document is not registered in the control plane.
@@ -422,6 +424,8 @@ mod tests {
 
     #[cfg(feature = "ladybug")]
     use super::execute_entity_merges;
+    #[cfg(feature = "ladybug")]
+    use super::{EntityGcReport, collect_entity_garbage};
     use super::{OpsError, RuntimeLock, archive, backup, delete_document, prune, requeue};
     use crate::config::Config;
     use crate::control::{self, NewDocument, Stage};
@@ -747,5 +751,59 @@ mod tests {
                     .is_empty()
             );
         });
+    }
+
+    #[cfg(feature = "ladybug")]
+    #[test]
+    fn entity_gc_waits_for_zero_mentions_and_removes_both_registries() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).expect("data directory");
+        let config_path = dir.path().join("ohara.toml");
+        fs::write(
+            &config_path,
+            format!("data_dir = {data:?}\n[er]\nentity_gc_grace_days = 0\n"),
+        )
+        .expect("config file");
+        let config = Config::load(Some(&config_path)).expect("valid config");
+
+        let db = control::connect(config.db_path()).expect("control store");
+        control::ensure_entity(&db, "unused", "Unused", "CONCEPT", None).expect("entity row");
+        drop(db);
+
+        let store = LadybugStore::open(&data.join("ladybug"), config.embedder().dim())
+            .expect("knowledge store");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            store
+                .upsert_entity(&EntityRecord {
+                    entity_id: "unused".to_string(),
+                    canonical_name: "Unused".to_string(),
+                    entity_type: EntityType::Concept,
+                    subtype: None,
+                })
+                .await
+                .expect("entity node");
+        });
+        drop(store);
+
+        let report = runtime
+            .block_on(collect_entity_garbage(&config))
+            .expect("GC sweep");
+        assert_eq!(
+            report,
+            EntityGcReport {
+                entities_examined: 1,
+                candidates_recorded: 1,
+                candidates_cancelled: 0,
+                entities_deleted: 1,
+            }
+        );
+        let db = control::connect(config.db_path()).expect("control store");
+        assert!(
+            control::entity_details(&db, "unused")
+                .expect("entity lookup")
+                .is_none()
+        );
     }
 }

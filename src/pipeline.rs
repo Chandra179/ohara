@@ -14,6 +14,7 @@ mod retrieve;
 mod runtime;
 mod scrape;
 mod synthesis;
+mod usage;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -24,9 +25,6 @@ use crate::engine::Fetcher;
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
 
-pub use crate::engine::HttpFetcher;
-#[cfg(feature = "ladybug")]
-pub use crate::knowledge::LadybugStore;
 pub use chunk::{Chunk, chunk_document};
 pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, ReadabilityExtractor};
 #[cfg(feature = "onnx-embedder")]
@@ -676,6 +674,37 @@ pub(crate) mod test_support {
                 .unwrap()
                 .retain(|(chunk, _)| !deleted_chunks.contains(chunk));
             Ok(())
+        }
+
+        async fn delete_entity(&self, entity_id: &str) -> Result<bool, KnowledgeError> {
+            if !self.entities.lock().unwrap().contains_key(entity_id) {
+                self.vectors
+                    .lock()
+                    .unwrap()
+                    .remove(&key(&VectorSpace::EntityNames, entity_id));
+                return Ok(false);
+            }
+            let has_mention = self
+                .mentions
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, id)| id == entity_id);
+            let has_fact = self
+                .facts
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|(subject, _, object)| subject == entity_id || object == entity_id);
+            if has_mention || has_fact {
+                return Ok(false);
+            }
+            self.entities.lock().unwrap().remove(entity_id);
+            self.vectors
+                .lock()
+                .unwrap()
+                .remove(&key(&VectorSpace::EntityNames, entity_id));
+            Ok(true)
         }
 
         async fn chunks_for_entities(&self, ids: &[&str]) -> Result<Vec<String>, KnowledgeError> {

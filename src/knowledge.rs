@@ -369,6 +369,15 @@ pub trait KnowledgeStore: Send + Sync {
     /// [`KnowledgeError`] per its taxonomy.
     async fn delete_doc(&self, doc_id: &str) -> Result<(), KnowledgeError>;
 
+    /// Deletes an unreferenced entity node and its `EntityNames` vector. The
+    /// operation is idempotent; it returns `false` when the entity is absent or
+    /// still has graph relationships, so a stale GC candidate cannot remove live
+    /// context.
+    ///
+    /// # Errors
+    /// [`KnowledgeError`] when the knowledge-plane operation fails.
+    async fn delete_entity(&self, entity_id: &str) -> Result<bool, KnowledgeError>;
+
     /// Chunk ids connected to any of `ids` via `:MENTIONS` (the Stage 5 graph path).
     ///
     /// # Errors

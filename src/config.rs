@@ -54,6 +54,8 @@ pub(crate) mod defaults {
     pub const ER_MAX_EVIDENCE: usize = 8;
     /// §8 Stage 4: `occurred_on` values kept per fact edge.
     pub const ER_MAX_OCCURRENCES: usize = 8;
+    /// §8 Stage 4: zero-mention entity grace period before collection.
+    pub const ER_ENTITY_GC_GRACE_DAYS: u64 = 30;
     /// §8 Stage 5.2: `EntityNames` embedding-similarity floor for query
     /// entities — same conservative posture as ER's floor.
     pub const RETRIEVAL_ENTITY_THRESHOLD: f64 = 0.75;
@@ -99,6 +101,10 @@ pub(crate) mod defaults {
     pub const RETRIEVAL_SYNTHESIS_MAX_TOKENS: u32 = 512;
     /// Ollama liveness probe timeout (§2 boot gate).
     pub const LLM_HEALTH_TIMEOUT_SECS: u64 = 10;
+    /// Input pricing in millionths of a US dollar per million tokens.
+    pub const LLM_INPUT_COST_MICROS_PER_MILLION_TOKENS: u64 = 0;
+    /// Output pricing in millionths of a US dollar per million tokens.
+    pub const LLM_OUTPUT_COST_MICROS_PER_MILLION_TOKENS: u64 = 0;
     /// Honest User-Agent (§8): identifies the crawler and its owner.
     pub const USER_AGENT: &str = concat!(
         "ohara/",
@@ -209,6 +215,8 @@ pub struct FetcherConfig {
     max_redirects: usize,
     /// Maximum site-configured re-crawl interval.
     max_recrawl_seconds: u64,
+    /// Optional executable for the JS-rendering and stealth ladder leg.
+    obscura_command: Option<PathBuf>,
 }
 
 /// LLM endpoint and pinned models (§2, §11.2, §12).
@@ -220,6 +228,8 @@ pub struct LlmConfig {
     fallback_model: Option<String>,
     cloud_llm_enabled: bool,
     health_timeout: Duration,
+    input_cost_micros_per_million_tokens: u64,
+    output_cost_micros_per_million_tokens: u64,
 }
 
 /// Entity-resolution thresholds and fact-edge caps (§8 Stage 4). The thresholds
@@ -231,6 +241,7 @@ pub struct ErConfig {
     embedding_sim_threshold: f64,
     max_evidence: usize,
     max_occurrences: usize,
+    entity_gc_grace: Duration,
 }
 
 /// Stage 5 retrieval knobs (§8 Stage 5): the graph path's candidate bounds and
@@ -288,6 +299,7 @@ struct RawFetcher {
     max_body_bytes: Option<usize>,
     max_redirects: Option<usize>,
     max_recrawl_seconds: Option<u64>,
+    obscura_command: Option<String>,
 }
 
 fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
@@ -315,6 +327,9 @@ fn build_fetcher(raw: Option<&RawFetcher>) -> FetcherConfig {
         max_recrawl_seconds: raw
             .and_then(|f| f.max_recrawl_seconds)
             .unwrap_or(defaults::MAX_RECRAWL_SECONDS),
+        obscura_command: raw
+            .and_then(|f| f.obscura_command.as_deref())
+            .map(PathBuf::from),
     }
 }
 
@@ -365,6 +380,8 @@ struct RawLlm {
     fallback_model: Option<String>,
     cloud_llm_enabled: Option<bool>,
     health_timeout_secs: Option<u64>,
+    input_cost_micros_per_million_tokens: Option<u64>,
+    output_cost_micros_per_million_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -374,6 +391,7 @@ struct RawEr {
     embedding_similarity_threshold: Option<f64>,
     max_evidence: Option<usize>,
     max_occurrences: Option<usize>,
+    entity_gc_grace_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -402,6 +420,11 @@ fn build_er(raw: Option<&RawEr>) -> ErConfig {
             .unwrap_or(defaults::ER_EMBEDDING_SIMILARITY),
         max_evidence: raw.max_evidence.unwrap_or(defaults::ER_MAX_EVIDENCE),
         max_occurrences: raw.max_occurrences.unwrap_or(defaults::ER_MAX_OCCURRENCES),
+        entity_gc_grace: Duration::from_secs(
+            raw.entity_gc_grace_days
+                .unwrap_or(defaults::ER_ENTITY_GC_GRACE_DAYS)
+                .saturating_mul(24 * 60 * 60),
+        ),
     }
 }
 
@@ -504,6 +527,12 @@ fn build_llm(raw: Option<&RawLlm>) -> Result<LlmConfig, ConfigError> {
             raw.health_timeout_secs
                 .unwrap_or(defaults::LLM_HEALTH_TIMEOUT_SECS),
         ),
+        input_cost_micros_per_million_tokens: raw
+            .input_cost_micros_per_million_tokens
+            .unwrap_or(defaults::LLM_INPUT_COST_MICROS_PER_MILLION_TOKENS),
+        output_cost_micros_per_million_tokens: raw
+            .output_cost_micros_per_million_tokens
+            .unwrap_or(defaults::LLM_OUTPUT_COST_MICROS_PER_MILLION_TOKENS),
     })
 }
 
@@ -831,7 +860,14 @@ impl FetcherConfig {
         check(
             !self.impersonation_user_agent.is_empty(),
             "fetcher.impersonation_user_agent must be non-empty",
-        )
+        )?;
+        if let Some(command) = &self.obscura_command {
+            check(
+                !command.as_os_str().is_empty(),
+                "fetcher.obscura_command must be non-empty",
+            )?;
+        }
+        Ok(())
     }
 
     /// Whether `robots.txt` is honored (§8, default on).
@@ -880,6 +916,12 @@ impl FetcherConfig {
     #[must_use]
     pub fn max_recrawl_seconds(&self) -> u64 {
         self.max_recrawl_seconds
+    }
+
+    /// Optional Obscura executable used for JavaScript rendering and stealth.
+    #[must_use]
+    pub fn obscura_command(&self) -> Option<&Path> {
+        self.obscura_command.as_deref()
     }
 }
 
@@ -988,6 +1030,18 @@ impl LlmConfig {
     pub fn health_timeout(&self) -> Duration {
         self.health_timeout
     }
+
+    /// Input price in millionths of a US dollar per million tokens.
+    #[must_use]
+    pub fn input_cost_micros_per_million_tokens(&self) -> u64 {
+        self.input_cost_micros_per_million_tokens
+    }
+
+    /// Output price in millionths of a US dollar per million tokens.
+    #[must_use]
+    pub fn output_cost_micros_per_million_tokens(&self) -> u64 {
+        self.output_cost_micros_per_million_tokens
+    }
 }
 
 impl ErConfig {
@@ -1028,6 +1082,12 @@ impl ErConfig {
     #[must_use]
     pub fn max_occurrences(&self) -> usize {
         self.max_occurrences
+    }
+
+    /// Time an entity must remain without mentions before collection (§8 Stage 4).
+    #[must_use]
+    pub fn entity_gc_grace(&self) -> Duration {
+        self.entity_gc_grace
     }
 }
 
@@ -1185,12 +1245,13 @@ mod tests {
             config.fetcher().max_recrawl_seconds(),
             defaults::MAX_RECRAWL_SECONDS
         );
+        assert_eq!(config.fetcher().obscura_command(), None);
     }
 
     #[test]
     fn fetcher_overrides_apply() {
         let config = Config::load_from_str(
-            "[fetcher]\nrobots = false\ntimeout_secs = 5\nimpersonation_user_agent = \"browser-test\"\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\nmax_recrawl_seconds = 7200\n",
+            "[fetcher]\nrobots = false\ntimeout_secs = 5\nimpersonation_user_agent = \"browser-test\"\nallow_private_hosts = true\nmax_body_bytes = 2048\nmax_redirects = 2\nmax_recrawl_seconds = 7200\nobscura_command = \"/usr/local/bin/obscura\"\n",
         )
         .expect("valid config");
         assert!(!config.fetcher().robots());
@@ -1200,6 +1261,10 @@ mod tests {
         assert_eq!(config.fetcher().max_body_bytes(), 2048);
         assert_eq!(config.fetcher().max_redirects(), 2);
         assert_eq!(config.fetcher().max_recrawl_seconds(), 7200);
+        assert_eq!(
+            config.fetcher().obscura_command(),
+            Some(Path::new("/usr/local/bin/obscura"))
+        );
     }
 
     #[test]
@@ -1269,15 +1334,17 @@ mod tests {
         assert_eq!(config.er().embedding_sim_threshold(), 0.75);
         assert_eq!(config.er().max_evidence(), 8);
         assert_eq!(config.er().max_occurrences(), 8);
+        assert_eq!(config.er().entity_gc_grace(), Duration::from_hours(30 * 24));
 
         let config = Config::load_from_str(
-            "[er]\nname_similarity_threshold = 0.9\nembedding_similarity_threshold = 0.8\nmax_evidence = 3\nmax_occurrences = 2\n",
+            "[er]\nname_similarity_threshold = 0.9\nembedding_similarity_threshold = 0.8\nmax_evidence = 3\nmax_occurrences = 2\nentity_gc_grace_days = 0\n",
         )
         .expect("valid");
         assert_eq!(config.er().name_sim_threshold(), 0.9);
         assert_eq!(config.er().embedding_sim_threshold(), 0.8);
         assert_eq!(config.er().max_evidence(), 3);
         assert_eq!(config.er().max_occurrences(), 2);
+        assert_eq!(config.er().entity_gc_grace(), Duration::ZERO);
     }
 
     #[test]

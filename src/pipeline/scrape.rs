@@ -108,7 +108,7 @@ pub(super) fn run(ctx: &ScrapeContext<'_>, job: &ClaimedJob) -> Result<StageOutc
 }
 
 /// Translates the control-plane site hint into the engine-plane ladder value.
-/// The engine never imports SQLite types; this is the pipeline boundary where
+/// The engine never imports `SQLite` types; this is the pipeline boundary where
 /// the two planes exchange a small domain value.
 fn fetch_leg(hint: LadderHint) -> FetchLeg {
     match hint {

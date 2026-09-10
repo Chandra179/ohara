@@ -13,6 +13,7 @@ use std::time::Duration;
 pub use http::{HttpFetcher, HttpFetcherParams};
 pub use impersonate::ImpersonationFetcher;
 pub use ladder::FetchLadder;
+pub use obscura::ObscuraFetcher;
 
 use async_trait::async_trait;
 
@@ -161,7 +162,7 @@ pub enum UrlError {
 
 /// A fetch-ladder leg (§8 Stage 1). The value is engine-neutral so the pipeline
 /// can translate a control-plane site hint without making the engine depend on
-/// SQLite.
+/// `SQLite`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FetchLeg {
     /// Plain HTTP: fast and cheap, but no JavaScript or stealth support.

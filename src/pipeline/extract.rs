@@ -21,6 +21,7 @@ use super::execution::ExtractContext;
 use super::extraction_contract::{
     self, ValidTriplet, extraction_prompt, parse_triplets, triplets_schema,
 };
+use super::usage::{CompletionContext, UsageError};
 
 fn attempt_of(job: &ClaimedJob) -> u32 {
     u32::try_from(job.attempts().saturating_add(1)).unwrap_or(u32::MAX)
@@ -114,22 +115,33 @@ fn extract_chunk(
         temperature: 0.0,
         json_schema: Some(triplets_schema()),
     };
-    let response = match ctx.handle.block_on(ctx.llm.complete(request)) {
+    let response = match ctx.handle.block_on(super::usage::complete(
+        ctx.config,
+        ctx.conn,
+        ctx.llm,
+        request,
+        CompletionContext {
+            operation: "extract",
+            doc_id: Some(job.doc_id()),
+            job_id: Some(job.job_id()),
+        },
+    )) {
         Ok(response) => response,
-        Err(LlmError::InvalidResponse(detail)) => {
+        Err(UsageError::Provider(LlmError::InvalidResponse(detail))) => {
             // §8: a malformed response skips the chunk (temperature-0
             // regeneration would reproduce it); the run continues — the chunk
             // stays uncovered and is retried on the next execution.
             record_skip(ctx, job, &format!("chunk {}: {detail}", chunk.chunk_id));
             return Ok(());
         }
-        Err(other) => {
+        Err(UsageError::Provider(other)) => {
             return Err(StageError::transient(
                 std::io::Error::other(other.to_string()),
                 other.class(),
                 attempt,
             ));
         }
+        Err(UsageError::Ledger(error)) => return Err(StageError::fatal(error)),
     };
     let parsed = match parse_triplets(
         &response.text,
@@ -466,7 +478,7 @@ mod tests {
     use crate::control::testing::seed_doc;
     use crate::control::{self, ClaimedJob, ControlDb, NewChunkRow, Stage};
     use crate::knowledge::{KnowledgeStore, VectorSpace};
-    use crate::llm::{CompletionResponse, LlmUsage};
+    use crate::llm::CompletionResponse;
     use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
     use crate::text::sha256_hex;
 
@@ -494,6 +506,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::llm::Llm for FakeLlm {
+        fn provider_name(&self) -> &'static str {
+            "fake"
+        }
+
         async fn complete(
             &self,
             _req: crate::llm::CompletionRequest,
@@ -517,10 +533,6 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
             })
-        }
-
-        fn usage(&self) -> LlmUsage {
-            LlmUsage::default()
         }
     }
 

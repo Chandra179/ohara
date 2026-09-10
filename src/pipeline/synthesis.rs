@@ -14,6 +14,7 @@ use crate::llm::{CompletionRequest, Llm};
 
 use super::ScoredChunk;
 use super::retrieve::RetrievedContext;
+use super::usage::{CompletionContext, UsageError};
 
 /// The operator query response. When synthesis is unavailable or invalid,
 /// `answer` is `None` and the immutable ranked chunk sources remain available.
@@ -27,10 +28,9 @@ pub struct QueryResponse {
     pub chunks: Vec<ScoredChunk>,
 }
 
-/// Attempts one bounded synthesis call. Provider failures are values at this
-/// interactive boundary and return ranked sources unchanged; control-plane
-/// metadata failures still propagate because the prompt cannot be rendered
-/// safely without them.
+/// Attempts bounded synthesis with the configured primary model and optional
+/// quality-fallback model. Provider failures and invalid grounding are values at
+/// this interactive boundary; control-plane metadata failures still propagate.
 pub(crate) async fn run(
     config: &Config,
     conn: &ControlDb,
@@ -53,26 +53,80 @@ pub(crate) async fn run(
         &context,
         config.retrieval().synthesis_context_chars(),
     )?;
-    let Ok(response) = llm
-        .complete(CompletionRequest {
-            model: config.llm().synthesis_model().to_string(),
-            prompt,
+    let primary_model = config.llm().synthesis_model();
+    let attempt = CompletionContext {
+        operation: "synthesis",
+        doc_id: None,
+        job_id: None,
+    };
+    let primary = complete_attempt(
+        config,
+        conn,
+        llm,
+        CompletionRequest {
+            model: primary_model.to_string(),
+            prompt: prompt.clone(),
             max_tokens: Some(config.retrieval().synthesis_max_tokens()),
             temperature: 0.0,
             json_schema: Some(schema()),
-        })
-        .await
-    else {
-        return Ok(fallback());
-    };
-    let Some((answer, citations)) = parse(&response.text, &allowed_citations) else {
-        return Ok(fallback());
-    };
-    Ok(QueryResponse {
-        answer: Some(answer),
-        citations,
-        chunks: context.chunks,
-    })
+        },
+        attempt,
+    )
+    .await?;
+    if let Some(response) = primary
+        && let Some((answer, citations)) = parse(&response.text, &allowed_citations)
+    {
+        return Ok(QueryResponse {
+            answer: Some(answer),
+            citations,
+            chunks: context.chunks,
+        });
+    }
+
+    let fallback_model = config
+        .llm()
+        .fallback_model()
+        .filter(|model| *model != primary_model);
+    if let Some(fallback_model) = fallback_model {
+        let fallback_response = complete_attempt(
+            config,
+            conn,
+            llm,
+            CompletionRequest {
+                model: fallback_model.to_string(),
+                prompt,
+                max_tokens: Some(config.retrieval().synthesis_max_tokens()),
+                temperature: 0.0,
+                json_schema: Some(schema()),
+            },
+            attempt,
+        )
+        .await?;
+        if let Some(response) = fallback_response
+            && let Some((answer, citations)) = parse(&response.text, &allowed_citations)
+        {
+            return Ok(QueryResponse {
+                answer: Some(answer),
+                citations,
+                chunks: context.chunks,
+            });
+        }
+    }
+    Ok(fallback())
+}
+
+async fn complete_attempt(
+    config: &Config,
+    conn: &ControlDb,
+    llm: &dyn Llm,
+    request: CompletionRequest,
+    context: CompletionContext<'_>,
+) -> Result<Option<crate::llm::CompletionResponse>, DbError> {
+    match super::usage::complete(config, conn, llm, request, context).await {
+        Ok(response) => Ok(Some(response)),
+        Err(UsageError::Provider(_)) => Ok(None),
+        Err(UsageError::Ledger(error)) => Err(error),
+    }
 }
 
 fn render_prompt(
@@ -211,7 +265,7 @@ mod tests {
     use super::{QueryResponse, RetrievedContext, ScoredChunk, parse, run};
     use crate::config::Config;
     use crate::control;
-    use crate::llm::{CompletionRequest, CompletionResponse, Llm, LlmError, LlmUsage};
+    use crate::llm::{CompletionRequest, CompletionResponse, Llm, LlmError};
     use std::collections::HashSet;
 
     struct RecordingLlm {
@@ -221,6 +275,10 @@ mod tests {
 
     #[async_trait]
     impl Llm for RecordingLlm {
+        fn provider_name(&self) -> &'static str {
+            "recording"
+        }
+
         async fn complete(
             &self,
             request: CompletionRequest,
@@ -232,9 +290,30 @@ mod tests {
                 completion_tokens: 0,
             })
         }
+    }
 
-        fn usage(&self) -> LlmUsage {
-            LlmUsage::default()
+    struct FallbackLlm;
+
+    #[async_trait]
+    impl Llm for FallbackLlm {
+        fn provider_name(&self) -> &'static str {
+            "fallback-test"
+        }
+
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let text = if request.model == "fallback-model" {
+                r#"{"answer":"fallback answer","citations":["chunk-a"]}"#
+            } else {
+                r#"{"answer":"bad answer","citations":["not-a-source"]}"#
+            };
+            Ok(CompletionResponse {
+                text: text.to_string(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+            })
         }
     }
 
@@ -332,5 +411,32 @@ mod tests {
 
         assert_eq!(response.answer, None);
         assert!(llm.request.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_primary_output_uses_the_configured_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ohara.toml");
+        std::fs::write(&path, "[llm]\nfallback_model = \"fallback-model\"\n").unwrap();
+        let config = Config::load(Some(&path)).unwrap();
+        let conn = control::testing::boot();
+
+        let response = run(
+            &config,
+            &conn,
+            &FallbackLlm,
+            "How does SQLite write?",
+            context(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.answer.as_deref(), Some("fallback answer"));
+        assert_eq!(response.citations, ["chunk-a"]);
+        let calls: i64 = conn
+            .raw()
+            .query_row("SELECT count(*) FROM llm_usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(calls, 2);
     }
 }

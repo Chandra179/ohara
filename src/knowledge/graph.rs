@@ -228,6 +228,54 @@ fn entity_exists(conn: &lbug::Connection<'_>, entity_id: &str) -> Result<bool, K
     Ok(count > 0)
 }
 
+/// Deletes an entity graph node only when it has no incoming or outgoing
+/// relationship. Vector cleanup is owned by `vectors`, keeping this module's
+/// responsibility limited to graph state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EntityDeleteOutcome {
+    /// The graph node can be removed.
+    Deleted,
+    /// No graph node exists; the vector half may still be cleaned up.
+    Absent,
+    /// A mention or fact relationship remains, so the entity is retained.
+    Referenced,
+}
+
+pub(super) fn delete_entity(
+    store: &LadybugStore,
+    entity_id: &str,
+) -> Result<EntityDeleteOutcome, KnowledgeError> {
+    let conn = store.conn()?;
+    if !entity_exists(&conn, entity_id)? {
+        return Ok(EntityDeleteOutcome::Absent);
+    }
+    let outgoing = conn
+        .query(&format!(
+            "MATCH (e:Entity {{entity_id: {}}})-[r]->() RETURN count(r)",
+            cypher_str(entity_id)
+        ))
+        .map_err(|e| backend(&e))?
+        .next()
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
+    let incoming = conn
+        .query(&format!(
+            "MATCH ()-[r]->(e:Entity {{entity_id: {}}}) RETURN count(r)",
+            cypher_str(entity_id)
+        ))
+        .map_err(|e| backend(&e))?
+        .next()
+        .map_or(Ok(0), |row| int_at(&row, 0))?;
+    if outgoing > 0 || incoming > 0 {
+        return Ok(EntityDeleteOutcome::Referenced);
+    }
+    conn.query(&format!(
+        "MATCH (e:Entity {{entity_id: {}}}) DETACH DELETE e",
+        cypher_str(entity_id)
+    ))
+    .map_err(|e| backend(&e))?;
+    Ok(EntityDeleteOutcome::Deleted)
+}
+
 fn read_mentions(
     conn: &lbug::Connection<'_>,
     loser: &str,

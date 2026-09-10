@@ -11,7 +11,7 @@
 | API shape & naming | [API Guidelines](https://rust-lang.github.io/api-guidelines/checklist.html) | code review, this guide's checklist |
 | Module tree, visibility | Rust Book ch07, ARCHITECTURE Appendix A | compiler + review |
 | Errors, panics | Rust Book ch09, ARCHITECTURE §10 | compiler + contract tests |
-| Design decisions | ARCHITECTURE.md (v2.10) | — |
+| Design decisions | ARCHITECTURE.md (v2.13) | — |
 
 ---
 
@@ -46,7 +46,7 @@
 - **C-GETTER:** getters drop the `get_` prefix — `model_id()`, `capabilities()`, `class()` (§9 ports), not `get_model_id()`.
 - **C-ITER / C-ITER-TY:** collection-producing-iterator methods are `iter`, `iter_mut`, `into_iter`; the iterator types they return are named after the method.
 - **C-WORD-ORDER:** consistent error/enum naming — `FetchError`, `KnowledgeError`, `StageError` (noun + `Error`); predicate methods `is_*`/`has_*` (C-PRED); constructors are static inherent methods named `new` (C-CTOR) — `NormalizedUrl::new(raw, final_url) -> Result<Self, …>`.
-- **C-FEATURE:** cargo feature names describe content, never placeholders: `ladybug`, `onnx-embedder`, and the future `obscura` feature — never `extra`, `new`, `full`.
+- **C-FEATURE:** cargo feature names describe content, never placeholders: `ladybug` and `onnx-embedder` are the current heavy-stack gates. Obscura is a runtime-configured executable adapter, not a Cargo feature until it owns a native dependency — never use `extra`, `new`, or `full`.
 
 ## 3. API design
 

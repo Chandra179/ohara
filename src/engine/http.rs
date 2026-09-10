@@ -261,7 +261,8 @@ impl HttpFetcher {
         let mut first_hop = validators;
         for _ in 0..=self.max_redirects {
             let response = self.request_once(&current, first_hop, policy).await?;
-            if !response.status().is_redirection() {
+            if response.status() == StatusCode::NOT_MODIFIED || !response.status().is_redirection()
+            {
                 return Ok((response, current));
             }
             first_hop = None;
@@ -446,12 +447,37 @@ fn plain_headers() -> HeaderMap {
 
 /// §12: only globally-routable addresses are fetchable. `is_global` covers
 /// loopback, RFC 1918, link-local, unique-local, documentation, and shared ranges.
-fn is_fetchable_ip(ip: IpAddr) -> bool {
+pub(super) fn is_fetchable_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_global_v4(v4),
         // IPv4-mapped (::ffff:0:0/96) and deprecated IPv4-compatible addresses
         // inherit their embedded IPv4 classification.
         IpAddr::V6(v6) => v6.to_ipv4().map_or_else(|| is_global_v6(v6), is_global_v4),
+    }
+}
+
+/// Resolves and validates an absolute target before handing it to a provider.
+/// Built-in HTTP requests additionally pin these addresses in
+/// `ValidatingResolver`; external providers receive this same boundary check.
+pub(super) async fn validate_target(
+    url: &NormalizedUrl,
+    allow_private_hosts: bool,
+) -> Result<(), FetchError> {
+    if allow_private_hosts {
+        return Ok(());
+    }
+    let host = url.host_str();
+    let port = url.as_url().port_or_known_default().unwrap_or(80);
+    let has_global_address = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| FetchError::Protocol(format!("cannot resolve {url}: {error}")))?
+        .any(|address| is_fetchable_ip(address.ip()));
+    if has_global_address {
+        Ok(())
+    } else {
+        Err(FetchError::Protocol(format!(
+            "no fetchable (global) address for {url} — §12 SSRF guard"
+        )))
     }
 }
 
@@ -525,7 +551,7 @@ fn map_request_error(error: &reqwest::Error, timeout_secs: u64) -> FetchError {
 
 /// Whether the payload is something the cleaning stage can consume. An absent
 /// Content-Type is tolerated (labeled anyway); binaries are a protocol violation.
-fn is_fetchable_content(content_type: Option<&str>) -> bool {
+pub(super) fn is_fetchable_content(content_type: Option<&str>) -> bool {
     match content_type {
         None => true,
         Some(ct) => {

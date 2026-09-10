@@ -16,8 +16,10 @@ pub use documents::{
     ChunkSignature, ChunkText, CleanResult, DeletionIntent, Document, EnqueueOutcome, NewChunkRow,
     NewDocument, RawRetentionCandidate,
 };
-pub use entities::{EntityDetails, EntityMerge, ErReview, NameCandidate, NewTriplet, TripletRow};
-pub use metrics::MetricsSnapshot;
+pub use entities::{
+    EntityDetails, EntityGcCandidate, EntityMerge, ErReview, NameCandidate, NewTriplet, TripletRow,
+};
+pub use metrics::{LlmUsageEvent, LlmUsageOutcome, LlmUsageSnapshot, MetricsSnapshot};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
 pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
@@ -107,6 +109,14 @@ pub fn due_for_recrawl(db: &ControlDb, now_stamp: &str) -> Result<Vec<String>, D
 /// Returns [`DbError`] when an aggregate query fails.
 pub fn metrics(db: &ControlDb, now_stamp: &str) -> Result<MetricsSnapshot, DbError> {
     metrics::snapshot(db.raw(), now_stamp)
+}
+
+/// Appends one LLM completion attempt to the durable usage ledger.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn record_llm_usage(db: &ControlDb, event: &LlmUsageEvent<'_>) -> Result<(), DbError> {
+    metrics::record_llm_usage(db.raw(), event)
 }
 
 /// Re-queues due SCRAPE jobs while preserving live work.
@@ -322,6 +332,53 @@ pub fn ensure_entity(
 /// Returns [`DbError`] if the control-plane query fails.
 pub fn entity_type_of(db: &ControlDb, entity_id: &str) -> Result<Option<String>, DbError> {
     entities::entity_type_of(db.raw(), entity_id)
+}
+
+/// Lists unmerged entities that may be checked for zero mentions.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn entity_ids_for_gc(db: &ControlDb) -> Result<Vec<String>, DbError> {
+    entities::entity_ids_for_gc(db.raw())
+}
+
+/// Records the first zero-mention observation for an entity.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn record_entity_gc_candidate(
+    db: &ControlDb,
+    entity_id: &str,
+    zero_since: &str,
+) -> Result<bool, DbError> {
+    entities::record_entity_gc_candidate(db.raw(), entity_id, zero_since)
+}
+
+/// Removes an entity's GC candidate after a mention reappears.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane write fails.
+pub fn cancel_entity_gc_candidate(db: &ControlDb, entity_id: &str) -> Result<bool, DbError> {
+    entities::cancel_entity_gc_candidate(db.raw(), entity_id)
+}
+
+/// Reads zero-mention candidates old enough for collection.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn due_entity_gc_candidates(
+    db: &ControlDb,
+    cutoff_stamp: &str,
+) -> Result<Vec<EntityGcCandidate>, DbError> {
+    entities::due_entity_gc_candidates(db.raw(), cutoff_stamp)
+}
+
+/// Removes the control-plane half of an entity collection operation.
+///
+/// # Errors
+/// Returns [`DbError`] if the transaction fails.
+pub fn execute_entity_gc(db: &ControlDb, entity_id: &str) -> Result<bool, DbError> {
+    entities::execute_entity_gc(db.raw(), entity_id)
 }
 
 /// Reads an entity's canonical name.
@@ -602,6 +659,13 @@ pub fn set_site_policy(
 }
 
 pub(crate) use db::{now, now_plus};
+
+/// Computes a timestamp before `now` using the control plane's canonical format.
+#[cfg(feature = "ladybug")]
+pub(crate) fn before(now_stamp: &str, duration: std::time::Duration) -> Result<String, DbError> {
+    let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX / 2);
+    db::shift(now_stamp, -seconds)
+}
 pub(crate) use entities::new_entity_id;
 
 /// Shared in-crate fixtures for the control-plane unit tests (§10: tests unwrap

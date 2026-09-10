@@ -1,4 +1,4 @@
-//! Durable control-plane metrics derived from SQLite state and audit rows (§13).
+//! Durable control-plane metrics derived from `SQLite` state and audit rows (§13).
 //!
 //! This module deliberately returns domain data rather than exposing SQL rows.
 //! Filesystem usage and operator presentation remain outside the control plane.
@@ -9,6 +9,49 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use super::db::DbError;
+
+/// Outcome recorded for one LLM completion attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmUsageOutcome {
+    /// The provider returned a completion.
+    Succeeded,
+    /// The provider call failed or returned an invalid response.
+    Failed,
+}
+
+impl LlmUsageOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// One immutable LLM completion-attempt record.
+#[derive(Debug, Clone, Copy)]
+pub struct LlmUsageEvent<'a> {
+    /// Operation that initiated the call, such as extract or synthesis.
+    pub operation: &'a str,
+    /// Document associated with extraction, if any.
+    pub doc_id: Option<&'a str>,
+    /// Job associated with extraction, if any.
+    pub job_id: Option<&'a str>,
+    /// Provider name declared by the LLM Adapter.
+    pub provider: &'a str,
+    /// Model requested for this attempt.
+    pub model: &'a str,
+    /// Provider outcome.
+    pub outcome: LlmUsageOutcome,
+    /// Prompt tokens reported by the provider.
+    pub prompt_tokens: u64,
+    /// Completion tokens reported by the provider.
+    pub completion_tokens: u64,
+    /// Estimated cost in millionths of a US dollar.
+    pub estimated_cost_micros: u64,
+    /// Provider error, when the attempt failed.
+    pub error: Option<&'a str>,
+}
 
 /// A consistent read of the control-plane metrics used by the operator view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -27,9 +70,28 @@ pub struct MetricsSnapshot {
     pub pending_er_reviews: u64,
     /// Number of documents currently eligible for a conditional re-crawl.
     pub due_for_recrawl: u64,
+    /// Durable LLM completion-attempt usage.
+    pub llm_usage: LlmUsageSnapshot,
 }
 
-/// Reads a metrics snapshot without leaking the SQLite connection to callers.
+/// Aggregated durable LLM usage for the operator view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LlmUsageSnapshot {
+    /// Number of recorded attempts.
+    pub calls: u64,
+    /// Number of successful attempts.
+    pub successful_calls: u64,
+    /// Number of failed attempts.
+    pub failed_calls: u64,
+    /// Total prompt tokens reported by providers.
+    pub prompt_tokens: u64,
+    /// Total completion tokens reported by providers.
+    pub completion_tokens: u64,
+    /// Estimated cost in millionths of a US dollar.
+    pub estimated_cost_micros: u64,
+}
+
+/// Reads a metrics snapshot without leaking the `SQLite` connection to callers.
 ///
 /// # Errors
 /// [`DbError::Sqlite`] if an aggregate query or row decode fails.
@@ -60,6 +122,7 @@ pub fn snapshot(conn: &Connection, now_stamp: &str) -> Result<MetricsSnapshot, D
             AND status NOT IN ('FAILED_QUALITY', 'FAILED', 'ARCHIVED')",
         now_stamp,
     )?;
+    let llm_usage = usage_snapshot(conn)?;
 
     Ok(MetricsSnapshot {
         captured_at: now_stamp.to_string(),
@@ -69,7 +132,56 @@ pub fn snapshot(conn: &Connection, now_stamp: &str) -> Result<MetricsSnapshot, D
         events_by_stage,
         pending_er_reviews,
         due_for_recrawl,
+        llm_usage,
     })
+}
+
+/// Appends one completion attempt to the durable usage ledger.
+pub fn record_llm_usage(conn: &Connection, event: &LlmUsageEvent<'_>) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT INTO llm_usage
+            (operation, doc_id, job_id, provider, model, outcome,
+             prompt_tokens, completion_tokens, estimated_cost_micros, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            event.operation,
+            event.doc_id,
+            event.job_id,
+            event.provider,
+            event.model,
+            event.outcome.as_str(),
+            i64::try_from(event.prompt_tokens).unwrap_or(i64::MAX),
+            i64::try_from(event.completion_tokens).unwrap_or(i64::MAX),
+            i64::try_from(event.estimated_cost_micros).unwrap_or(i64::MAX),
+            event.error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn usage_snapshot(conn: &Connection) -> Result<LlmUsageSnapshot, DbError> {
+    conn.query_row(
+        "SELECT
+            count(*),
+            COALESCE(sum(CASE WHEN outcome = 'SUCCEEDED' THEN 1 ELSE 0 END), 0),
+            COALESCE(sum(CASE WHEN outcome = 'FAILED' THEN 1 ELSE 0 END), 0),
+            COALESCE(sum(prompt_tokens), 0),
+            COALESCE(sum(completion_tokens), 0),
+            COALESCE(sum(estimated_cost_micros), 0)
+         FROM llm_usage",
+        [],
+        |row| {
+            Ok(LlmUsageSnapshot {
+                calls: row.get::<_, i64>(0)?.cast_unsigned(),
+                successful_calls: row.get::<_, i64>(1)?.cast_unsigned(),
+                failed_calls: row.get::<_, i64>(2)?.cast_unsigned(),
+                prompt_tokens: row.get::<_, i64>(3)?.cast_unsigned(),
+                completion_tokens: row.get::<_, i64>(4)?.cast_unsigned(),
+                estimated_cost_micros: row.get::<_, i64>(5)?.cast_unsigned(),
+            })
+        },
+    )
+    .map_err(DbError::from)
 }
 
 fn grouped_counts(conn: &Connection, sql: &str) -> Result<BTreeMap<String, u64>, DbError> {
