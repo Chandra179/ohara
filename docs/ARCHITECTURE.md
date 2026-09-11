@@ -5,6 +5,9 @@ data flow, and invariants. Detailed component contracts are in the
 [component documentation](architecture/README.md); implementation file names
 do not belong in this overview.
 
+General readers can start with the [Ohara overview](OVERVIEW.md), which explains
+the product, features, and algorithms in plain language.
+
 ## 1. Overview
 
 Ohara is an embedded, zero-daemon knowledge pipeline for personal-scale corpora.
