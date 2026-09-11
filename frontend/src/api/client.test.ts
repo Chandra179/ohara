@@ -23,4 +23,44 @@ describe("mock API boundary", () => {
     expect(result).toEqual(snapshot);
     expect(result.queue).not.toBe(snapshot.queue);
   });
+
+  it("returns an isolated operator metrics snapshot", async () => {
+    const api = createMockApi();
+
+    const result = await api.getMetrics();
+    result.jobsByStageStatus.SCRAPE.PENDING = 0;
+
+    const nextResult = await api.getMetrics();
+
+    expect(nextResult.jobsByStageStatus.SCRAPE.PENDING).toBe(8);
+    expect(nextResult.llmUsage).toMatchObject({ calls: 84, successfulCalls: 81 });
+    expect(nextResult.rawMaxBytes).toBe(536_870_912);
+  });
+
+  it("supports the query result states used by the UI", async () => {
+    const api = createMockApi();
+
+    await expect(api.queryKnowledgeBase("offline provider")).resolves.toMatchObject({
+      availability: "unavailable",
+      grounding: "ungrounded",
+    });
+    await expect(api.queryKnowledgeBase("ungrounded question")).resolves.toMatchObject({
+      availability: "available",
+      grounding: "ungrounded",
+    });
+    await expect(api.queryKnowledgeBase("error response")).rejects.toThrow(
+      "query service is unavailable",
+    );
+  });
+
+  it("removes a merged entity review from subsequent reads", async () => {
+    const api = createMockApi();
+
+    const preview = await api.previewEntityMerge("review-1");
+    const result = await api.mergeEntities("review-1");
+    const reviews = await api.getEntityReviews();
+
+    expect(result.preview).toEqual(preview);
+    expect(reviews).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: "review-1" })]));
+  });
 });

@@ -55,16 +55,36 @@ vertical slice.
 Show pending review candidates and a clear merge preview. The merge action must
 state which entity survives and remain reversible until the user confirms it.
 
+### Operations
+
+Show the read-only metrics snapshot: active and dead-letter queue counts,
+stage outcomes, audit outcomes, durable LLM usage, and raw-payload storage.
+Keep the captured-at timestamp visible. Throughput and latency charts are
+intentionally omitted until the backend exposes those measurements.
+
 Quality Lab and Operations are secondary navigation destinations. They should
-not compete with the four primary workflows in the first release.
+not compete with the four primary workflows in the first release. Quality Lab
+remains gated until retrieval and ER measurement contracts are stable.
 
 ## Interaction rules
 
 - Use visible keyboard focus and preserve a logical tab order.
+- Provide a skip link, move focus to the main content region after route
+  changes, and trap focus inside confirmation dialogs until they close.
+- Escape closes an open dialog and focus returns to the control that opened it.
 - Every async operation has loading, success, empty, and failure states.
+- Refreshable resources expose a visible refresh action and retry from their
+  failure state. Query, ingestion, and merge outcomes are announced through a
+  persistent, dismissible live notification region.
 - Destructive or identity-changing actions require an explicit confirmation.
 - Status is communicated with text and color, never color alone.
 - Keep the primary navigation stable across screens.
+- Tablet and narrow desktop layouts reduce multi-column density before the
+  mobile breakpoint; mobile layouts stack filters, actions, citations, and
+  entity review panels.
+- Respect `prefers-reduced-motion` by disabling transitions and spinner motion.
+- Primary text, controls, borders, and focus indicators use contrast-safe
+  tokens; forced-colors mode keeps boundaries and selected states visible.
 
 ## Implementation boundary
 

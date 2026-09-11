@@ -1,6 +1,10 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { useCallback, useEffect, useRef } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
+import type { HealthSnapshot, ServiceStatus } from "../../api/client";
+import { useApi } from "../../api/useApi";
 import { Icon, type IconName } from "../ui/Icon";
-import { StatusBadge } from "../ui/StatusBadge";
+import { StatusBadge, type StatusTone } from "../ui/StatusBadge";
+import { useAsyncResource, type AsyncResource } from "../../hooks/useAsyncResource";
 
 interface NavigationItem {
   icon: IconName;
@@ -20,6 +24,18 @@ const secondaryNavigation: NavigationItem[] = [
   { icon: "activity", label: "Operations", to: "/operations" },
 ];
 
+const SERVICE_LABELS: Record<ServiceStatus, string> = {
+  degraded: "Local · Degraded",
+  healthy: "Local · Healthy",
+  offline: "Local · Offline",
+};
+
+const SERVICE_TONES: Record<ServiceStatus, StatusTone> = {
+  degraded: "pending",
+  healthy: "healthy",
+  offline: "danger",
+};
+
 function NavigationLink({ icon, label, to }: NavigationItem) {
   return (
     <NavLink
@@ -34,8 +50,27 @@ function NavigationLink({ icon, label, to }: NavigationItem) {
 }
 
 export function AppShell() {
+  const api = useApi();
+  const location = useLocation();
+  const loadHealth = useCallback(() => api.getHealth(), [api]);
+  const { resource: health } = useAsyncResource<HealthSnapshot>(loadHealth);
+  const mainRef = useRef<HTMLElement>(null);
+  const previousPathname = useRef(location.pathname);
+
+  useEffect(() => {
+    if (previousPathname.current === location.pathname) {
+      return;
+    }
+
+    previousPathname.current = location.pathname;
+    mainRef.current?.focus();
+  }, [location.pathname]);
+
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        Skip to content
+      </a>
       <aside aria-label="Primary navigation" className="sidebar">
         <div className="brand">OHARA</div>
 
@@ -58,15 +93,33 @@ export function AppShell() {
 
       <div className="app-main">
         <header className="top-bar">
-          <StatusBadge tone="healthy">Local · Healthy</StatusBadge>
+          <HealthBadge health={health} />
           <button aria-label="Open user menu" className="avatar" type="button">
             U
           </button>
         </header>
-        <main className="content">
+        <main
+          aria-labelledby="page-title"
+          className="content"
+          id="main-content"
+          ref={mainRef}
+          tabIndex={-1}
+        >
           <Outlet />
         </main>
       </div>
     </div>
+  );
+}
+
+function HealthBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {
+  if (health.status !== "success") {
+    return <StatusBadge tone="muted">Local · Checking…</StatusBadge>;
+  }
+
+  return (
+    <StatusBadge tone={SERVICE_TONES[health.data.status]}>
+      {SERVICE_LABELS[health.data.status]}
+    </StatusBadge>
   );
 }

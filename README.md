@@ -2,7 +2,7 @@
 
 **ohara** is an embedded, zero-daemon data pipeline for personal-scale knowledge building: it scrapes the web, cleans and normalizes the text, chunks it semantically, and indexes it into a local knowledge store supporting GraphRAG — vector search, property-graph traversal, and cross-encoder reranking — all in one Rust process. No Postgres, no Redis, no Elasticsearch: SQLite is the control plane, LadybugDB (vectors + graph) is the knowledge plane, and Ollama is an optional user-run LLM endpoint.
 
-> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, citation-preserving LLM synthesis with quality fallback, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, entity GC, raw retention pruning, and a read-only operator metrics snapshot with durable LLM usage/cost aggregates are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The fetch ladder wires plain HTTP and browser-profile impersonation, and can add the optional Obscura subprocess when configured. Cloud providers, stage throughput dashboards, HNSW, Symspell, and HyDE remain tracked in `TODO.md`. The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Status:** the core ingestion, conditional re-crawling, vectorization, graph extraction, three-path retrieval baseline, citation-preserving LLM synthesis with quality fallback, `ohara query`, staged `ohara backup`, document lifecycle commands, offline ER merge executor, entity GC, raw retention pruning, read-only operator metrics, and the initial loopback UI API slice are implemented. The stabilization matrix covers entity-aware and multi-hop graph cases, duplicate/deletion cleanup, wrong-language and paywall rejection, and retry/dead-letter recovery. The fetch ladder wires plain HTTP and browser-profile impersonation, and can add the optional Obscura subprocess when configured. Cloud providers, stage throughput dashboards, HNSW, Symspell, HyDE, and the remaining UI document/entity/lifecycle APIs remain tracked in `TODO.md`. The implementation status and target design are kept in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 The engine-owned `FetchLadder` provides deterministic selection and escalation; the default runtime wires HTTP leg 1 and browser-profile impersonation leg 2, and adds the Obscura leg 3 when `fetcher.obscura_command` is configured.
 
@@ -40,7 +40,7 @@ The engine-owned `FetchLadder` provides deterministic selection and escalation; 
 | Reranker | ONNX `bge-reranker-base` **int8** plus identity baseline | Local cross-encoder reranking behind the `Reranker` port; the identity implementation is the deterministic fallback |
 | LLM | [Ollama](https://ollama.com) (local, pinned: `phi4-mini`) | Graph extraction and bounded citation-preserving synthesis with optional fallback; every attempt is recorded in the durable Usage Ledger. Cloud providers remain planned. Nothing leaves the machine by default |
 
-Every third-party engine sits behind a small trait so it can be swapped without touching pipeline logic — see [Ports & substitution](docs/ARCHITECTURE.md#9-ports--substitution-lsp) in the architecture doc.
+Every third-party engine sits behind a small trait so it can be swapped without touching pipeline logic. See the [architecture component contracts](docs/architecture/pipeline.md) and [knowledge contract](docs/architecture/knowledge-plane.md).
 
 ## Building
 
@@ -88,6 +88,33 @@ the extraction health gate. The default result count is `[retrieval].top_k`; tun
 `[llm].synthesis_model`, `[llm].fallback_model`,
 `[retrieval].synthesis_context_chars`, and `[retrieval].synthesis_max_tokens` in
 TOML.
+
+## Local UI API
+
+Run the optional API boundary and frontend in separate terminals:
+
+```text
+make backend
+make frontend
+```
+
+The combined `make dev` launcher is also available when a single terminal is
+preferred.
+
+The server binds to `127.0.0.1:3000` by default and currently exposes
+`GET /api/health`, `GET /api/metrics`, and `POST /api/query`. The frontend keeps
+the typed mock adapter as its default, so unset `VITE_OHARA_API_MODE` for the
+offline demo. `make dev` sets HTTP mode automatically. The API is read-only at
+this stage; document, entity-review, and lifecycle endpoints remain in
+`TODO.md`.
+
+`make backend` and `make frontend` free their respective TCP ports before
+starting. The frontend waits for the API to answer health checks and cannot
+silently move to a different port. Override `API_BIND`, `API_PROXY_TARGET`, or
+`FRONTEND_PORT` when needed. On Linux, when only versioned OpenSSL runtime
+libraries are available, it creates a compatibility directory under
+`OPENSSL_FALLBACK_DIR` (default `/tmp/ohara-ossl`) and supplies the linker path
+automatically. Installing `libssl-dev` remains the preferred system setup.
 
 Create a consistent snapshot while the worker is stopped or quiesced:
 
@@ -166,7 +193,7 @@ Two native prerequisites are also required:
 - **OpenSSL development libraries** — the `lbug` crate's bundled engine links
   OpenSSL at link time: `sudo apt install libssl-dev` (Ubuntu/Debian). Without
   sudo, symlinking the runtime libs into a scratch dir works too:
-  `mkdir -p /tmp/ossl/lib && ln -s /usr/lib/x86_64-linux-gnu/libssl.so.3 /tmp/ossl/lib/libssl.so && ln -s /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /tmp/ossl/lib/libcrypto.so && OPENSSL_DIR=/tmp/ossl cargo build`.
+  `mkdir -p /tmp/ossl/lib && ln -s /usr/lib/x86_64-linux-gnu/libssl.so.3 /tmp/ossl/lib/libssl.so && ln -s /usr/lib/x86_64-linux-gnu/libcrypto.so.3 /tmp/ossl/lib/libcrypto.so && OPENSSL_DIR=/tmp/ossl RUSTFLAGS="-L native=/tmp/ossl/lib" cargo build`.
 - **CMake + a C++ toolchain** — `lbug` compiles its bundled C++ engine on first
   build (this takes a while and needs ~2 GB of scratch space).
 
@@ -175,7 +202,7 @@ are fetched on first use from the network and cached under `data/models/`;
 afterwards everything runs offline. Heavy native stacks are feature-gated:
 `cargo build --no-default-features` drops `lbug` + the ONNX embedder (for
 deployments that inject remote `KnowledgeStore`/`Embedder` providers at boot,
-§9).
+the injected-provider path).
 
 ## Repository layout
 
@@ -184,7 +211,8 @@ ohara/
 ├── Cargo.toml
 ├── README.md
 ├── docs/
-│   ├── ARCHITECTURE.md        # system design (v2.13) — the source of truth
+│   ├── ARCHITECTURE.md        # big-picture system design and source of truth
+│   ├── architecture/          # focused component contracts
 │   └── CODE_GUIDE.md          # code style, API guidelines, lint policy
 ├── migrations/                # SQL migrations, versioned with the code
 ├── data/                      # runtime payloads (gitignored): raw/, clean/
@@ -239,6 +267,7 @@ ohara/
     │   └── retrieve.rs         # Stage 5: paths, context assembly, rerank + QueryNormalizer port
     ├── llm.rs                 # pub trait Llm + the local Ollama provider (structured
                                #   outputs, provider identity, boot health check)
+    ├── server.rs              # optional loopback HTTP API for the local frontend
     ├── ops.rs                 # operator facade: lock, metrics, backups, lifecycle, and pruning
     │   ├── entity_gc.rs       # zero-mention entity collection orchestration
     │   ├── entity_merge.rs    # offline ER merge orchestration
@@ -275,6 +304,7 @@ ohara/
 5. Retrieval baseline: BM25 (FTS5) + vector + rerank — measured on the golden set
 6. Stage 4: triplet extraction, entity resolution, graph path — **landed** (Ollama `Llm` provider, §8 matrix validation, `er_review` for near-ties, capped fact-edge aggregation; Stage 5 query entities + the `:MENTIONS` graph path in three-path fusion, with the hermetic machinery baseline measuring 1.000 recall@20 per path and 0.723 fused MRR)
 7. Stabilization: retrieval evaluation and the operator CLI slice; restart, deletion, lease, quality-gate, and retry/dead-letter acceptance is landed. `ohara query` synthesizes bounded answers with primary/fallback models and citations, `ohara backup` creates consistent snapshots, `requeue`/`archive`/`delete` manage document lifecycle, `er merge` closes the offline merge queue, `gc` collects unmerged zero-mention entities, `prune` enforces raw retention, and `metrics` reports durable control/raw/LLM usage state
-8. Remaining feature work: cloud LLM providers, embedding dual-write migration, Symspell/HyDE evaluation, stage throughput/latency metrics, dashboards/export, and HNSW
+8. Optional local UI boundary: initial loopback API slice (`serve`, health, metrics, query) with typed frontend integration; remaining UI endpoints stay tracked separately
+9. Remaining feature work: cloud LLM providers, embedding dual-write migration, Symspell/HyDE evaluation, stage throughput/latency metrics, dashboards/export, and HNSW
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: schema, consistency protocol, stage specs, port contracts, error handling, cost model, and security notes.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the system overview and [docs/architecture/README.md](docs/architecture/README.md) for focused component contracts.

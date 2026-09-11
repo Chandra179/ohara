@@ -9,9 +9,9 @@
 | Formatting | [Rust Style Guide](https://doc.rust-lang.org/nightly/style-guide/) | `cargo fmt` — never hand-format |
 | Lints | This guide's `[lints]` table (C-LINT below) | `make clippy`, warnings = errors |
 | API shape & naming | [API Guidelines](https://rust-lang.github.io/api-guidelines/checklist.html) | code review, this guide's checklist |
-| Module tree, visibility | Rust Book ch07, ARCHITECTURE Appendix A | compiler + review |
+| Module tree, visibility | Rust Book ch07, architecture component docs | compiler + review |
 | Errors, panics | Rust Book ch09, ARCHITECTURE §10 | compiler + contract tests |
-| Design decisions | ARCHITECTURE.md (v2.13) | — |
+| Design decisions | ARCHITECTURE.md and its component docs | — |
 
 ---
 
@@ -93,7 +93,15 @@ Allowed-by-default `pedantic` exceptions go in the same table with a one-line ju
 
 ## 6. Module and visibility conventions
 
-Recap from ARCHITECTURE Appendix A (ch07): `pub mod` planes at the crate root, private leaf modules, `pub(crate)`/`pub(super)` for internals, facade re-exports (`pub use models::{Document, Job};`) so the public surface stays flat. **C-STRUCT-PRIVATE** applies to every struct crossing a plane boundary — with the guideline's own exception: plain data records whose fields carry no invariant beyond construction (DTOs like `FetchedDoc`, `Fact`, `ScoredChunk`) may expose `pub` fields; anything whose fields must stay coherent (e.g. [`Config`](config.rs), the ID newtypes) keeps them private behind constructors and getters. `pipeline/` depends on traits and facades only — a PR that names a vendor type outside its owning plane is rejected in review, full stop.
+The architecture component docs define the current plane boundaries. Use Rust
+Book ch07 module conventions: `pub mod` planes at the crate root, private leaf
+modules, `pub(crate)`/`pub(super)` for internals, and facade re-exports so the
+public surface stays flat. **C-STRUCT-PRIVATE** applies to every struct crossing
+a plane boundary — with the guideline's own exception: plain data records whose
+fields carry no invariant beyond construction may expose `pub` fields; anything
+whose fields must stay coherent keeps them private behind constructors and
+getters. The pipeline depends on traits and facades only — vendor types remain
+inside their owning plane.
 
 ## 7. Repository gates
 

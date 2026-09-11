@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { BrowserRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
@@ -13,17 +13,40 @@ function renderApp() {
 }
 
 describe("App shell", () => {
-  it("renders the overview and shared navigation", () => {
+  it("renders the overview and shared navigation", async () => {
     renderApp();
 
     expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
     expect(
       screen.getByRole("complementary", { name: "Primary navigation" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Local · Healthy")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Implementation plan" }),
-    ).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Skip to content" })).toHaveAttribute(
+      "href",
+      "#main-content",
+    );
+    expect(await screen.findByRole("heading", { name: "Ingestion queue" })).toBeInTheDocument();
+    expect(screen.getAllByText("Local · Healthy")).toHaveLength(2);
+    expect(screen.getByText("Product Notes Q1.pdf")).toBeInTheDocument();
+  });
+
+  it("refreshes ingestion status and announces the result", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(await screen.findByRole("button", { name: "Refresh" }));
+
+    expect(await screen.findByText("Ingestion status refreshed")).toBeInTheDocument();
+  });
+
+  it("moves focus to the main content after navigation", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("link", { name: "Documents" }));
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("main"));
+    });
   });
 
   it("navigates between route boundaries", async () => {
@@ -32,7 +55,84 @@ describe("App shell", () => {
 
     await user.click(screen.getByRole("link", { name: "Documents" }));
 
-    expect(screen.getByRole("heading", { name: "Documents" })).toBeInTheDocument();
-    expect(screen.getByText("Primary workflow coming next")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Documents" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "8 documents" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Search documents" })).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Status" }), "processing");
+    expect(await screen.findByRole("heading", { name: "2 documents" })).toBeInTheDocument();
+    expect(screen.getByText("Product Notes Q1.pdf")).toBeInTheDocument();
+  });
+
+  it("renders the Operations metrics snapshot", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("link", { name: "Operations" }));
+
+    expect(await screen.findByRole("heading", { name: "Pipeline activity" })).toBeInTheDocument();
+    expect(screen.getByText("Active queue")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "LLM usage" })).toBeInTheDocument();
+    expect(screen.getByText("Throughput and latency are not available yet")).toBeInTheDocument();
+  });
+
+  it("runs a grounded query and renders citations", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("link", { name: "Query" }));
+    expect(await screen.findByText("Start with a question")).toBeInTheDocument();
+    await user.type(
+      await screen.findByRole("textbox", { name: "Ask your knowledge base" }),
+      "What is Ohara?",
+    );
+    await user.click(screen.getByRole("button", { name: "Ask" }));
+
+    expect(await screen.findByRole("heading", { name: "Answer" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Citations" })).toBeInTheDocument();
+    expect(screen.getByText("ohara-product-guide.pdf")).toBeInTheDocument();
+  });
+
+  it("shows the ungrounded query state", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("link", { name: "Query" }));
+    await user.type(
+      await screen.findByRole("textbox", { name: "Ask your knowledge base" }),
+      "Show an ungrounded answer",
+    );
+    await user.click(screen.getByRole("button", { name: "Ask" }));
+
+    expect(await screen.findByText("No grounded answer")).toBeInTheDocument();
+  });
+
+  it("shows the unavailable model state", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("link", { name: "Query" }));
+    await user.type(
+      await screen.findByRole("textbox", { name: "Ask your knowledge base" }),
+      "Use the offline provider",
+    );
+    await user.click(screen.getByRole("button", { name: "Ask" }));
+
+    expect(await screen.findByText("Local model unavailable")).toBeInTheDocument();
+  });
+
+  it("previews and confirms an entity merge", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(screen.getByRole("link", { name: "Entities" }));
+    await user.click(await screen.findByRole("button", { name: /Ohara Potential duplicate/ }));
+
+    expect(await screen.findByRole("heading", { name: "Merge preview" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Merge entities" }));
+    expect(screen.getByRole("dialog", { name: "Confirm entity merge" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Confirm merge" }));
+
+    expect(await screen.findByText("Merge completed")).toBeInTheDocument();
   });
 });

@@ -34,7 +34,7 @@ describe("shared UI primitives", () => {
     expect(screen.getByRole("cell", { name: "3" })).toBeInTheDocument();
   });
 
-  it("supports closing a modal and retrying an error", () => {
+  it("supports closing a modal with keyboard and retrying an error", () => {
     const onClose = vi.fn();
     const onRetry = vi.fn();
 
@@ -47,10 +47,11 @@ describe("shared UI primitives", () => {
       </>,
     );
 
+    fireEvent.keyDown(screen.getByRole("button", { name: "Close dialog" }), { key: "Escape" });
     fireEvent.click(screen.getByRole("button", { name: "Close dialog" }));
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
 
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledTimes(2);
     expect(onRetry).toHaveBeenCalledOnce();
   });
 });

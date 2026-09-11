@@ -5,7 +5,6 @@ import { StatusBadge } from "../components/ui/StatusBadge";
 export type PageKey =
   | "documents"
   | "entities"
-  | "operations"
   | "overview"
   | "query"
   | "quality"
@@ -24,10 +23,6 @@ const PAGE_DEFINITIONS: Record<PageKey, PageDefinition> = {
   entities: {
     description: "Review and resolve people, places, and concepts.",
     label: "Entities",
-  },
-  operations: {
-    description: "Inspect worker health and operational activity.",
-    label: "Operations",
   },
   overview: {
     description: "Your local knowledge workbench.",
@@ -58,7 +53,7 @@ export function FoundationPage({ page }: FoundationPageProps) {
     <div className="page-stack">
       <div className="page-heading">
         <p className="eyebrow">Local knowledge workbench</p>
-        <h1>{definition.label}</h1>
+        <h1 id="page-title">{definition.label}</h1>
         <p>{definition.description}</p>
       </div>
 
@@ -79,7 +74,7 @@ export function FoundationPage({ page }: FoundationPageProps) {
         <div className="foundation-grid">
           <div>
             <span className="foundation-grid__label">Navigation</span>
-            <strong>6 routes</strong>
+            <strong>7 routes</strong>
           </div>
           <div>
             <span className="foundation-grid__label">Theme</span>

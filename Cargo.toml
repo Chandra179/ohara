@@ -37,6 +37,7 @@ ladybug = ["dep:lbug"]
 onnx-embedder = ["dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 async-trait = "0.1.92"
 chrono = "0.4.45"
 fs2 = "0.4.3"
@@ -50,7 +51,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "signal", "fs", "io-util", "macros", "process"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "signal", "fs", "io-util", "macros", "process", "net"] }
 toml = "1.1.5"
 unicode-normalization = "0.1.25"
 url = "2.5.8"
@@ -73,3 +74,4 @@ tokenizers = { version = "0.22.2", optional = true, default-features = false, fe
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }

@@ -1,59 +1,76 @@
 # Frontend TODO
 
-Implementation order for the approved design in
-[design/DESIGN.md](design/DESIGN.md). Complete each vertical slice with its
-loading, empty, and failure states before moving to the next priority.
+Implementation queue for the approved design in
+[design/DESIGN.md](design/DESIGN.md). Complete each vertical slice with
+loading, empty, unavailable, and failure states before moving to the next
+priority.
 
-## P0 — foundation
+## P0 — live integration correctness
 
-- [x] Create the React + TypeScript + Vite application in this directory.
-- [x] Add Tailwind CSS and define the design tokens from `design/DESIGN.md`.
-- [x] Define and implement the reusable UI foundation: buttons, inputs,
-  selects, panels, badges, tables, modal, and loading/empty/error states.
-- [x] Add the shared application shell: sidebar, top bar, responsive layout,
-  focus styles, and route boundaries.
-- [x] Add typed frontend models and an API client/mock-adapter boundary. Keep
-  backend and datastore details out of UI components.
-- [x] Add Vitest, Testing Library, and Playwright smoke-test configuration.
+- [ ] Fix the live metrics `llmUsage` casing mismatch so Operations cannot crash
+  on undefined usage fields.
+- [ ] Preserve the distinction between unavailable LLM synthesis and an
+  ungrounded answer in the HTTP response mapping.
+- [ ] Make every HTTP-backed route render an explicit unavailable/error state;
+  no failed API response may produce a blank page.
+- [ ] Add live Rust-backed Playwright coverage for health, metrics, and query,
+  including unavailable knowledge/model fixtures.
 
-## P1 — first usable workflow
+## P1 — complete read-only product workflows
 
-- [ ] Implement the Overview screen with health, document totals, and the
-  ingestion queue.
-- [ ] Implement the Documents screen with search, status/type/source filters,
-  pagination, and document status states.
-- [ ] Implement the Query screen with search, answer, citations, loading,
-  empty, unavailable-LLM, and ungrounded-answer states.
-- [ ] Implement the Entities screen with pending review, merge preview,
-  confirmation, success, and failure states.
-- [ ] Add route-level and component-level tests for the four primary screens.
+- [ ] Add paginated document listing with backend status preservation and wire
+  the Documents view.
+- [ ] Add document and queue read models for the Overview view.
+- [ ] Align frontend document type/status models with the backend schema before
+  enabling filters; the backend currently has no document-type field and has
+  more statuses than the provisional UI model.
+- [ ] Add entity-review listing and merge-preview endpoints and wire the
+  Entities view.
+- [ ] Extend live Rust-backed Playwright coverage to documents and entity review.
 
-## P2 — usability and resilience
+## P2 — safe operations
 
-- [ ] Verify keyboard navigation, focus management, contrast, and reduced
-  motion behavior.
-- [ ] Add responsive layouts for tablet and narrow desktop widths.
-- [ ] Add retry and refresh behavior for asynchronous operations.
-- [ ] Add accessible notifications for ingestion, query, and merge outcomes.
-- [ ] Add Playwright coverage for the query and entity-merge journeys.
+- [ ] Map worker-process readiness after the Rust server can supervise or
+  observe ingestion.
+- [ ] Define request limits, CORS, and local authentication/CSRF behavior before
+  exposing browser-triggered mutations.
+- [ ] Add lifecycle actions only after confirmation, authorization, idempotency,
+  and failure behavior are covered by the API contract.
+- [ ] Keep the mock adapter injectable for unit tests and local UI demos while
+  replacing unsupported HTTP methods incrementally.
 
-## P3 — secondary operations
+## P3 — quality and observability
 
-- [ ] Define the API contract for metrics before implementing the Operations
-  screen.
-- [ ] Add the Operations view for queue health, stage outcomes, and usage
-  summaries.
-- [ ] Add the Quality Lab view after retrieval and ER measurement contracts
-  are stable.
+- [ ] Add the Quality Lab after retrieval and ER measurement contracts are
+  stable.
 - [ ] Add stage throughput and latency charts only when backend metrics are
-  available; do not fabricate operational data in production UI.
+  available; never fabricate operational data in production UI.
+- [ ] Show actionable model and knowledge-store readiness diagnostics in the
+  shell and affected pages.
 
-## Documentation and release checks
+## P4 — release checks
 
-- [ ] Keep `design/DESIGN.md` current when the visual system changes.
-- [ ] Document local development, environment variables, and API setup in a
-  frontend README.
 - [ ] Add a production build check and verify that no secrets or runtime data
   are bundled.
-- [ ] Run format, lint, unit, integration, accessibility, and end-to-end
-  checks before the first frontend release.
+- [ ] Run format, lint, unit, integration, accessibility, and end-to-end checks
+  before the first frontend release.
+- [ ] Keep `design/DESIGN.md` current when the visual system changes.
+
+## Completed foundation
+
+- [x] Create the React + TypeScript + Vite application in this directory.
+- [x] Add Tailwind CSS and design tokens from `design/DESIGN.md`.
+- [x] Implement reusable UI primitives, loading/empty/error states, and
+  accessible notifications.
+- [x] Implement the shared shell, responsive layout, focus styles, and route
+  boundaries.
+- [x] Define typed frontend models and a mock-adapter API boundary.
+- [x] Add Vitest, Testing Library, and Playwright smoke-test configuration.
+- [x] Implement the Overview, Documents, Query, Entities, and Operations
+  screens against the mock adapter.
+- [x] Verify keyboard navigation, focus management, contrast, reduced motion,
+  responsive layouts, retry, and refresh behavior.
+- [x] Add the HTTP adapter, Vite `/api` proxy, health/status mapping, metrics
+  wiring, and query wiring.
+- [x] Document frontend local development, environment variables, and API
+  setup in the frontend README.

@@ -26,7 +26,7 @@ pub use entity_gc::{EntityGcReport, collect_entity_garbage};
 #[cfg(all(feature = "ladybug", test))]
 pub(super) use entity_merge::execute_entity_merges;
 pub use entity_merge::merge_entities;
-pub use metrics::{MetricsReport, metrics};
+pub use metrics::{MetricsReport, metrics, metrics_read_only};
 pub use prune::{PruneReport, prune};
 
 /// Operator failures.

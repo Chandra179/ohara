@@ -15,6 +15,7 @@ USAGE:
     ohara delete <id> [--config <path.toml>]
     ohara prune [--dry-run] [--config <path.toml>]
     ohara metrics [--json] [--config <path.toml>]
+    ohara serve [--bind <host:port>] [--config <path.toml>]
     ohara er merge [--config <path.toml>]
     ohara gc [--config <path.toml>]
 
@@ -30,6 +31,8 @@ OPTIONS:
     --dry-run          Show prune selection without deleting files
     metrics            Show queue, audit, entity-review, recrawl, and raw usage metrics
     --json             Render metrics as machine-readable JSON
+    serve              Run the optional loopback HTTP API for the frontend
+    --bind <host:port> API listener address for serve (default: 127.0.0.1:3000)
     er merge           Execute pending offline entity merges
     gc                 Collect unreferenced entities after the configured grace period
     -h, --help         print this help";
@@ -68,6 +71,10 @@ enum CliCommand {
         config_path: Option<PathBuf>,
         json: bool,
     },
+    Serve {
+        config_path: Option<PathBuf>,
+        bind: std::net::SocketAddr,
+    },
     EntityMerge {
         config_path: Option<PathBuf>,
     },
@@ -95,6 +102,8 @@ enum CliError {
     Query(#[from] ohara::pipeline::QueryError),
     #[error("operator: {0}")]
     Ops(#[from] ohara::ops::OpsError),
+    #[error("server: {0}")]
+    Server(#[from] ohara::server::ServerError),
     #[error("output: {0}")]
     Output(#[from] serde_json::Error),
 }
@@ -158,6 +167,9 @@ where
         CliCommand::Metrics { config_path, json } => {
             metrics_and_print(config_path.as_deref(), json)
         }
+        CliCommand::Serve { config_path, bind } => {
+            runtime.block_on(serve_and_run(config_path, bind))
+        }
         CliCommand::EntityMerge { config_path } => runtime.block_on(merge_and_print(config_path)),
         CliCommand::EntityGc { config_path } => runtime.block_on(gc_and_print(config_path)),
     };
@@ -181,6 +193,7 @@ enum CliMode {
     Lifecycle(LifecycleAction),
     Prune,
     Metrics,
+    Serve,
     EntityMerge,
     EntityGc,
 }
@@ -195,6 +208,7 @@ struct CliParser {
     top_k: Option<usize>,
     dry_run: bool,
     json: bool,
+    bind: Option<std::net::SocketAddr>,
     entity_group: bool,
 }
 
@@ -236,11 +250,13 @@ impl CliParser {
             "delete" => self.select_mode(CliMode::Lifecycle(LifecycleAction::Delete))?,
             "prune" => self.select_mode(CliMode::Prune)?,
             "metrics" => self.select_mode(CliMode::Metrics)?,
+            "serve" => self.select_mode(CliMode::Serve)?,
             "gc" => self.select_mode(CliMode::EntityGc)?,
             "er" => self.select_entity_group()?,
             "merge" => self.select_entity_merge()?,
             "--dry-run" => self.parse_dry_run()?,
             "--json" => self.parse_json()?,
+            "--bind" => self.parse_bind(args)?,
             value => self.parse_value(value)?,
         }
         Ok(())
@@ -320,6 +336,27 @@ impl CliParser {
         Ok(())
     }
 
+    fn parse_bind<I>(&mut self, args: &mut I) -> Result<(), CliError>
+    where
+        I: Iterator<Item = String>,
+    {
+        if self.mode != Some(CliMode::Serve) {
+            return Err(CliError::Argument(
+                "--bind is only valid with serve".to_string(),
+            ));
+        }
+        let value = next_arg(args, "--bind requires a host:port")?;
+        let bind = value.parse().map_err(|_| {
+            CliError::Argument(format!("--bind must be a valid host:port, got {value:?}"))
+        })?;
+        if self.bind.replace(bind).is_some() {
+            return Err(CliError::Argument(
+                "serve accepts --bind at most once".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn parse_value(&mut self, value: &str) -> Result<(), CliError> {
         match self.mode {
             Some(CliMode::Query) => {
@@ -358,6 +395,11 @@ impl CliParser {
             Some(CliMode::Metrics) => {
                 return Err(CliError::Argument(
                     "metrics does not accept positional arguments".to_string(),
+                ));
+            }
+            Some(CliMode::Serve) => {
+                return Err(CliError::Argument(
+                    "serve does not accept positional arguments".to_string(),
                 ));
             }
             Some(CliMode::EntityMerge) => {
@@ -401,6 +443,7 @@ impl CliParser {
             Some(CliMode::Lifecycle(action)) => self.finish_lifecycle(action),
             Some(CliMode::Prune) => self.finish_prune(),
             Some(CliMode::Metrics) => self.finish_metrics(),
+            Some(CliMode::Serve) => self.finish_serve(),
             Some(CliMode::EntityMerge) => self.finish_entity_merge(),
             Some(CliMode::EntityGc) => self.finish_entity_gc(),
             None if self.entity_group => Err(CliError::Argument(
@@ -495,6 +538,23 @@ impl CliParser {
         }))
     }
 
+    fn finish_serve(self) -> Result<Option<CliCommand>, CliError> {
+        reject_top_k(self.top_k)?;
+        reject_json(self.json)?;
+        if self.lifecycle_doc.is_some() || self.backup_destination.is_some() {
+            return Err(CliError::Argument(
+                "serve does not accept a document id or destination".to_string(),
+            ));
+        }
+        let bind = self
+            .bind
+            .unwrap_or(std::net::SocketAddr::from(([127, 0, 0, 1], 3000)));
+        Ok(Some(CliCommand::Serve {
+            config_path: self.config_path,
+            bind,
+        }))
+    }
+
     fn finish_entity_merge(self) -> Result<Option<CliCommand>, CliError> {
         reject_top_k(self.top_k)?;
         reject_json(self.json)?;
@@ -565,6 +625,15 @@ fn reject_json(json: bool) -> Result<(), CliError> {
 async fn boot_and_run(config_path: Option<PathBuf>) -> Result<(), ohara::BootError> {
     let config = ohara::config::Config::load(config_path.as_deref())?;
     ohara::run(config).await
+}
+
+async fn serve_and_run(
+    config_path: Option<PathBuf>,
+    bind: std::net::SocketAddr,
+) -> Result<(), CliError> {
+    let config = ohara::config::Config::load(config_path.as_deref())?;
+    ohara::server::run(config, bind).await?;
+    Ok(())
 }
 
 async fn query_and_print(
@@ -891,6 +960,30 @@ mod tests {
         );
         assert!(parse_args(["metrics", "extra"].into_iter().map(str::to_string)).is_err());
         assert!(parse_args(["--json"].into_iter().map(str::to_string)).is_err());
+    }
+
+    #[test]
+    fn parses_loopback_serve_with_optional_bind_address() {
+        assert_eq!(
+            parse_args(
+                ["serve", "--bind", "127.0.0.1:4312", "--config", "x.toml"]
+                    .into_iter()
+                    .map(str::to_string),
+            )
+            .unwrap(),
+            Some(CliCommand::Serve {
+                config_path: Some(PathBuf::from("x.toml")),
+                bind: "127.0.0.1:4312".parse().unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_args(["serve"].into_iter().map(str::to_string)).unwrap(),
+            Some(CliCommand::Serve {
+                config_path: None,
+                bind: "127.0.0.1:3000".parse().unwrap(),
+            })
+        );
+        assert!(parse_args(["serve", "extra"].into_iter().map(str::to_string)).is_err());
     }
 
     #[test]
