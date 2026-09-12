@@ -36,8 +36,7 @@ priority.
   exposing browser-triggered mutations.
 - [ ] Add lifecycle actions only after confirmation, authorization, idempotency,
   and failure behavior are covered by the API contract.
-- [ ] Keep the mock adapter injectable for unit tests and local UI demos while
-  replacing unsupported HTTP methods incrementally.
+- [x] Keep the mock adapter injectable for unit tests and local UI demos.
 
 ## P3 — quality and observability
 
@@ -50,11 +49,22 @@ priority.
 
 ## P4 — release checks
 
-- [ ] Add a production build check and verify that no secrets or runtime data
-  are bundled.
+- [x] Run the production frontend build in CI.
+- [ ] Audit the production bundle to verify that no secrets or runtime data are
+  bundled.
 - [ ] Run format, lint, unit, integration, accessibility, and end-to-end checks
   before the first frontend release.
 - [ ] Keep `design/DESIGN.md` current when the visual system changes.
+
+## Completed maintenance
+
+- [x] Remove the unsupported entity-merge mutation from the read-only client
+  interface and keep merge preview read-only until lifecycle contracts exist.
+- [x] Align mock metrics fixtures with durable backend document statuses.
+- [x] Keep frontend documentation and CI expectations aligned with the live
+  read-only workflow.
+- [x] Run frontend lint, unit tests, production build, and mock browser tests in
+  repository CI.
 
 ## Completed foundation
 

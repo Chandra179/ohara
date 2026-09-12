@@ -101,11 +101,14 @@ a plane boundary — with the guideline's own exception: plain data records whos
 fields carry no invariant beyond construction may expose `pub` fields; anything
 whose fields must stay coherent keeps them private behind constructors and
 getters. The pipeline depends on traits and facades only — vendor types remain
-inside their owning plane.
+inside their owning plane. Default adapter selection and readiness probing
+belong to the runtime composition root, not transport handlers or stages.
 
 ## 7. Repository gates
 
-The repository exposes the quality gates through the [Makefile](../Makefile). CI is not wired yet, so run these locally before every commit:
+The repository exposes the quality gates through the [Makefile](../Makefile),
+and CI runs the same Rust gates with the pinned toolchain. Run these locally
+before every commit:
 
 ```
 cargo fmt --check

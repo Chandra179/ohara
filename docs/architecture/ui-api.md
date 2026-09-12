@@ -39,6 +39,6 @@ metrics, overview, documents, query, entity reviews, and unavailable
 model/store fixtures through Rust-backed browser checks.
 
 Health checks now return actionable diagnostics for missing embedding files and
-invalid knowledge artifacts. Health still probes the default local providers at
-the transport boundary; a shared readiness seam should be introduced before
-the API grows more provider-specific checks.
+invalid knowledge artifacts. Readiness probing is composed centrally and the
+transport maps the provider-neutral report into the HTTP contract; adding a new
+provider requires changing the readiness composition, not a route handler.

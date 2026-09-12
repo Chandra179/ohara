@@ -10,6 +10,7 @@ These pages hold the detailed contracts for one module at a time:
 - [Pipeline and stages](pipeline.md)
 - [Retrieval and evaluation](retrieval.md)
 - [Language-model services](llm.md)
+- [Runtime composition and readiness](runtime.md)
 - [Operator services](operations.md)
 - [Frontend and local API](ui-api.md)
 - [Testing and build](testing-and-build.md)

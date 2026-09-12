@@ -1,23 +1,20 @@
-//! Provider and runtime assembly for the worker and operator query paths.
+//! Default adapter assembly for the local runtime.
 //!
-//! This module owns the construction-time invariants shared by those paths:
-//! feature-gated defaults, model compatibility, and provider capability checks.
-//! The worker and query modules retain their different lifecycles, but they no
-//! longer need to know how a default adapter is assembled.
+//! This is the composition root for concrete providers. It is the only place
+//! that combines pipeline ports with Engine, Control, and Knowledge adapters.
 
 use std::sync::Arc;
 
 use crate::BootError;
 use crate::config::Config;
+use crate::engine::Ollama;
 use crate::engine::{
     FetchLadder, FetchLeg, Fetcher, HttpFetcher, HttpFetcherParams, ImpersonationFetcher,
     ObscuraFetcher,
 };
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
-
-use super::clean::{Extractor, ReadabilityExtractor};
-use super::embed::Embedder;
+use crate::pipeline::{Embedder, Extractor, ReadabilityExtractor};
 
 /// The fully assembled default provider set for a worker.
 pub(crate) struct WorkerPorts {
@@ -85,7 +82,7 @@ pub(crate) fn query_ports(config: &Config) -> Result<QueryPorts, BootError> {
     // already reported the actionable download instruction; starting a second
     // network download from a request would leave the browser waiting on a
     // provider operation with no useful progress state.
-    super::check_embedder_readiness(config)?;
+    crate::pipeline::check_embedder_readiness(config)?;
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
     let knowledge = default_knowledge(config)?;
@@ -101,7 +98,7 @@ pub(crate) fn query_ports(config: &Config) -> Result<QueryPorts, BootError> {
 /// remains useful while Ollama is stopped; synthesis then degrades to ranked
 /// chunks at the query boundary (§8 Stage 5.6).
 fn query_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
-    Ok(Arc::new(crate::llm::Ollama::new(
+    Ok(Arc::new(Ollama::new(
         config.llm().base_url().clone(),
         config.llm().health_timeout(),
     )?))
@@ -109,7 +106,7 @@ fn query_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
 
 #[cfg(feature = "onnx-embedder")]
 fn default_embedder(config: &Config) -> Result<Arc<dyn Embedder>, BootError> {
-    Ok(Arc::new(super::embed::LocalEmbedder::new(
+    Ok(Arc::new(crate::pipeline::LocalEmbedder::new(
         &config.data_dir().join("models"),
     )?))
 }
@@ -180,7 +177,7 @@ fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
     if !config.pipeline().graph_enabled() {
         return Ok(Arc::new(crate::llm::NoLlm));
     }
-    let ollama = crate::llm::Ollama::new(
+    let ollama = Ollama::new(
         config.llm().base_url().clone(),
         config.llm().health_timeout(),
     )?;

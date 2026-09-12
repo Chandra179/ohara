@@ -13,5 +13,8 @@ prune are idempotent and preserve the control/knowledge consistency protocol.
 Read-only metrics use a control-plane snapshot and do not require the exclusive
 mutation lock.
 
-The local HTTP API currently exposes only health, metrics, and query. It is an
-API-only process boundary and does not supervise the ingestion worker.
+The local HTTP API exposes health, metrics, overview, documents, query, and
+read-only entity-review previews. It is an API-only process boundary and does
+not supervise the ingestion worker. Lifecycle mutations remain a planned
+contract so confirmation, authorization, idempotency, and failure behavior can
+be specified before browser-triggered writes are enabled.

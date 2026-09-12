@@ -38,10 +38,19 @@ boundaries; this file records what is still open.
   before exposing browser-triggered mutations.
 - [ ] Add explicit lifecycle API contracts for requeue, archive, and delete,
   including confirmation, authorization, idempotency, and failure behavior.
-- [ ] Add a shared readiness/health seam so transport handlers do not construct
+- [x] Add a shared readiness/health seam so transport handlers do not construct
   concrete provider implementations directly.
-- [ ] Add the document/entity/lifecycle API handlers through public facades only;
-  never expose SQL, graph queries, filesystem paths, or CLI subprocesses.
+- [x] Keep default provider assembly in the runtime composition root so the
+  pipeline names ports rather than concrete network or datastore adapters.
+- [x] Keep document and entity read handlers on public facades; transport code
+  does not expose SQL, graph queries, filesystem paths, or CLI subprocesses.
+- [x] Move the Ollama HTTP adapter into the Engine plane and keep the LLM port
+  provider-neutral.
+- [x] Split the Stage 4 extraction/graph, entity merge/review, and HTTP health
+  and error implementations into focused modules.
+- [x] Replace the bespoke query encoder with the `url` crate serializer and add
+  encoded-key regression coverage.
+- [x] Add Rust and frontend quality gates to repository CI.
 
 ## P3 — retrieval and entity-resolution quality
 
@@ -80,3 +89,7 @@ boundaries; this file records what is still open.
   and read-only operator metrics.
 - [x] Implement the initial loopback API for health, metrics, and query plus the
   typed frontend HTTP adapter and its contract tests.
+- [x] Remove the unsupported frontend entity-merge mutation from the read-only
+  interface until the lifecycle contract is implemented.
+- [x] Align component documentation with the current read-only API and live
+  browser coverage.

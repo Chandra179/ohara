@@ -20,9 +20,9 @@ store; the knowledge index is rebuildable; external services are optional.
 | Plane | Owns | Does not own |
 | :--- | :--- | :--- |
 | Control | durable documents, jobs, audit, identities, and usage | network or graph operations |
-| Engine | outbound fetching and fetch policy | document state or knowledge writes |
+| Engine | outbound HTTP adapters, fetching, and fetch policy | document state or knowledge writes |
 | Knowledge | vectors and graph data | queue scheduling or SQLite schema |
-| Pipeline | stage order, port composition, and recovery sequencing | vendor-specific storage or transport |
+| Pipeline | stage order, orchestration, and recovery sequencing | vendor-specific storage or transport |
 
 Runtime/operator services compose the planes. The frontend and local HTTP API
 are transport surfaces, not a fourth datastore plane.
@@ -135,6 +135,11 @@ completion, extraction, and query normalization. A provider must map native
 failures to the shared error taxonomy and preserve ordering, identity, and
 deletion guarantees.
 
+The `Llm` port owns provider semantics and remains independent of networking.
+Outbound HTTP implementations for local or cloud providers belong with the
+Engine plane, while runtime assembly selects the adapter and the pipeline sees
+only the port. Cloud egress remains disabled unless explicitly configured.
+
 ## 10. Error handling
 
 Every boundary returns `Result` for infrastructure failure. Domain outcomes
@@ -161,8 +166,9 @@ an authenticated deployment boundary exists.
 
 Durable stage events, queue and milestone aggregates, recrawl state, entity
 reviews, raw-payload usage, and every language-model attempt form the current
-operator view. The API exposes the initial health, metrics, and query slice.
-Stage throughput/latency dashboards and export are planned.
+operator view. The API exposes health, metrics, overview, documents, query, and
+read-only entity-review previews. Stage throughput/latency dashboards and export
+are planned.
 
 ## 14. Testing strategy
 
@@ -187,8 +193,8 @@ build/runtime details are in [testing and build](architecture/testing-and-build.
 4. Local UI boundary — health, metrics, query, overview, document, and
    read-only entity-review transport implemented; lifecycle mutations remain
    open.
-5. Next work — worker lifecycle/readiness, transport hardening, lifecycle API
-   contracts, measured ER/retrieval quality, HNSW, throughput metrics,
+5. Next work — worker process lifecycle/readiness, transport hardening,
+   lifecycle API contracts, measured ER/retrieval quality, HNSW, throughput metrics,
    embedding migration, and cloud providers.
 
 ## Component documentation
@@ -203,6 +209,7 @@ The detailed component contracts are kept separately:
 | Pipeline stages | [pipeline.md](architecture/pipeline.md) |
 | Retrieval and evaluation | [retrieval.md](architecture/retrieval.md) |
 | Language-model services | [llm.md](architecture/llm.md) |
+| Runtime composition | [runtime.md](architecture/runtime.md) |
 | Operator services | [operations.md](architecture/operations.md) |
 | Frontend and local API | [ui-api.md](architecture/ui-api.md) |
 | Testing and build | [testing-and-build.md](architecture/testing-and-build.md) |

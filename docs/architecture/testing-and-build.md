@@ -11,9 +11,10 @@ cargo test --workspace
 cargo doc --no-deps
 ```
 
-`make verify` provides the repository equivalent. Frontend changes also run
-the package's lint, unit tests, build, and Playwright checks when the relevant
-runtime is available.
+`make verify` provides the repository equivalent. The repository CI workflow
+runs these Rust gates with the pinned toolchain. Frontend changes also run the
+package's lint, unit tests, build, and mock Playwright checks; Rust-backed live
+checks remain a separate local/runtime-dependent suite.
 
 ## Test layers
 
@@ -25,7 +26,8 @@ runtime is available.
 - Evaluation tests measure retrieval paths and ranking; ignored real-model tests
   are separate because they download models and require network/runtime state.
 - Frontend tests cover components, routes, API adapters, and browser smoke
-  journeys. Live Rust-backed coverage is still pending.
+  journeys. Mock browser coverage runs in CI; live Rust-backed coverage runs
+  when the local model and native runtime prerequisites are available.
 
 ## Native and runtime prerequisites
 

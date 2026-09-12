@@ -121,11 +121,6 @@ export interface MergePreview {
   score: number | null;
 }
 
-export interface MergeResult {
-  mergedAt: string;
-  preview: MergePreview;
-}
-
 /** Counts for one category in the operator metrics snapshot. */
 export type MetricCounts = Record<string, number>;
 
@@ -161,7 +156,6 @@ export interface OharaApi {
   getHealth(): Promise<HealthSnapshot>;
   getMetrics(): Promise<MetricsSnapshot>;
   listDocuments(options?: DocumentListOptions): Promise<DocumentPage>;
-  mergeEntities(reviewId: string): Promise<MergeResult>;
   previewEntityMerge(reviewId: string): Promise<MergePreview>;
   queryKnowledgeBase(question: string): Promise<QueryResult>;
 }
@@ -340,7 +334,7 @@ const DEFAULT_METRICS: MetricsSnapshot = {
   capturedAt: "2026-09-11T00:00:00.000Z",
   documentsByStatus: {
     INDEXED: 2847,
-    PROCESSING: 12,
+    SCRAPED: 12,
     FAILED: 3,
   },
   dueForRecrawl: 8,
@@ -376,17 +370,14 @@ const DEFAULT_METRICS: MetricsSnapshot = {
   rawMaxBytes: 536_870_912,
 };
 
-/**
- * Creates the temporary adapter used until a live HTTP adapter is connected.
- * Production data should be provided by an implementation of [`OharaApi`].
- */
+/** Creates deterministic offline data for local UI development and tests. */
 export function createMockApi(
   snapshot: DashboardSnapshot = DEFAULT_DASHBOARD,
   documents: DocumentRecord[] = DEFAULT_DOCUMENTS,
   entityReviews: EntityReview[] = DEFAULT_ENTITY_REVIEWS,
   metricsSnapshot: MetricsSnapshot = DEFAULT_METRICS,
 ): OharaApi {
-  let pendingReviews = entityReviews.map((review) => cloneEntityReview(review));
+  const pendingReviews = entityReviews.map((review) => cloneEntityReview(review));
   const previewEntityMerge = async (reviewId: string): Promise<MergePreview> => {
     const review = pendingReviews.find((candidate) => candidate.id === reviewId);
     if (!review) {
@@ -441,11 +432,6 @@ export function createMockApi(
         items: pageItems.map((document) => ({ ...document })),
         nextCursor: hasNext ? pageItems.at(-1)?.id ?? null : null,
       };
-    },
-    async mergeEntities(reviewId) {
-      const preview = await previewEntityMerge(reviewId);
-      pendingReviews = pendingReviews.filter((review) => review.id !== reviewId);
-      return { mergedAt: new Date().toISOString(), preview };
     },
     previewEntityMerge,
     async queryKnowledgeBase(question) {

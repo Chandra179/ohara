@@ -2,7 +2,9 @@
 
 The language-model boundary owns provider identity, completion responses,
 structured-output support, and provider error mapping. It does not own pipeline
-state or prompt-side graph effects.
+state, prompt-side graph effects, or the networking mechanism used by an
+adapter. Network adapters live with the Engine plane; callers depend on this
+provider-neutral port.
 
 ## Current behavior
 

@@ -7,11 +7,11 @@ mod clean;
 mod embed;
 mod execution;
 mod extract;
+mod extract_graph;
 mod extraction_contract;
 mod query;
 mod recovery;
 mod retrieve;
-mod runtime;
 mod scrape;
 mod synthesis;
 mod usage;
@@ -24,6 +24,7 @@ use crate::control::{self, ControlDb, DbError, Stage};
 use crate::engine::Fetcher;
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
+use crate::runtime;
 
 pub use chunk::{Chunk, chunk_document};
 pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, ReadabilityExtractor};
@@ -303,9 +304,6 @@ impl Worker {
     }
 }
 
-/// In-crate test fakes for the pipeline ports (§14: fakes live next to the
-/// ports they fake; §10: tests panic/unwrap freely). Used by the stage-body
-/// unit tests in this module's children.
 /// Runs the worker loop until interrupted (§6: single worker by default).
 ///
 /// Boot: materializes the data directories, opens and migrates the control store,

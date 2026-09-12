@@ -1,8 +1,8 @@
 # Ohara frontend
 
 The frontend is a React + TypeScript + Vite application. It uses a typed mock
-adapter by default and has an opt-in HTTP adapter for the initial Rust API
-slice.
+adapter by default and has an opt-in HTTP adapter for the Rust read-only
+operator surface.
 
 ## Local development
 

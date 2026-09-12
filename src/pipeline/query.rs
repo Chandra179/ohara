@@ -8,9 +8,9 @@ use crate::control::{self, ControlDb};
 use crate::knowledge::ModelId;
 
 use super::retrieve::RetrievedContext;
-use super::runtime::{QueryPorts, query_ports};
 use super::synthesis;
 use super::{IdentityReranker, Retriever, ScoredChunk, WhatlangNormalizer};
+use crate::runtime::{QueryPorts, query_ports};
 
 pub use super::synthesis::QueryResponse;
 

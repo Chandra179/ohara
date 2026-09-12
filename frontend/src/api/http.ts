@@ -75,7 +75,6 @@ export function createHttpApi({ baseUrl = "", fetcher = fetch }: HttpApiOptions 
     getMetrics: () => request<unknown>("/api/metrics").then(parseMetricsSnapshot),
     listDocuments: (options) =>
       request<unknown>(documentsPath(options)).then(parseDocumentPage),
-    mergeEntities: () => unsupported("entity merge"),
     previewEntityMerge: (reviewId) =>
       request<unknown>(
         `/api/entities/reviews/${encodeURIComponent(reviewId)}/preview`,
@@ -519,8 +518,4 @@ function isHealthComponent(value: unknown): value is HealthComponent {
 
 function invalidResponse(resource: string): Error {
   return new Error(`The local API returned an invalid ${resource} response`);
-}
-
-function unsupported<T>(resource: string): Promise<T> {
-  return Promise.reject(new ApiRequestError(`The ${resource} API is not available yet`, 501));
 }

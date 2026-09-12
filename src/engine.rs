@@ -5,6 +5,7 @@
 mod http;
 mod impersonate;
 mod ladder;
+mod llm;
 mod obscura;
 mod robots;
 
@@ -13,6 +14,7 @@ use std::time::Duration;
 pub use http::{HttpFetcher, HttpFetcherParams};
 pub use impersonate::ImpersonationFetcher;
 pub use ladder::FetchLadder;
+pub use llm::Ollama;
 pub use obscura::ObscuraFetcher;
 
 use async_trait::async_trait;
@@ -79,11 +81,11 @@ impl NormalizedUrl {
         pairs.sort();
         // Rebuild the query from the sorted, filtered pairs; an empty set drops
         // the `?` entirely.
-        let rebuilt = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={}", urlencode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &pairs {
+            serializer.append_pair(key, value);
+        }
+        let rebuilt = serializer.finish();
         url.set_query(if rebuilt.is_empty() {
             None
         } else {
@@ -128,25 +130,6 @@ impl std::fmt::Display for NormalizedUrl {
 /// entries, or anything under the `utm_` prefix.
 fn is_tracking_param(key: &str) -> bool {
     key.starts_with("utm_") || TRACKING_PARAMS.binary_search(&key).is_ok()
-}
-
-/// Percent-encodes a rebuilt query value (the [`url`] crate keeps pairs decoded;
-/// `form_urlencoded` re-encodes with the standard `+`-for-space query rules).
-fn urlencode(value: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'*' => {
-                out.push(*byte as char);
-            }
-            b' ' => out.push('+'),
-            other => {
-                let _ = write!(out, "%{other:02X}");
-            }
-        }
-    }
-    out
 }
 
 /// URL validation failures.
@@ -423,5 +406,7 @@ mod tests {
         assert_eq!(url.as_str(), "https://example.com/q?lang=en&q=rust+sqlite");
         let url = NormalizedUrl::parse("https://example.com/q?q=a%2Bb").unwrap();
         assert_eq!(url.as_str(), "https://example.com/q?q=a%2Bb");
+        let url = NormalizedUrl::parse("https://example.com/q?weird%20key=a%26b").unwrap();
+        assert_eq!(url.as_str(), "https://example.com/q?weird+key=a%26b");
     }
 }

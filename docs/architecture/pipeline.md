@@ -1,7 +1,8 @@
 # Pipeline and stages
 
 The pipeline coordinates work without owning vendor implementations. It claims
-jobs from the control plane, composes ports, runs stages, and records outcomes.
+jobs from the control plane, receives behavioral ports, runs stages, and records
+outcomes.
 
 ## Stage flow
 

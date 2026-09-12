@@ -15,8 +15,8 @@ use crate::llm::Llm;
 
 use super::clean::Extractor;
 use super::embed::Embedder;
-use super::runtime::WorkerPorts;
 use super::{StageError, StageOutcome, clean, embed, extract, scrape};
+use crate::runtime::WorkerPorts;
 
 /// What the loop does after one claimed job's outcome is recorded.
 pub(crate) enum Flow {

@@ -64,6 +64,17 @@ toolchain. On Ubuntu or Debian:
 sudo apt install libssl-dev cmake g++
 ```
 
+If system package installation is unavailable, point the build at an OpenSSL
+development prefix instead. The `RUSTDOCFLAGS` entry keeps `make verify`
+working for doctests as well as normal binaries:
+
+```text
+OPENSSL_DIR=/path/to/openssl \
+RUSTFLAGS="-L native=/path/to/openssl/lib" \
+RUSTDOCFLAGS="-C link-arg=-L/path/to/openssl/lib" \
+make verify
+```
+
 The Ladybug dependency builds native code on its first build.
 The pinned embedding model downloads on first use into local runtime storage.
 Afterward it can be used offline.

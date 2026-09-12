@@ -1,8 +1,9 @@
-# Fetch engine
+# Network engine
 
 The engine owns all outbound network activity and implements the fetcher port.
-It is responsible for safe, policy-compliant fetching rather than document
-state or pipeline scheduling.
+It also contains HTTP adapters for provider ports such as local Ollama. It is
+responsible for safe, policy-compliant egress rather than document state,
+language-model semantics, or pipeline scheduling.
 
 ## Provider ladder
 

@@ -5,8 +5,8 @@ their important text and relationships, and lets you ask questions over the
 resulting knowledge base.
 
 It is designed for personal-scale collections on one computer. Local files and
-local models are the default. A cloud language model is optional and must be
-enabled deliberately.
+local models are the default. The built-in language-model path is local Ollama;
+cloud providers are planned and cloud egress is disabled today.
 
 ## What can it do?
 
@@ -22,9 +22,10 @@ enabled deliberately.
 - Inspect progress, usage, failed work, and maintenance state locally.
 
 The product interface includes views for overview, documents, queries, entity
-review, and operations. The visual product is ahead of the live data connection:
-health, metrics, and query are connected today; document, entity, and lifecycle
-actions are still being connected.
+review, and operations. The live read-only connection covers health, metrics,
+overview, documents, query, and entity-review previews. Lifecycle actions remain
+deliberately separate until their confirmation and idempotency contract is
+ready.
 
 ## The architecture in one picture
 
@@ -155,8 +156,8 @@ default.
 - The default vector search is exact rather than HNSW-accelerated.
 - The production query path currently uses the deterministic identity reranker
   baseline.
-- The live interface connection currently covers health, metrics, and query;
-  document, entity-review, and lifecycle data are next.
+- The live interface connection covers health, metrics, overview, documents,
+  query, and entity-review previews; lifecycle mutations are next.
 - Entity-resolution thresholds are conservative configuration defaults and still
   need measurement on larger, ambiguous collections.
 - Symspell correction, HyDE query expansion, stage throughput dashboards,

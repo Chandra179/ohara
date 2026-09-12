@@ -69,14 +69,4 @@ describe("mock API boundary", () => {
     );
   });
 
-  it("removes a merged entity review from subsequent reads", async () => {
-    const api = createMockApi();
-
-    const preview = await api.previewEntityMerge("review-1");
-    const result = await api.mergeEntities("review-1");
-    const reviews = await api.getEntityReviews();
-
-    expect(result.preview).toEqual(preview);
-    expect(reviews).not.toEqual(expect.arrayContaining([expect.objectContaining({ id: "review-1" })]));
-  });
 });

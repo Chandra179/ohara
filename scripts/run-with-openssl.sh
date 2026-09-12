@@ -9,6 +9,7 @@ fi
 
 openssl_dir="${OPENSSL_DIR:-}"
 rustflags="${RUSTFLAGS:-}"
+rustdocflags="${RUSTDOCFLAGS:-}"
 fallback_dir="${OPENSSL_FALLBACK_DIR:-/tmp/ohara-ossl}"
 multiarch="$(cc -print-multiarch 2>/dev/null || true)"
 runtime_lib_dir="${OPENSSL_RUNTIME_LIB_DIR:-/usr/lib/$multiarch}"
@@ -40,8 +41,10 @@ fi
 
 if [ -n "$openssl_dir" ]; then
 	rustflags="$rustflags -L native=$openssl_dir/lib"
+	rustdocflags="$rustdocflags -C link-arg=-L$openssl_dir/lib"
 fi
 
 export OPENSSL_DIR="$openssl_dir"
 export RUSTFLAGS="$rustflags"
+export RUSTDOCFLAGS="$rustdocflags"
 exec "$@"

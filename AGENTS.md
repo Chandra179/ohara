@@ -11,7 +11,7 @@ Single-crate Rust workspace (edition 2024, Rust 1.95+): `lib.rs` holds library l
 - `lbug` links OpenSSL at link time → `sudo apt install libssl-dev` (README §Building has a no-sudo `OPENSSL_DIR` workaround) and compiles its bundled C++ engine on first build (CMake + C++ toolchain, ~2 GB scratch).
 - ONNX models (`bge-small-en-v1.5`, reranker) are fetched from the HF hub on first use into the configured models dir; offline afterwards. Real-model eval caches under `~/.cache/ohara-test`.
 
-## Verification (gates from CODE_GUIDE §7; no CI is wired up yet — run these yourself)
+## Verification (gates from CODE_GUIDE §7; CI runs these on every change)
 ```
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings

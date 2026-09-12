@@ -72,6 +72,8 @@ pub mod pipeline;
 pub mod server;
 pub mod text;
 
+mod runtime;
+
 pub use pipeline::run;
 
 /// Errors that abort startup before the worker loop begins (§10: fail fast at
