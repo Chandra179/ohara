@@ -170,9 +170,9 @@ mod tests {
     use crate::config::Config;
     use crate::control::testing::seed_doc;
     use crate::control::{self, ClaimedJob, ControlDb, NewChunkRow, Stage};
-    use crate::knowledge::{KnowledgeStore, VectorSpace};
+    use crate::knowledge::{InMemoryKnowledge, KnowledgeStore, VectorSpace};
     use crate::llm::CompletionResponse;
-    use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
+    use crate::pipeline::test_support::FakeEmbedder;
     use crate::text::sha256_hex;
 
     const NOW: &str = "2026-09-06 12:00:00";
@@ -376,7 +376,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
-        assert_eq!(model, "phi4-mini:latest", "§11 prompt-version guard");
+        assert_eq!(model, "gemma3:1b", "§11 prompt-version guard");
 
         // The registry: three entities with typed aliases.
         let people = entities_of(&conn, "PERSON");
@@ -485,7 +485,10 @@ mod tests {
         assert_eq!(llm.calls(), 1, "§7.7: extraction is never paid twice");
         let facts = knowledge.facts();
         assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].3, 1, "evidence dedup keeps support at 1");
+        assert_eq!(
+            facts[0].support_count, 1,
+            "evidence dedup keeps support at 1"
+        );
         let conn = control::connect(&fx.store).unwrap();
         let count: i64 = conn
             .raw()

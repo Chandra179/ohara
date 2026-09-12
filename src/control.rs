@@ -751,7 +751,6 @@ pub fn set_site_policy(
 pub(crate) use db::{now, now_plus};
 
 /// Computes a timestamp before `now` using the control plane's canonical format.
-#[cfg(feature = "ladybug")]
 pub(crate) fn before(now_stamp: &str, duration: std::time::Duration) -> Result<String, DbError> {
     let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX / 2);
     db::shift(now_stamp, -seconds)

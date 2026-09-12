@@ -40,7 +40,10 @@ describe("HTTP API boundary", () => {
     });
     expect(fetcher).toHaveBeenCalledWith(
       "/api/topics/scrape",
-      expect.objectContaining({ method: "POST" }),
+      expect.objectContaining({
+        body: JSON.stringify({ limit: 2, topic: "september 2026 news" }),
+        method: "POST",
+      }),
     );
   });
 

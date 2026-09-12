@@ -31,7 +31,7 @@ pub(crate) struct ReadinessDiagnostic {
 pub(crate) struct ReadinessReport {
     /// `SQLite` control store status.
     pub(crate) control_store: ReadinessCheck,
-    /// `LadybugDB` knowledge store status.
+    /// Qdrant and `FalkorDB` knowledge-service status.
     pub(crate) knowledge_store: ReadinessCheck,
     /// Local embedding model status.
     pub(crate) embedder: ReadinessCheck,
@@ -127,38 +127,23 @@ async fn check_control_store(config: Config) -> ReadinessCheck {
     }
 }
 
-#[cfg(feature = "ladybug")]
 async fn check_knowledge_store(config: Config) -> ReadinessCheck {
-    let result = tokio::task::spawn_blocking(move || {
-        crate::knowledge::LadybugStore::open(
-            &config.data_dir().join("ladybug"),
-            config.embedder().dim(),
-        )
-        .map(|_| ())
-    })
-    .await;
+    let result = match crate::knowledge::RemoteKnowledgeStore::connect(
+        config.knowledge(),
+        config.embedder().dim(),
+        true,
+    ) {
+        Ok(store) => store.health().await,
+        Err(error) => Err(error),
+    };
     match result {
-        Ok(Ok(())) => available(),
-        Ok(Err(error)) => unavailable(
-            "knowledgeStore",
-            format!("knowledge store is unavailable: {error}"),
-            "Repair or rebuild the local knowledge index, then restart Ohara.",
-        ),
+        Ok(()) => available(),
         Err(error) => unavailable(
             "knowledgeStore",
-            format!("knowledge store health check failed: {error}"),
-            "Restart the local API and check the knowledge-store logs.",
+            format!("knowledge store is unavailable: {error}"),
+            "Run `make services`, then check the Qdrant and FalkorDB logs.",
         ),
     }
-}
-
-#[cfg(not(feature = "ladybug"))]
-fn check_knowledge_store(_config: Config) -> std::future::Ready<ReadinessCheck> {
-    std::future::ready(unavailable(
-        "knowledgeStore",
-        "Ohara was built without the `ladybug` feature.",
-        "Use the default feature set or inject a KnowledgeStore.",
-    ))
 }
 
 async fn check_embedder(config: Config) -> ReadinessCheck {

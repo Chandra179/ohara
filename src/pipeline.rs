@@ -16,6 +16,7 @@ mod scrape;
 mod synthesis;
 mod usage;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -171,18 +172,17 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Boots a worker with the real ports: engine-plane fetch ladder (HTTP plus
-    /// browser-profile impersonation), the readability extractor, the pinned
-    /// local embedder, and the embedded
-    /// `LadybugDB` knowledge store. Callers create the data directories first
-    /// ([`run`] does).
+    /// Asynchronously boots a worker with the real ports: engine-plane fetch
+    /// ladder (HTTP plus browser-profile impersonation), the readability
+    /// extractor, the pinned local embedder, and the Qdrant/FalkorDB knowledge
+    /// services. Callers create the data directories first ([`run`] does).
     ///
     /// # Errors
     /// [`crate::BootError`] if the store cannot be opened/migrated, the runtime
     /// handle is unavailable, or any default port cannot be built.
-    pub fn new(config: Arc<Config>) -> Result<Self, crate::BootError> {
+    pub async fn new(config: Arc<Config>) -> Result<Self, crate::BootError> {
         let runtime_lock = runtime::acquire_lock(&config)?;
-        let ports = runtime::worker_ports(&config)?;
+        let ports = runtime::worker_ports(&config).await?;
         Self::with_ports_locked(config, ports, runtime_lock)
     }
 
@@ -293,7 +293,7 @@ impl Worker {
     }
 
     /// Runs the full §7.3 boot reconciliation sweep before the loop claims
-    /// anything: interrupted §7.6 deletions are removed from `LadybugDB` first,
+    /// anything: interrupted §7.6 deletions are removed from the knowledge
     /// then from `SQLite`, and the §5 audit trail is pruned to retention. Expired
     /// leases are deliberately not swept — the §6 claim reclaims them with the
     /// correct accounting.
@@ -416,11 +416,20 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
     if let Some(parent) = config.db_path().parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let worker = Arc::new(Worker::new(Arc::clone(&config))?);
+    eprintln!("ohara: worker booting providers");
+    let worker = Arc::new(Worker::new(Arc::clone(&config)).await?);
+    eprintln!("ohara: worker registered as {}", worker.id);
     let heartbeat = worker.spawn_heartbeat();
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_listener = tokio::spawn(listen_for_shutdown(Arc::clone(&shutdown_requested)));
     let result: Result<(), crate::BootError> = async {
         worker.reconcile().await?;
+        if shutdown_requested.load(Ordering::Acquire) {
+            worker.set_worker_state(control::WorkerState::Stopping, None, None, None)?;
+            return Ok(());
+        }
         worker.set_worker_state(control::WorkerState::Ready, None, None, None)?;
+        eprintln!("ohara: worker ready");
 
         loop {
             let executed = tokio::task::spawn_blocking({
@@ -430,20 +439,19 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
             .await
             .map_err(|join| crate::BootError::Worker(join.to_string()))??;
 
+            if shutdown_requested.load(Ordering::Acquire) {
+                worker.set_worker_state(control::WorkerState::Stopping, None, None, None)?;
+                break;
+            }
             if executed == 0 {
-                tokio::select! {
-                    () = tokio::time::sleep(config.poll_interval()) => {}
-                    _ = tokio::signal::ctrl_c() => {
-                        worker.set_worker_state(control::WorkerState::Stopping, None, None, None)?;
-                        break;
-                    }
-                }
+                tokio::time::sleep(config.poll_interval()).await;
             }
             // Jobs executed: loop immediately to drain the queue.
         }
         Ok(())
     }
     .await;
+    shutdown_listener.abort();
     heartbeat.abort();
 
     let (state, error) = match &result {
@@ -454,17 +462,42 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
     result
 }
 
+async fn listen_for_shutdown(shutdown_requested: Arc<AtomicBool>) {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            eprintln!("ohara: failed to install Ctrl-C handler: {error}");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("ohara: failed to install SIGTERM handler: {error}");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    eprintln!("ohara: failed to install Ctrl-C handler: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("ohara: failed to install Ctrl-C handler: {error}");
+    }
+
+    shutdown_requested.store(true, Ordering::Release);
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use std::collections::HashMap;
     use std::sync::Mutex;
-
-    use crate::knowledge::{
-        ChunkFilter, EntityRecord, Fact, KnowledgeError, KnowledgeStore, Predicate, ScoredHit,
-        VectorSpace,
-    };
 
     /// Deterministic embedder fake (§14): whitespace token counting +2 for
     /// specials, vectors derived from a word hash — chunks sharing vocabulary
@@ -529,366 +562,6 @@ pub(crate) mod test_support {
                     }
                 })
                 .collect())
-        }
-    }
-
-    /// One stored vector: `(doc_id, vector)`.
-    type StoredVector = (String, Vec<f32>);
-
-    /// The §8 Stage 4 aggregation a [`KnowledgeStore`] fake must hold for
-    /// fact-merge assertions.
-    type StoredFact = (
-        String,      // subject_id
-        Predicate,   // predicate
-        String,      // object_id
-        u64,         // support_count
-        Vec<String>, // evidence chunk ids (capped)
-        Vec<String>, // occurrences (capped)
-    );
-
-    /// The in-memory `KnowledgeStore` fake (§14): vectors keyed by
-    /// `(space, id)` with document membership, brute-force cosine KNN, plus the
-    /// graph state Stage 4 writes (entities, `:MENTIONS`, fact edges with the
-    /// §8 aggregation). Graph reads mirror the postconditions of the real impl.
-    pub struct InMemoryKnowledge {
-        vectors: Mutex<HashMap<(String, String), StoredVector>>,
-        entities: Mutex<HashMap<String, EntityRecord>>,
-        mentions: Mutex<std::collections::HashSet<(String, String)>>,
-        facts: Mutex<HashMap<(String, String, String), StoredFact>>,
-        graph_traversal: bool,
-    }
-
-    impl Default for InMemoryKnowledge {
-        fn default() -> Self {
-            Self {
-                vectors: Mutex::new(HashMap::new()),
-                entities: Mutex::new(HashMap::new()),
-                mentions: Mutex::new(std::collections::HashSet::new()),
-                facts: Mutex::new(HashMap::new()),
-                // The fake mirrors the real store's reads (§14), so it declares
-                // the same capability by default.
-                graph_traversal: true,
-            }
-        }
-    }
-
-    fn key(space: &VectorSpace, id: &str) -> (String, String) {
-        (format!("{space:?}"), id.to_string())
-    }
-
-    impl InMemoryKnowledge {
-        /// The capability-off variant: a store without graph traversal, for
-        /// the §8 Stage 5 degradation tests.
-        #[must_use]
-        pub fn without_graph() -> Self {
-            Self {
-                graph_traversal: false,
-                ..Self::default()
-            }
-        }
-
-        /// Test helper: simulates a lost vector (§7.3 repair path).
-        pub fn remove(&self, id: &str) {
-            self.vectors.lock().unwrap().retain(|(_, key), _| key != id);
-        }
-
-        /// Test helper: all fact edges currently stored.
-        pub fn facts(&self) -> Vec<StoredFact> {
-            self.facts.lock().unwrap().values().cloned().collect()
-        }
-
-        fn cosine(a: &[f32], b: &[f32]) -> f32 {
-            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-            let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if na == 0.0 || nb == 0.0 {
-                0.0
-            } else {
-                dot / (na * nb)
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl KnowledgeStore for InMemoryKnowledge {
-        fn capabilities(&self) -> crate::knowledge::KsCapabilities {
-            crate::knowledge::KsCapabilities {
-                filtered_ann: false,
-                graph_traversal: self.graph_traversal,
-            }
-        }
-
-        async fn upsert_vectors(
-            &self,
-            space: VectorSpace,
-            doc_id: &str,
-            ids: &[&str],
-            vectors: &[Vec<f32>],
-        ) -> Result<(), KnowledgeError> {
-            let mut store = self.vectors.lock().unwrap();
-            for (id, v) in ids.iter().zip(vectors) {
-                store.insert(key(&space, id), (doc_id.to_string(), v.clone()));
-            }
-            Ok(())
-        }
-
-        async fn knn(
-            &self,
-            space: VectorSpace,
-            q: &[f32],
-            k: usize,
-            _f: &ChunkFilter,
-        ) -> Result<Vec<ScoredHit>, KnowledgeError> {
-            let store = self.vectors.lock().unwrap();
-            let mut hits: Vec<ScoredHit> = store
-                .iter()
-                .filter(|((s, _), _)| *s == format!("{space:?}"))
-                .map(|((_, id), (_, v))| ScoredHit {
-                    id: id.clone(),
-                    score: Self::cosine(q, v),
-                })
-                .collect();
-            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
-            hits.truncate(k);
-            Ok(hits)
-        }
-
-        async fn has_vector(&self, space: VectorSpace, id: &str) -> Result<bool, KnowledgeError> {
-            Ok(self.vectors.lock().unwrap().contains_key(&key(&space, id)))
-        }
-
-        async fn upsert_entity(&self, e: &EntityRecord) -> Result<(), KnowledgeError> {
-            self.entities
-                .lock()
-                .unwrap()
-                .insert(e.entity_id.clone(), e.clone());
-            Ok(())
-        }
-
-        async fn link_mention(
-            &self,
-            chunk_id: &str,
-            entity_id: &str,
-        ) -> Result<(), KnowledgeError> {
-            self.mentions
-                .lock()
-                .unwrap()
-                .insert((chunk_id.to_string(), entity_id.to_string()));
-            Ok(())
-        }
-
-        async fn fold_entity(&self, loser: &str, winner: &str) -> Result<(), KnowledgeError> {
-            if loser == winner {
-                return Ok(());
-            }
-
-            self.entities.lock().unwrap().remove(loser);
-
-            let mut mentions = self.mentions.lock().unwrap();
-            let rewired: Vec<(String, String)> = mentions
-                .iter()
-                .filter(|(_, entity)| entity == loser)
-                .map(|(chunk, _)| (chunk.clone(), winner.to_string()))
-                .collect();
-            mentions.retain(|(_, entity)| entity != loser);
-            mentions.extend(rewired);
-            drop(mentions);
-
-            let mut facts = self.facts.lock().unwrap();
-            let existing = std::mem::take(&mut *facts);
-            for (_, (subject, predicate, object, support, evidence, occurrences)) in existing {
-                let subject = if subject == loser {
-                    winner.to_string()
-                } else {
-                    subject
-                };
-                let object = if object == loser {
-                    winner.to_string()
-                } else {
-                    object
-                };
-                let key = (
-                    subject.clone(),
-                    predicate.as_str().to_string(),
-                    object.clone(),
-                );
-                let entry = facts.entry(key).or_insert_with(|| {
-                    (
-                        subject.clone(),
-                        predicate,
-                        object.clone(),
-                        0,
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                });
-                entry.3 = entry.3.saturating_add(support);
-                for item in evidence {
-                    if !entry.4.iter().any(|existing| existing == &item) {
-                        entry.4.push(item);
-                    }
-                }
-                for item in occurrences {
-                    if !entry.5.iter().any(|existing| existing == &item) {
-                        entry.5.push(item);
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        async fn merge_fact(
-            &self,
-            subject_id: &str,
-            predicate: Predicate,
-            object_id: &str,
-            evidence_chunk: &str,
-            properties: Option<&serde_json::Value>,
-            caps: crate::knowledge::FactCaps,
-        ) -> Result<(), KnowledgeError> {
-            let identity = (
-                subject_id.to_string(),
-                predicate.as_str().to_string(),
-                object_id.to_string(),
-            );
-            let mut facts = self.facts.lock().unwrap();
-            let entry = facts.entry(identity).or_insert_with(|| {
-                (
-                    subject_id.to_string(),
-                    predicate,
-                    object_id.to_string(),
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                )
-            });
-            // §8 aggregation mirror: support increments on new evidence; lists
-            // capped + deduped; replay with the same chunk is a no-op.
-            if !entry.4.iter().any(|c| c == evidence_chunk) {
-                entry.3 += 1;
-                if entry.4.len() < caps.max_evidence {
-                    entry.4.push(evidence_chunk.to_string());
-                }
-            }
-            if let Some(props) = properties {
-                let values: Vec<String> = props.get("occurred_on").map_or_else(Vec::new, |v| {
-                    v.as_array()
-                        .map_or_else(Vec::new, |arr| {
-                            arr.iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .into_iter()
-                        .chain(v.as_str().map(str::to_string))
-                        .collect()
-                });
-                for value in values {
-                    if !entry.5.iter().any(|o| o == &value) && entry.5.len() < caps.max_occurrences
-                    {
-                        entry.5.push(value);
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        async fn delete_doc(&self, doc_id: &str) -> Result<(), KnowledgeError> {
-            let mut deleted_chunks = std::collections::HashSet::new();
-            self.vectors.lock().unwrap().retain(|(space, id), (d, _)| {
-                let keep = d != doc_id;
-                if !keep && space.starts_with("Chunks") {
-                    deleted_chunks.insert(id.clone());
-                }
-                keep
-            });
-            self.mentions
-                .lock()
-                .unwrap()
-                .retain(|(chunk, _)| !deleted_chunks.contains(chunk));
-            Ok(())
-        }
-
-        async fn delete_entity(&self, entity_id: &str) -> Result<bool, KnowledgeError> {
-            if !self.entities.lock().unwrap().contains_key(entity_id) {
-                self.vectors
-                    .lock()
-                    .unwrap()
-                    .remove(&key(&VectorSpace::EntityNames, entity_id));
-                return Ok(false);
-            }
-            let has_mention = self
-                .mentions
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, id)| id == entity_id);
-            let has_fact = self
-                .facts
-                .lock()
-                .unwrap()
-                .keys()
-                .any(|(subject, _, object)| subject == entity_id || object == entity_id);
-            if has_mention || has_fact {
-                return Ok(false);
-            }
-            self.entities.lock().unwrap().remove(entity_id);
-            self.vectors
-                .lock()
-                .unwrap()
-                .remove(&key(&VectorSpace::EntityNames, entity_id));
-            Ok(true)
-        }
-
-        async fn chunks_for_entities(&self, ids: &[&str]) -> Result<Vec<String>, KnowledgeError> {
-            let mentions = self.mentions.lock().unwrap();
-            let mut chunks: Vec<String> = mentions
-                .iter()
-                .filter(|(_, entity)| ids.iter().any(|id| id == entity))
-                .map(|(chunk, _)| chunk.clone())
-                .collect();
-            chunks.sort();
-            chunks.dedup();
-            Ok(chunks)
-        }
-
-        async fn facts_within_hops(
-            &self,
-            ids: &[&str],
-            hops: u8,
-        ) -> Result<Vec<Fact>, KnowledgeError> {
-            if ids.is_empty() || hops == 0 {
-                return Ok(Vec::new());
-            }
-            let facts = self.facts.lock().unwrap();
-            let mut frontier: std::collections::HashSet<String> =
-                ids.iter().map(|s| (*s).to_string()).collect();
-            let mut out: Vec<Fact> = Vec::new();
-            let mut seen: std::collections::HashSet<(String, String, String)> =
-                std::collections::HashSet::new();
-            for _ in 0..hops {
-                let mut next = std::collections::HashSet::new();
-                for (subj, pred, obj, support, _evidence, _occ) in facts.values() {
-                    if frontier.contains(subj) || frontier.contains(obj) {
-                        if seen.insert((subj.clone(), pred.as_str().to_string(), obj.clone())) {
-                            out.push(Fact {
-                                subject_id: subj.clone(),
-                                predicate: *pred,
-                                object_id: obj.clone(),
-                                support_count: *support,
-                                properties: None,
-                            });
-                        }
-                        next.insert(subj.clone());
-                        next.insert(obj.clone());
-                    }
-                }
-                if next.is_empty() {
-                    break;
-                }
-                frontier = next;
-            }
-            Ok(out)
         }
     }
 }

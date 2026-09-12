@@ -115,6 +115,7 @@ fn resolve(
 
     if let Some(id) = control::lookup_alias(ctx.conn, &normalized, entity_type.as_str())? {
         ensure_name_vector(ctx, &id, attempt)?;
+        ensure_entity_node(ctx, &id, entity_type, attempt)?;
         cache.resolved.insert(key, id.clone());
         return Ok(id);
     }
@@ -132,6 +133,7 @@ fn resolve(
                 }
                 None => best.0.clone(),
             };
+        ensure_entity_node(ctx, &owner, entity_type, attempt)?;
         cache.resolved.insert(key, owner.clone());
         return Ok(owner);
     }
@@ -148,6 +150,7 @@ fn resolve(
             &[vector],
         ))
         .map_err(|e| knowledge_err(&e, attempt))?;
+    ensure_entity_node(ctx, &id, entity_type, attempt)?;
     cache.resolved.insert(key, id.clone());
     Ok(id)
 }
@@ -250,6 +253,32 @@ fn ensure_name_vector(
         ))
         .map_err(|e| knowledge_err(&e, attempt))?;
     Ok(())
+}
+
+fn ensure_entity_node(
+    ctx: &ExtractContext<'_>,
+    entity_id: &str,
+    entity_type: EntityType,
+    attempt: u32,
+) -> Result<(), StageError> {
+    let canonical_name = control::canonical_name(ctx.conn, entity_id)
+        .map_err(StageError::fatal)?
+        .ok_or_else(|| {
+            StageError::fatal(format!(
+                "entity {entity_id:?} has no canonical name in the control registry"
+            ))
+        })?;
+    ctx.handle
+        .block_on(
+            ctx.knowledge
+                .upsert_entity(&crate::knowledge::EntityRecord {
+                    entity_id: entity_id.to_string(),
+                    canonical_name,
+                    entity_type,
+                    subtype: None,
+                }),
+        )
+        .map_err(|e| knowledge_err(&e, attempt))
 }
 
 fn merge_triplet_parts(

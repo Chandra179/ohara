@@ -91,6 +91,6 @@ remains gated until retrieval and ER measurement contracts are stable.
 ## Implementation boundary
 
 The frontend should consume a typed HTTP/JSON boundary when one is available.
-It must not access SQLite, LadybugDB, Rust modules, or local runtime files
+It must not access SQLite, Qdrant, FalkorDB, Rust modules, or local runtime files
 directly. Until the API contract exists, use typed fixtures or a mock adapter
 behind the same client interface.

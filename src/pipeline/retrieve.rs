@@ -668,8 +668,8 @@ mod tests {
     use crate::config::Config;
     use crate::control::testing::seed_doc;
     use crate::control::{self, ControlDb, NewChunkRow};
-    use crate::knowledge::{ModelId, VectorSpace};
-    use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
+    use crate::knowledge::{InMemoryKnowledge, ModelId, VectorSpace};
+    use crate::pipeline::test_support::FakeEmbedder;
     use crate::text::sha256_hex;
 
     use super::{

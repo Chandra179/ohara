@@ -23,7 +23,7 @@ pub struct ReconcileReport {
 ///
 /// The worker uses this after it has completed the knowledge-first deletion
 /// protocol. Keeping the operation separate prevents a boot sweep from
-/// deleting a `SQLite` document before its `LadybugDB` index is cleaned.
+/// deleting a `SQLite` document before its knowledge indexes are cleaned.
 pub(crate) fn reconcile_retention(
     conn: &Connection,
     now_stamp: &str,

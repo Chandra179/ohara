@@ -2,7 +2,7 @@
 
 The frontend is a separate client with one typed API boundary. It owns layout,
 view state, loading/empty/error states, notifications, and user interaction.
-It does not know about SQLite, LadybugDB, provider SDKs, filesystem paths, or
+It does not know about SQLite, Qdrant, FalkorDB, provider SDKs, filesystem paths, or
 CLI subprocesses.
 
 ## Current shape

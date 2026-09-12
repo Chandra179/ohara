@@ -8,8 +8,7 @@ Single-crate Rust workspace (edition 2024, Rust 1.95+): `lib.rs` holds library l
 - `TODO.md` — what is NOT implemented yet. Notably: cloud `Llm` providers, embedding dual-write migration, Symspell/HyDE evaluation, stage throughput dashboards, HNSW, and threshold measurement remain open. These are tracked, not broken — don't "fix" them as bugs.
 
 ## Build prerequisites (non-obvious)
-- `lbug` links OpenSSL at link time → `sudo apt install libssl-dev` (README §Building has a no-sudo `OPENSSL_DIR` workaround) and compiles its bundled C++ engine on first build (CMake + C++ toolchain, ~2 GB scratch).
-- ONNX models (`bge-small-en-v1.5`, reranker) are fetched from the HF hub on first use into the configured models dir; offline afterwards. Real-model eval caches under `~/.cache/ohara-test`.
+- Qdrant and FalkorDB run as local Docker Compose services (`make services`). ONNX models (`bge-small-en-v1.5`, reranker) are fetched from the HF hub on first use into the configured models dir; offline afterwards. Real-model eval caches under `~/.cache/ohara-test`.
 
 ## Verification (gates from CODE_GUIDE §7; CI runs these on every change)
 ```
@@ -31,11 +30,11 @@ Focused runs:
 - The only clippy pedantic allowance: `module_name_repetitions` (justified in Cargo.toml). Don't add more.
 
 ## Architecture rules (verified, not guessable from filenames)
-- Three planes, each the sole owner of its datastore: `control/` = all SQLite, `knowledge/` = all LadybugDB, `engine/` = all networking. `pipeline/` depends only on port traits (`Fetcher`, `KnowledgeStore`, `Embedder`, `Reranker`, `Llm`, `Extractor`, `QueryNormalizer`) re-exported through the plane facades. A PR that names a vendor type (`lbug`, `fastembed`, `rusqlite`, …) outside its owning plane is rejected.
-- Heavy native stacks are feature-gated: `default = ["ladybug", "onnx-embedder"]`. `LocalEmbedder`/`LocalReranker` are `#[cfg(feature = "onnx-embedder")]`. `--no-default-features` is for deployments injecting remote providers through `Worker::with_ports`.
+- Three planes, each the sole owner of its datastore: `control/` = all SQLite, `knowledge/` = Qdrant and FalkorDB, `engine/` = all networking. `pipeline/` depends only on port traits (`Fetcher`, `KnowledgeStore`, `Embedder`, `Reranker`, `Llm`, `Extractor`, `QueryNormalizer`) re-exported through the plane facades. A PR that names a vendor type (`redis`, `fastembed`, `rusqlite`, …) outside its owning plane is rejected.
+- The ONNX stack is feature-gated: `default = ["onnx-embedder"]`. `LocalEmbedder`/`LocalReranker` are `#[cfg(feature = "onnx-embedder")]`. `--no-default-features` is for deployments injecting remote providers through `Worker::with_ports`.
 - `data/` is gitignored — runtime system of record, never commit it.
 - Identity discipline: immutable rows are content-hash keyed (`chunk_id = sha256(doc_id:seq)`, triplets likewise); entities use uuidv7 surrogates + `UNIQUE(canonical_name, entity_type)`. Writes are idempotent upserts (`ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE`) — replay/retry must be safe.
-- Chunk/triplet/vector writes must keep SQLite and LadybugDB consistent; there is no shared transaction — follow the §7 protocol.
+- Chunk/triplet/vector writes must keep SQLite, Qdrant, and FalkorDB consistent; there is no shared transaction — follow the §7 protocol.
 - Commit messages reference build order, e.g. `…(§15 step 4)`.
 
 ## Conventions

@@ -484,34 +484,37 @@ export function createMockApi(
     previewEntityMerge,
     async scrapeTopic(topic, limit) {
       const normalizedTopic = topic.trim();
+      const requested = limit ?? 5;
+      const documents = [
+        {
+          documentId: "topic-doc-1",
+          jobId: "topic-job-1",
+          sourceUrl: "https://example.com/news/one",
+          status: "enqueued" as const,
+          title: `${normalizedTopic} · lead story`,
+        },
+        {
+          documentId: "topic-doc-2",
+          jobId: "topic-job-2",
+          sourceUrl: "https://example.com/news/two",
+          status: "enqueued" as const,
+          title: `${normalizedTopic} · second story`,
+        },
+        {
+          documentId: "topic-doc-3",
+          jobId: null,
+          sourceUrl: "https://example.com/news/three",
+          status: "duplicate" as const,
+          title: `${normalizedTopic} · already saved`,
+        },
+      ].slice(0, requested);
+      const duplicates = documents.filter((document) => document.status === "duplicate").length;
       return {
-        discovered: 3,
-        documents: [
-          {
-            documentId: "topic-doc-1",
-            jobId: "topic-job-1",
-            sourceUrl: "https://example.com/news/one",
-            status: "enqueued",
-            title: `${normalizedTopic} · lead story`,
-          },
-          {
-            documentId: "topic-doc-2",
-            jobId: "topic-job-2",
-            sourceUrl: "https://example.com/news/two",
-            status: "enqueued",
-            title: `${normalizedTopic} · second story`,
-          },
-          {
-            documentId: "topic-doc-3",
-            jobId: null,
-            sourceUrl: "https://example.com/news/three",
-            status: "duplicate",
-            title: `${normalizedTopic} · already saved`,
-          },
-        ],
-        duplicates: 1,
-        enqueued: 2,
-        requested: limit ?? 5,
+        discovered: documents.length,
+        documents,
+        duplicates,
+        enqueued: documents.length - duplicates,
+        requested,
         topic: normalizedTopic,
       };
     },

@@ -2,8 +2,8 @@
 
 Ohara builds a private, local knowledge base from documents. It cleans content,
 turns it into searchable text and relationships, and answers questions with
-citations. It runs as one Rust process with local storage and optional local
-Ollama language models.
+citations. The ingestion worker and optional local HTTP API run as separate Rust
+processes using SQLite, Qdrant, FalkorDB, and optional local Ollama models.
 
 ## What it provides
 
@@ -57,52 +57,68 @@ make build
 make verify
 ```
 
-The default build needs OpenSSL development libraries, CMake, and a C++
-toolchain. On Ubuntu or Debian:
-
-```text
-sudo apt install libssl-dev cmake g++
-```
-
-If system package installation is unavailable, point the build at an OpenSSL
-development prefix instead. The `RUSTDOCFLAGS` entry keeps `make verify`
-working for doctests as well as normal binaries:
-
-```text
-OPENSSL_DIR=/path/to/openssl \
-RUSTFLAGS="-L native=/path/to/openssl/lib" \
-RUSTDOCFLAGS="-C link-arg=-L/path/to/openssl/lib" \
-make verify
-```
-
-The Ladybug dependency builds native code on its first build.
 The pinned embedding model downloads on first use into local runtime storage.
-Afterward it can be used offline.
+Afterward it can be used offline. Qdrant and FalkorDB run as local containers.
 
-## Local frontend
+## Local development
 
-Run the Rust API and frontend in separate terminals:
-
-```text
-make backend
-make frontend
-```
-
-Or start both together:
+Start the complete local stack with one command:
 
 ```text
 make dev
 ```
 
+`make dev` starts Qdrant and FalkorDB with Docker Compose, then starts the Rust
+API, ingestion worker, and Vite frontend in one terminal, so all logs are
+visible together.
 The API listens on `127.0.0.1:3000` and the frontend on `127.0.0.1:5173`.
-The frontend uses its mock data by default; the development launchers select the
-Rust-backed HTTP mode. The live API supports health, metrics, overview,
-documents, topic discovery/queueing, query, and entity-review previews. The
-worker still runs as a separate process, and lifecycle mutations remain tracked
-work.
+Press `Ctrl-C` to stop the complete stack; the launcher forwards the signal to
+the service processes, waits for graceful shutdown, and stops the Compose
+services.
 
-Both individual launch commands free their configured TCP port first. Override
-`API_BIND`, `API_PROXY_TARGET`, or `FRONTEND_PORT` when needed.
+The Compose file uses Qdrant host ports `6335/6336` and FalkorDB host port
+`6380` by default. If
+another project is already publishing one of those ports, stop that project
+first or override the Compose port and matching `[knowledge]` URL in
+`ohara.toml`.
+
+For normal use, this is the only launch command you need. Use the separate
+targets only when debugging one service or inspecting its logs in a dedicated
+terminal.
+
+To run one service in its own terminal, use:
+
+```text
+make backend
+make worker
+make frontend
+```
+
+Start `make services` once before using the focused targets. `make frontend`
+expects the API to already be running. `make worker` consumes queued documents
+and runs the fetch, clean, chunk, embedding, and graph stages; the API does not
+supervise it. These Make targets select the Rust-backed HTTP mode. Pass the
+same configuration to both backend and worker, for example:
+
+```text
+make backend CONFIG_ARGS='--config /path/to/ohara.toml'
+make worker CONFIG_ARGS='--config /path/to/ohara.toml'
+```
+
+Use `make services` only when you need to manage Qdrant and FalkorDB without
+starting Ohara. `make services-down` stops them and `make services-logs` follows
+their logs.
+
+The live API supports health, metrics, overview, topic discovery/queueing, query,
+documents, and entity-review previews. Lifecycle mutations remain tracked work.
+
+Knowledge data is derived. If a Qdrant or FalkorDB volume is lost, recreate the
+services and re-run vectorization/extraction from the durable control data.
+
+The backend and frontend launch commands free their configured TCP port first. Override
+`API_BIND`, `API_PROXY_TARGET`, or `FRONTEND_PORT` when needed. The internal port
+cleanup and readiness helpers are used by these launchers and are not needed
+during normal development.
 
 ## Querying
 
@@ -117,29 +133,23 @@ The query combines full-text, vector, and graph signals. It returns a bounded
 answer with exact evidence citations when the language model produces grounded
 output. Otherwise it returns the ranked evidence so retrieval remains useful.
 
-From the Overview screen, enter a topic such as `september 2026 news` to
-discover a bounded set of news URLs. Ohara normalizes and deduplicates the
-results before adding new documents to the durable queue. Start the worker to
-fetch and index queued documents.
+From the Overview screen, enter a topic such as `september 2026 news` and choose
+the maximum number of articles to discover (1–10, default 5). Ohara normalizes
+and deduplicates the results before adding new documents to the durable queue.
+Start the worker to fetch and index queued documents.
 
 ## Operator commands
 
-The command-line operator surface includes:
 
 ```text
-make run ARGS='metrics'
-make run ARGS='metrics --json'
-make run ARGS='backup /path/to/backup'
-make run ARGS='requeue --doc <document-id>'
-make run ARGS='archive <document-id>'
-make run ARGS='delete <document-id>'
-make run ARGS='er merge'
-make run ARGS='gc'
-make run ARGS='prune --dry-run'
-```
+make services
 
-Mutating commands coordinate with the worker through a runtime lock. Backups
-are staged and do not overwrite an existing destination.
+make backend
+
+make worker
+
+make frontend
+```
 
 ## Documentation
 

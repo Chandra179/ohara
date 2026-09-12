@@ -186,10 +186,10 @@ impl Embedder for LimitedCapacityEmbedder {
     }
 }
 
-/// The real `LadybugDB` engine, in-memory (§14 integration: real stores, canned
-/// content).
+/// The production port shape, backed by a deterministic in-memory store for
+/// hermetic integration tests.
 fn memory_knowledge() -> Arc<dyn KnowledgeStore> {
-    Arc::new(ohara::knowledge::LadybugStore::in_memory(4).unwrap())
+    Arc::new(ohara::knowledge::InMemoryKnowledge::default())
 }
 
 /// Config in a temp dir; graph off so the (stubbed) later stages stay inert.
@@ -555,7 +555,7 @@ async fn retry_then_dead_letter_requeues_and_recovers() {
 
 /// A restart acceptance case for the cross-store deletion protocol (§7.6): the
 /// `SQLite` intent survives the first process, and the next worker removes the
-/// `LadybugDB` index before completing the `SQLite` cascade.
+/// knowledge index before completing the `SQLite` cascade.
 #[tokio::test]
 async fn worker_restart_reconciles_deletion_across_stores() {
     let dir = tempfile::tempdir().unwrap();
@@ -587,10 +587,10 @@ async fn worker_restart_reconciles_deletion_across_stores() {
     )
     .unwrap();
 
-    // Populate a persistent knowledge store, then close it to model the first
+    // Populate a knowledge store, then close the first worker to model the
     // process exiting after it recorded the deletion intent.
-    let knowledge_path = dir.path().join("knowledge");
-    let first_store = ohara::knowledge::LadybugStore::open(&knowledge_path, 4).unwrap();
+    let shared_store = Arc::new(ohara::knowledge::InMemoryKnowledge::default());
+    let first_store = Arc::clone(&shared_store);
     first_store
         .upsert_vectors(
             model.clone(),
@@ -624,8 +624,7 @@ async fn worker_restart_reconciles_deletion_across_stores() {
     control::request_deletion(&conn, &doc_id, Some("restart acceptance")).unwrap();
 
     // The second worker is the boot/restart boundary under test.
-    let restarted_store =
-        Arc::new(ohara::knowledge::LadybugStore::open(&knowledge_path, 4).unwrap());
+    let restarted_store = Arc::clone(&shared_store);
     let worker = Worker::with_ports(
         Arc::clone(&config),
         Arc::new(FakeFetcher {
@@ -787,7 +786,7 @@ async fn extractor_failure_retries_via_backoff() {
 
 /// The §15 step 4 milestone: the worker drives a document all the way to
 /// `VECTORIZED` — chunk rows in the registry, vectors in the (real, in-memory)
-/// Ladybug store, FTS index synced by trigger.
+/// knowledge store, FTS index synced by trigger.
 #[tokio::test]
 async fn worker_drives_a_document_from_new_to_vectorized() {
     let dir = tempfile::tempdir().unwrap();
@@ -858,7 +857,7 @@ async fn worker_drives_a_document_from_new_to_vectorized() {
 }
 
 /// The §15 step 6 milestone: the worker drives a document all the way to
-/// `INDEXED` — Stage 4 runs end to end (LLM fake, real Ladybug graph): triplets
+/// `INDEXED` — Stage 4 runs end to end (LLM fake, real knowledge port): triplets
 /// staged, entities + aliases registered, `:MENTIONS` linked, fact edges merged,
 /// the §6 chain terminating at EXTRACT with no successor.
 #[tokio::test]
@@ -1069,7 +1068,7 @@ async fn indexed_graph_answers_entity_queries_via_the_graph_path() {
 
 /// Live end-to-end probe (§14 + §15 step 4 acceptance): the real `Worker::new`
 /// stack — real HTTP fetch, readability clean, chunker, the pinned ONNX
-/// embedder, and the on-disk Ladybug store — drives one document to
+/// embedder, and the configured knowledge services — drives one document to
 /// `VECTORIZED`. Ignores by default: needs the network (Wikipedia) and the
 /// pinned model, cached once under `data/models` (we symlink the shared cache
 /// to avoid re-downloading 130 MB per run). Run with `cargo test --ignored`.
@@ -1101,8 +1100,8 @@ async fn live_worker_drives_a_document_to_vectorized() {
     let doc_id = enqueue_url(&conn, &data, "https://en.wikipedia.org/wiki/SQLite");
     drop(conn);
 
-    // REAL ports: engine fetcher + readability + ONNX embedder + Ladybug store.
-    let worker = Arc::new(Worker::new(Arc::clone(&config)).unwrap());
+    // REAL ports: engine fetcher + readability + ONNX embedder + remote stores.
+    let worker = Arc::new(Worker::new(Arc::clone(&config)).await.unwrap());
     for _ in 0..3 {
         tick(&worker).await;
     }

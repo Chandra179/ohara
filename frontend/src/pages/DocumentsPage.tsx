@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { DocumentRecord, DocumentStatus } from "../api/client";
 import { useApi } from "../api/useApi";
 import { Icon } from "../components/ui/Icon";
@@ -20,11 +20,24 @@ const PAGE_SIZE = 25;
 export function DocumentsPage() {
   const api = useApi();
   const { notify } = useNotifications();
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState<DocumentStatus | "all">("all");
   const [page, setPage] = useState(1);
   const [pageCursors, setPageCursors] = useState<Array<string | undefined>>([undefined]);
   const currentCursor = pageCursors[page - 1];
+  const resetPagination = useCallback(() => {
+    setPage(1);
+    setPageCursors([undefined]);
+  }, []);
+  const submitSearch = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      setSearch(searchInput.trim());
+      resetPagination();
+    },
+    [resetPagination, searchInput],
+  );
   const loadDocuments = useCallback(
     () =>
       api.listDocuments({
@@ -65,11 +78,6 @@ export function DocumentsPage() {
   }, [notify, resource]);
 
   const documents = resource.status === "success" ? resource.data.items : [];
-
-  const resetPagination = useCallback(() => {
-    setPage(1);
-    setPageCursors([undefined]);
-  }, []);
 
   const goToNextPage = useCallback(() => {
     if (resource.status !== "success" || resource.data.nextCursor === null) {
@@ -141,15 +149,12 @@ export function DocumentsPage() {
 
       {resource.status === "success" ? (
         <Panel>
-          <div className="filters" aria-label="Document filters">
+          <form className="filters" aria-label="Document filters" onSubmit={submitSearch}>
             <Input
               label="Search documents"
-              onChange={(event) => {
-                setSearch(event.target.value);
-                resetPagination();
-              }}
+              onChange={(event) => setSearchInput(event.target.value)}
               placeholder="Search by title or source URL"
-              value={search}
+              value={searchInput}
             />
             <Select
               label="Status"
@@ -170,7 +175,10 @@ export function DocumentsPage() {
               ]}
               value={status}
             />
-          </div>
+            <Button type="submit" variant="secondary">
+              Search
+            </Button>
+          </form>
 
           <div className="panel-heading panel-heading--compact">
             <div>

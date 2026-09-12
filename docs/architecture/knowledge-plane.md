@@ -1,36 +1,46 @@
 # Knowledge plane
 
-The knowledge plane owns the embedded LadybugDB index: model-scoped vectors,
-entity-name vectors, graph nodes, graph relationships, and graph traversals.
-It is a rebuildable projection of durable control data, not a second source of
-truth.
+The knowledge plane owns the two external local services used for derived
+knowledge:
 
-## Stored shape
+- Qdrant stores model-scoped chunk and entity-name vectors.
+- FalkorDB stores entities, chunk mentions, and aggregated fact edges.
 
-- Chunk vectors are isolated by embedding model identity.
-- Entity-name vectors support typed entity resolution and query-entity lookup.
-- Chunk-to-entity mention relationships support graph retrieval.
-- Entity-to-entity fact edges aggregate support counts and bounded evidence.
+SQLite remains the source of truth for documents, chunks, triplet evidence,
+and entity identity. Knowledge data can be rebuilt from those records.
 
-All writes are idempotent. Deleting a document removes its vectors and graph
-links. Folding an entity rewires relationships and removes the loser in one
-knowledge-store transaction. Entity deletion is refused while live graph
-relationships remain.
+## Contracts
 
-## Vector posture
+All operations are behind the `KnowledgeStore` port. Vector operations preserve
+model isolation, deterministic ids, cosine scores, and delete-to-search
+postconditions. Graph operations are idempotent: entities and mentions use
+`MERGE` semantics, fact edges aggregate support and bounded evidence, and entity
+folds rewire relationships before removing the loser.
 
-The current implementation uses exact in-engine cosine KNN. The bundled engine
-does not provide HNSW, so HNSW is a future implementation behind the same port,
-not a current configuration switch. Any replacement must preserve collection
-isolation, deterministic upserts, filtering, and the delete-then-KNN
-postcondition.
+The worker creates a writable adapter. API/query processes create read-only
+adapters. This is an application ownership rule; service persistence and
+concurrency are handled by Qdrant and FalkorDB themselves, not by shared local
+files or process locks.
+
+## Service lifecycle
+
+`make dev` starts the services before the Ohara processes. Qdrant listens on
+port 6335 and FalkorDB listens on port 6380 by default. Configuration can
+override both URLs. Use `make services` when managing only the knowledge
+services. Readiness probes both services and reports one actionable knowledge
+diagnostic when either is unavailable.
+
+The Compose file owns both services. A Qdrant or Redis-compatible service from
+another project must be stopped before reusing these default host ports, or the
+Compose port and matching Ohara URL must be overridden together.
+
+The Compose volumes are the knowledge indexes. Back them up with the services'
+own snapshot procedures; the Ohara SQLite backup covers control data and local
+payloads, not live external-service files.
 
 ## Recovery
 
-The knowledge index can be rebuilt from stored chunk embedding text, triplet
-evidence, and control-plane identity mappings. Cross-store ordering is owned by
-the pipeline recovery flow; the knowledge plane exposes operations but does not
-decide when a control mutation is safe. When Ladybug reports a truncated frozen
-WAL checkpoint tail, opening the store retries with the incomplete tail
-discarded and removes that stale checkpoint. Other invalid artifacts remain
-unavailable and require an explicit rebuild or repair action.
+There is no local knowledge WAL parser or native-store recovery path. If an
+index is lost, recreate the services and re-run vectorization/extraction from
+the durable control data. Cross-store deletion and retry ordering remains in
+the pipeline recovery protocol.

@@ -34,7 +34,7 @@ pub(crate) fn topic_searcher(config: &Config) -> Arc<dyn TopicSearcher> {
 }
 
 /// Assembles the default worker adapters and validates their shared contracts.
-pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
+pub(crate) async fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
     let params = http_params(config);
     let plain = Arc::new(HttpFetcher::new(params.clone())?);
     let impersonated = Arc::new(ImpersonationFetcher::new(
@@ -56,7 +56,7 @@ pub(crate) fn worker_ports(config: &Config) -> Result<WorkerPorts, BootError> {
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
     let knowledge = default_knowledge(config)?;
-    let llm = default_llm(config)?;
+    let llm = default_llm(config).await?;
     Ok(WorkerPorts {
         fetcher,
         extractor,
@@ -86,7 +86,7 @@ pub(crate) fn query_ports(config: &Config) -> Result<QueryPorts, BootError> {
     crate::pipeline::check_embedder_readiness(config)?;
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
-    let knowledge = default_knowledge(config)?;
+    let knowledge = read_only_knowledge(config)?;
     let llm = query_llm(config)?;
     Ok(QueryPorts {
         embedder,
@@ -119,25 +119,24 @@ fn default_embedder(_config: &Config) -> Result<Arc<dyn Embedder>, BootError> {
     ))
 }
 
-#[cfg(feature = "ladybug")]
 fn default_knowledge(config: &Config) -> Result<Arc<dyn KnowledgeStore>, BootError> {
-    std::fs::create_dir_all(config.data_dir()).map_err(|e| {
-        BootError::Worker(format!(
-            "cannot create data dir {}: {e}",
-            config.data_dir().display()
-        ))
-    })?;
-    Ok(Arc::new(crate::knowledge::LadybugStore::open(
-        &config.data_dir().join("ladybug"),
+    Ok(Arc::new(crate::knowledge::RemoteKnowledgeStore::connect(
+        config.knowledge(),
         config.embedder().dim(),
+        false,
     )?))
 }
 
-#[cfg(not(feature = "ladybug"))]
-fn default_knowledge(_config: &Config) -> Result<Arc<dyn KnowledgeStore>, BootError> {
-    Err(BootError::Worker(
-        "ohara was built without the `ladybug` feature; provide a KnowledgeStore via Worker::with_ports (§9 provider swap)".to_string(),
-    ))
+pub(crate) fn writable_knowledge(config: &Config) -> Result<Arc<dyn KnowledgeStore>, BootError> {
+    default_knowledge(config)
+}
+
+pub(crate) fn read_only_knowledge(config: &Config) -> Result<Arc<dyn KnowledgeStore>, BootError> {
+    Ok(Arc::new(crate::knowledge::RemoteKnowledgeStore::connect(
+        config.knowledge(),
+        config.embedder().dim(),
+        true,
+    )?))
 }
 
 /// Validates the model and input-capacity contracts shared by the configured
@@ -174,7 +173,7 @@ pub(crate) fn validate_embedder(config: &Config, embedder: &dyn Embedder) -> Res
     Ok(())
 }
 
-fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
+async fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
     if !config.pipeline().graph_enabled() {
         return Ok(Arc::new(crate::llm::NoLlm));
     }
@@ -182,12 +181,7 @@ fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
         config.llm().base_url().clone(),
         config.llm().health_timeout(),
     )?;
-    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-        BootError::Worker(
-            "ohara must run inside a tokio runtime to health-check the LLM endpoint".to_string(),
-        )
-    })?;
-    handle.block_on(ollama.verify_endpoint())?;
+    ollama.verify_endpoint().await?;
     Ok(Arc::new(ollama))
 }
 
@@ -195,4 +189,32 @@ fn default_llm(config: &Config) -> Result<Arc<dyn Llm>, BootError> {
 pub(crate) fn acquire_lock(config: &Config) -> Result<crate::ops::RuntimeLock, BootError> {
     crate::ops::RuntimeLock::acquire(config.data_dir())
         .map_err(|error| BootError::Worker(error.to_string()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn default_llm_health_check_does_not_block_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("ohara.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "data_dir = {:?}\n[pipeline]\ngraph_enabled = true\n[llm]\nbase_url = \"http://127.0.0.1:9\"\nhealth_timeout_secs = 1\n",
+                directory.path()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(Some(&config_path)).unwrap();
+
+        let result = default_llm(&config).await;
+
+        assert!(matches!(
+            result,
+            Err(BootError::Llm(crate::llm::LlmError::Unavailable(_)))
+        ));
+    }
 }

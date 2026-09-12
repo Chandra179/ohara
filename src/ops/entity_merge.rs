@@ -3,15 +3,15 @@
 //! locking and error/report types.
 
 use crate::config::Config;
-#[cfg(feature = "ladybug")]
 use crate::control;
+use crate::knowledge::KnowledgeStore;
 
 use super::{EntityMergeReport, OpsError, open_control};
 
 /// Executes the offline entity-resolution merge queue.
 ///
 /// The runtime lock makes the operator mutation exclusive with the worker. The
-/// control-plane audit is written before each Ladybug fold, and every existing
+/// control-plane audit is written before each graph fold, and every existing
 /// audit row is replayed first so an interrupted cross-store operation heals on
 /// the next invocation. Pending candidates choose the entity with the higher
 /// `:MENTIONS` degree; ties use the older control-plane row and finally the
@@ -19,29 +19,13 @@ use super::{EntityMergeReport, OpsError, open_control};
 ///
 /// # Errors
 /// [`OpsError::RuntimeBusy`] if the worker is active, [`OpsError::Control`] for
-/// invalid control-plane state, [`OpsError::Knowledge`] for a fold failure, or
-/// [`OpsError::KnowledgeFeatureDisabled`] without the embedded store feature.
+/// invalid control-plane state, or [`OpsError::Knowledge`] for a fold failure.
 pub async fn merge_entities(config: &Config) -> Result<EntityMergeReport, OpsError> {
     let (_runtime_lock, db) = open_control(config)?;
-    #[cfg(feature = "ladybug")]
-    {
-        let store = crate::knowledge::LadybugStore::open(
-            &config.data_dir().join("ladybug"),
-            config.embedder().dim(),
-        )?;
-        execute_entity_merges(&db, &store).await
-    }
-    #[cfg(not(feature = "ladybug"))]
-    {
-        let _ = db;
-        Err(OpsError::KnowledgeFeatureDisabled)
-    }
+    let store = crate::runtime::writable_knowledge(config)?;
+    execute_entity_merges(&db, store.as_ref()).await
 }
 
-#[cfg(feature = "ladybug")]
-use crate::knowledge::KnowledgeStore;
-
-#[cfg(feature = "ladybug")]
 pub(crate) async fn execute_entity_merges(
     db: &control::ControlDb,
     store: &dyn KnowledgeStore,
@@ -79,7 +63,6 @@ pub(crate) async fn execute_entity_merges(
     Ok(report)
 }
 
-#[cfg(feature = "ladybug")]
 fn required_entity(
     db: &control::ControlDb,
     entity_id: &str,
@@ -91,7 +74,6 @@ fn required_entity(
     })
 }
 
-#[cfg(feature = "ladybug")]
 fn choose_merge_direction<'a>(
     a: &'a control::EntityDetails,
     mentions_a: usize,
@@ -109,5 +91,4 @@ fn choose_merge_direction<'a>(
     }
 }
 
-#[cfg(feature = "ladybug")]
 const ER_MERGE_REASON: &str = "offline er merge";

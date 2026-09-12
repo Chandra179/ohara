@@ -11,7 +11,7 @@ use crate::Class;
 /// it, temperature-0 determinism for extraction).
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
-    /// Provider model id — pinned per §2 (e.g. `phi4-mini:latest`).
+    /// Provider model id — pinned per §2 (e.g. `gemma3:1b`).
     pub model: String,
     /// The rendered prompt.
     pub prompt: String,
@@ -116,7 +116,7 @@ mod tests {
     async fn no_llm_never_completes() {
         let err = NoLlm
             .complete(CompletionRequest {
-                model: "phi4-mini:latest".to_string(),
+                model: "gemma3:1b".to_string(),
                 prompt: "x".to_string(),
                 max_tokens: None,
                 temperature: 0.0,

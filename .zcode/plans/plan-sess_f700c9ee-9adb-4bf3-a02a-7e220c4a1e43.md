@@ -1,8 +1,8 @@
 Create two documentation artifacts in /home/koala/Work/ohara — docs only, no source code:
 
 1. **README.md** (repo root)
-   - One-paragraph description: ohara — embedded, zero-daemon web scraping → clean text → chunking → GraphRAG pipeline in Rust
-   - Tech stack table (Obscura, SQLite/WAL, readability/html2md, whatlang/symspell, LadybugDB, FlashRank, pinned local embedder)
+   - One-paragraph description: ohara — local web scraping → clean text → chunking → GraphRAG pipeline in Rust
+   - Tech stack table (Obscura, SQLite/WAL, readability/html2md, whatlang/symspell, Qdrant, FalkorDB, FlashRank, pinned local embedder)
    - Pipeline stage diagram (Stages 1–5)
    - Full directory tree (ch07-compliant: lib.rs crate root, `pub mod` planes, private leaf modules, tests/, migrations/, data/, docs/)
    - Module-by-module explanation (what + why): control, engine, knowledge, pipeline + stages, llm, text, config

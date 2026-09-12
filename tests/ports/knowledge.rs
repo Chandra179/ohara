@@ -1,5 +1,5 @@
 use ohara::knowledge::{
-    ChunkFilter, EntityRecord, EntityType, FactCaps, KnowledgeStore, LadybugStore, ModelId,
+    ChunkFilter, EntityRecord, EntityType, FactCaps, InMemoryKnowledge, KnowledgeStore, ModelId,
     Predicate, VectorSpace,
 };
 
@@ -21,7 +21,7 @@ fn fact_caps() -> FactCaps {
 
 #[tokio::test]
 async fn vector_space_isolation_replay_and_delete_contract() {
-    let store = LadybugStore::in_memory(3).unwrap();
+    let store = InMemoryKnowledge::default();
     let port: &dyn KnowledgeStore = &store;
     let model_a = VectorSpace::Chunks {
         model_id: ModelId::new("model-a"),
@@ -74,7 +74,7 @@ async fn vector_space_isolation_replay_and_delete_contract() {
 
 #[tokio::test]
 async fn graph_links_and_facts_are_replay_idempotent_and_traversable() {
-    let store = LadybugStore::in_memory(3).unwrap();
+    let store = InMemoryKnowledge::default();
     let port: &dyn KnowledgeStore = &store;
     let chunks = VectorSpace::Chunks {
         model_id: ModelId::new("graph-model"),
@@ -147,7 +147,7 @@ async fn graph_links_and_facts_are_replay_idempotent_and_traversable() {
 
 #[tokio::test]
 async fn fold_rewires_mentions_and_facts_and_is_safe_to_replay() {
-    let store = LadybugStore::in_memory(3).unwrap();
+    let store = InMemoryKnowledge::default();
     let port: &dyn KnowledgeStore = &store;
     let chunks = VectorSpace::Chunks {
         model_id: ModelId::new("fold-model"),
@@ -219,7 +219,7 @@ async fn fold_rewires_mentions_and_facts_and_is_safe_to_replay() {
 
 #[tokio::test]
 async fn delete_doc_removes_document_chunks_and_mentions_but_keeps_other_docs() {
-    let store = LadybugStore::in_memory(3).unwrap();
+    let store = InMemoryKnowledge::default();
     let port: &dyn KnowledgeStore = &store;
     let chunks = VectorSpace::Chunks {
         model_id: ModelId::new("delete-model"),
@@ -258,7 +258,7 @@ async fn delete_doc_removes_document_chunks_and_mentions_but_keeps_other_docs() 
 
 #[tokio::test]
 async fn deleting_an_unreferenced_entity_removes_its_name_vector() {
-    let store = LadybugStore::in_memory(3).unwrap();
+    let store = InMemoryKnowledge::default();
     let port: &dyn KnowledgeStore = &store;
     port.upsert_entity(&entity("unused", "Unused", EntityType::Concept))
         .await
@@ -284,7 +284,7 @@ async fn deleting_an_unreferenced_entity_removes_its_name_vector() {
 
 #[tokio::test]
 async fn deleting_a_referenced_entity_is_retained() {
-    let store = LadybugStore::in_memory(3).unwrap();
+    let store = InMemoryKnowledge::default();
     let port: &dyn KnowledgeStore = &store;
     port.upsert_entity(&entity("used", "Used", EntityType::Concept))
         .await

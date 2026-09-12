@@ -7,11 +7,15 @@ import { Table } from "./ui/Table";
 
 describe("shared UI primitives", () => {
   it("associates an input with its label and validation message", () => {
-    render(<Input error="A name is required" label="Document name" />);
+    render(<Input aria-describedby="document-name-help" error="A name is required" id="document-name" label="Document name" />);
 
     expect(screen.getByRole("textbox", { name: "Document name" })).toHaveAttribute(
       "aria-invalid",
       "true",
+    );
+    expect(screen.getByRole("textbox", { name: "Document name" })).toHaveAttribute(
+      "aria-describedby",
+      "document-name-help document-name-error",
     );
     expect(screen.getByRole("alert")).toHaveTextContent("A name is required");
   });

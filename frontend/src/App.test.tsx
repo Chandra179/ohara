@@ -1,13 +1,14 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { BrowserRouter } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { createMockApi, type OharaApi } from "./api/client";
 
-function renderApp() {
+function renderApp(api?: OharaApi) {
   return render(
     <BrowserRouter>
-      <App />
+      <App api={api} />
     </BrowserRouter>,
   );
 }
@@ -43,10 +44,14 @@ describe("App shell", () => {
     const user = userEvent.setup();
     renderApp();
 
+    const maxArticles = await screen.findByRole("spinbutton", { name: "Max articles" });
+    expect(maxArticles).toHaveValue(5);
+    await user.clear(maxArticles);
+    await user.type(maxArticles, "2");
     await user.click(await screen.findByRole("button", { name: "Find & queue" }));
 
-    expect(await screen.findByText(/3 results found for/)).toBeInTheDocument();
-    expect(screen.getByText("2 queued · 1 already in your library.")).toBeInTheDocument();
+    expect(await screen.findByText(/2 results found for/)).toBeInTheDocument();
+    expect(screen.getByText("2 queued · 0 already in your library.")).toBeInTheDocument();
     expect(await screen.findByText("Topic queued")).toBeInTheDocument();
   });
 
@@ -74,6 +79,33 @@ describe("App shell", () => {
     await user.selectOptions(screen.getByRole("combobox", { name: "Status" }), "NEW");
     expect(await screen.findByRole("heading", { name: "1 document" })).toBeInTheDocument();
     expect(screen.getByText("Product Notes Q1")).toBeInTheDocument();
+  });
+
+  it("does not fetch documents while search text is being edited", async () => {
+    const user = userEvent.setup();
+    const api = createMockApi();
+    const listDocuments = vi.spyOn(api, "listDocuments");
+    renderApp(api);
+
+    await user.click(screen.getByRole("link", { name: "Documents" }));
+    await screen.findByRole("heading", { name: "8 documents" });
+    listDocuments.mockClear();
+
+    const search = screen.getByRole("textbox", { name: "Search documents" });
+    await user.type(search, "research");
+
+    expect(listDocuments).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByRole("heading", { name: "1 document" })).toBeInTheDocument();
+    expect(listDocuments).toHaveBeenCalledOnce();
+    expect(listDocuments).toHaveBeenCalledWith({
+      cursor: undefined,
+      limit: 25,
+      search: "research",
+      status: undefined,
+    });
   });
 
   it("renders the Operations metrics snapshot", async () => {

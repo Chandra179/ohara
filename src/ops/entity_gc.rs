@@ -5,9 +5,7 @@
 //! registry row. The runtime lock serializes the sweep with worker mutations.
 
 use crate::config::Config;
-#[cfg(feature = "ladybug")]
 use crate::control;
-#[cfg(feature = "ladybug")]
 use crate::knowledge::KnowledgeStore;
 
 /// Summary of one entity garbage-collection sweep.
@@ -32,29 +30,16 @@ pub struct EntityGcReport {
 ///
 /// # Errors
 /// Returns [`super::OpsError::RuntimeBusy`] when another worker/operator holds
-/// the lock, [`super::OpsError::KnowledgeFeatureDisabled`] without `LadybugDB`,
-/// or a control/knowledge failure during the sweep.
+/// the lock, or a control/knowledge failure during the sweep.
 pub async fn collect_entity_garbage(config: &Config) -> Result<EntityGcReport, super::OpsError> {
     let (_runtime_lock, db) = super::open_control(config)?;
-    #[cfg(feature = "ladybug")]
-    {
-        let store = crate::knowledge::LadybugStore::open(
-            &config.data_dir().join("ladybug"),
-            config.embedder().dim(),
-        )?;
-        return collect(&db, &store, config.er().entity_gc_grace()).await;
-    }
-    #[cfg(not(feature = "ladybug"))]
-    {
-        let _ = db;
-        Err(super::OpsError::KnowledgeFeatureDisabled)
-    }
+    let store = crate::runtime::writable_knowledge(config)?;
+    collect(&db, store.as_ref(), config.er().entity_gc_grace()).await
 }
 
-#[cfg(feature = "ladybug")]
 async fn collect(
     db: &control::ControlDb,
-    store: &impl KnowledgeStore,
+    store: &dyn KnowledgeStore,
     grace: std::time::Duration,
 ) -> Result<EntityGcReport, super::OpsError> {
     let now = control::now();

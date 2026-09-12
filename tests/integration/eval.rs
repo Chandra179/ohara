@@ -125,7 +125,7 @@ impl Embedder for EvalEmbedder {
 /// every chunk, so the graph path has structure to traverse.
 async fn seed_topic_graph(
     conn: &ohara::control::ControlDb,
-    knowledge: &ohara::knowledge::LadybugStore,
+    knowledge: &ohara::knowledge::InMemoryKnowledge,
     embedder: &dyn Embedder,
     t: usize,
     topic: &str,
@@ -163,7 +163,7 @@ async fn build_corpus(
     embedder: &dyn Embedder,
 ) -> (
     EvalFixture,
-    ohara::knowledge::LadybugStore,
+    ohara::knowledge::InMemoryKnowledge,
     Vec<GoldenQuery>,
 ) {
     let dir = tempfile::tempdir().unwrap();
@@ -178,7 +178,7 @@ async fn build_corpus(
     let space = VectorSpace::Chunks {
         model_id: ModelId::new(embedder.model_id().to_string()),
     };
-    let knowledge = ohara::knowledge::LadybugStore::in_memory(embedder.dim()).unwrap();
+    let knowledge = ohara::knowledge::InMemoryKnowledge::default();
 
     let mut queries: Vec<GoldenQuery> = Vec::new();
     for (t, topic) in TOPICS.iter().enumerate() {
@@ -359,7 +359,7 @@ impl Metrics {
 /// Runs every golden query through the retriever and the raw paths.
 async fn run_eval(
     fixture: &EvalFixture,
-    knowledge: &ohara::knowledge::LadybugStore,
+    knowledge: &ohara::knowledge::InMemoryKnowledge,
     embedder: &dyn Embedder,
     queries: &[GoldenQuery],
     reranker: &dyn ohara::pipeline::Reranker,
@@ -485,7 +485,7 @@ async fn eval_retrieval_baseline_machinery() {
 
 async fn assert_multihop_context(
     conn: &ohara::control::ControlDb,
-    knowledge: &ohara::knowledge::LadybugStore,
+    knowledge: &ohara::knowledge::InMemoryKnowledge,
     topic_doc: &str,
 ) -> String {
     // Multi-hop context is a separate graph contract from the direct
@@ -554,7 +554,7 @@ async fn assert_multihop_context(
 async fn insert_duplicate(
     fixture: &EvalFixture,
     conn: &ohara::control::ControlDb,
-    knowledge: &ohara::knowledge::LadybugStore,
+    knowledge: &ohara::knowledge::InMemoryKnowledge,
     embedder: &dyn Embedder,
     topic_chunk: &str,
 ) -> String {
@@ -617,7 +617,7 @@ async fn insert_duplicate(
 
 async fn assert_delete_preserves_duplicate(
     conn: &ohara::control::ControlDb,
-    knowledge: &ohara::knowledge::LadybugStore,
+    knowledge: &ohara::knowledge::InMemoryKnowledge,
     embedder: &dyn Embedder,
     retriever: &Retriever<'_>,
     topic_doc: &str,

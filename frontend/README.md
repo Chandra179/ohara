@@ -12,18 +12,20 @@ npm run dev
 ```
 
 The default development mode uses the mock adapter. From the repository root,
-start the Rust API and Vite in separate terminals:
+start the complete local stack with:
 
 ```sh
-make backend
-make frontend
+make dev
 ```
 
-For frontend-only work, `npm run dev` keeps using the mock adapter. `make frontend`
-keeps the requested port strict, waits for the API, and proxies `/api` to the
-configured `API_BIND`. The combined `make dev` launcher remains available. Set
-`VITE_OHARA_API_BASE_URL` only when the API is hosted at another origin; it is
-not a secret.
+The combined launcher starts the API, ingestion worker, and Vite in one terminal
+so all three service logs are visible. For separate terminals, use `make
+backend`, `make worker`, and `make frontend` from the repository root.
+For normal use, `make dev` is the only launch command you need.
+`make frontend` keeps the requested port strict, waits for the API, and proxies
+`/api` to the configured `API_BIND`. For frontend-only work, `npm run dev` keeps
+using the mock adapter. Set `VITE_OHARA_API_BASE_URL` only when the API is hosted
+at another origin; it is not a secret.
 
 Run the frontend checks with:
 
@@ -36,7 +38,7 @@ PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e:live
 ```
 
 The HTTP adapter keeps API base URL configuration at the frontend boundary and
-does not expose SQLite, LadybugDB, or runtime filesystem paths to components.
+does not expose SQLite, Qdrant, FalkorDB, or runtime filesystem paths to components.
 
 ## Read and topic-queue contracts
 
@@ -53,11 +55,12 @@ projection with `/api/health` for the Overview service badge.
 }
 ```
 
-The topic is trimmed and limited to 200 characters. `limit` defaults to 5 and
-must be between 1 and 10. The response reports discovered, newly enqueued, and
-duplicate results, including each document and job identity. The endpoint is
-loopback-only through the local API and queues work; the separate worker must
-run before pages are fetched and indexed.
+The topic is trimmed and limited to 200 characters. The Overview form sends the
+selected maximum article count; `limit` defaults to 5 and must be between 1 and
+10. The response reports discovered, newly enqueued, and duplicate results,
+including each document and job identity. The endpoint is loopback-only through
+the local API and queues work; the worker then fetches and indexes the queued
+pages.
 
 `GET /api/documents` returns cursor-paginated summaries:
 
@@ -150,9 +153,8 @@ the frontend does not infer it from whether `answer` or `citations` happen to
 be present. `reranker` exposes the current deterministic identity baseline.
 
 `GET /api/health` returns component statuses, worker lifecycle data, and a
-`diagnostics` array. A truncated Ladybug WAL checkpoint tail is recovered during
-store open when it is safe to discard the incomplete tail; other invalid
-artifacts remain unavailable with a rebuild action. Worker data reports the latest boot state and heartbeat;
+`diagnostics` array. Qdrant and FalkorDB availability are reported together as
+the knowledge-store status. Worker data reports the latest boot state and heartbeat;
 the `stale` flag identifies a worker that stopped reporting within the lease
 horizon. Each diagnostic identifies the unavailable component, explains the
 problem, and provides the next action. Missing local embedding files, invalid

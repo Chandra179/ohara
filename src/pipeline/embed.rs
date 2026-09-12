@@ -425,8 +425,8 @@ mod tests {
     use crate::config::Config;
     use crate::control::testing::seed_doc;
     use crate::control::{self, ClaimedJob, ControlDb, Stage};
-    use crate::knowledge::KnowledgeStore;
-    use crate::pipeline::test_support::{FakeEmbedder, InMemoryKnowledge};
+    use crate::knowledge::{InMemoryKnowledge, KnowledgeStore};
+    use crate::pipeline::test_support::FakeEmbedder;
 
     const NOW: &str = "2026-09-06 12:00:00";
 

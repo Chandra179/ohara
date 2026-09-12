@@ -597,6 +597,10 @@ button:disabled {
   flex: 1;
 }
 
+.topic-form__limit {
+  flex: 0 0 150px;
+}
+
 .topic-form .button {
   flex: 0 0 auto;
 }
@@ -1140,6 +1144,10 @@ button:disabled {
   .topic-form {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .topic-form__limit {
+    width: 100%;
   }
 
   .topic-form .button {

@@ -4,10 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // §10: tests unwrap freely
 
 #[path = "integration/eval.rs"]
-#[cfg(feature = "ladybug")]
 mod eval;
 #[path = "integration/pipeline.rs"]
-#[cfg(feature = "ladybug")]
 mod pipeline;
 #[path = "integration/store.rs"]
 mod store;

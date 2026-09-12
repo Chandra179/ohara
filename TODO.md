@@ -16,8 +16,12 @@ boundaries; this file records what is still open.
   state instead of a blank page.
 - [x] Keep the identity reranker as the selected operator-query baseline,
   explicitly document it, and expose the selection in the API and query view.
-- [x] Recover a truncated Ladybug WAL checkpoint tail when the base knowledge
-  index remains valid, and leave non-recoverable artifacts actionable.
+- [x] Replace the embedded knowledge backend with Qdrant vectors and FalkorDB
+  graph storage, including service readiness and deterministic remote adapters.
+- [x] Handle worker/API termination signals gracefully and make `make dev`
+  signal the actual service processes before waiting for them to exit.
+- [ ] Add an explicit knowledge-index rebuild/reindex operation for durable
+  documents whose derived service data is lost.
 
 ## P1 — complete the local frontend workflow
 

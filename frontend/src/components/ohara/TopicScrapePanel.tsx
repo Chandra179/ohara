@@ -10,25 +10,41 @@ interface TopicScrapePanelProps {
   onQueued: () => void;
 }
 
+const DEFAULT_TOPIC_LIMIT = 5;
+const MAX_TOPIC_LIMIT = 10;
+const MIN_TOPIC_LIMIT = 1;
+
 export function TopicScrapePanel({ onQueued }: TopicScrapePanelProps) {
   const api = useApi();
   const { notify } = useNotifications();
   const [topic, setTopic] = useState("september 2026 news");
+  const [limit, setLimit] = useState(String(DEFAULT_TOPIC_LIMIT));
   const [result, setResult] = useState<TopicScrapeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [limitError, setLimitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const normalizedTopic = topic.trim();
+    setError(null);
+    setLimitError(null);
     if (normalizedTopic.length === 0) {
       setError("Enter a topic to search.");
       return;
     }
+    const requestedLimit = Number(limit);
+    if (
+      !Number.isInteger(requestedLimit) ||
+      requestedLimit < MIN_TOPIC_LIMIT ||
+      requestedLimit > MAX_TOPIC_LIMIT
+    ) {
+      setLimitError(`Choose between ${MIN_TOPIC_LIMIT} and ${MAX_TOPIC_LIMIT} articles.`);
+      return;
+    }
     setSubmitting(true);
-    setError(null);
     try {
-      const response = await api.scrapeTopic(normalizedTopic);
+      const response = await api.scrapeTopic(normalizedTopic, requestedLimit);
       setResult(response);
       onQueued();
       notify({
@@ -65,12 +81,26 @@ export function TopicScrapePanel({ onQueued }: TopicScrapePanelProps) {
           placeholder="september 2026 news"
           value={topic}
         />
+        <div className="topic-form__limit">
+          <Input
+            aria-describedby="topic-scrape-help"
+            error={limitError ?? undefined}
+            label="Max articles"
+            max={MAX_TOPIC_LIMIT}
+            min={MIN_TOPIC_LIMIT}
+            onChange={(event) => setLimit(event.target.value)}
+            step={1}
+            type="number"
+            value={limit}
+          />
+        </div>
         <Button disabled={submitting} type="submit">
           {submitting ? "Searching…" : "Find & queue"}
         </Button>
       </form>
       <p className="panel-note" id="topic-scrape-help">
-        Up to five results are searched per request. The worker must be running to fetch and index them.
+        Search between {MIN_TOPIC_LIMIT} and {MAX_TOPIC_LIMIT} articles per request. The worker must be
+        running to fetch and index them.
       </p>
       {result ? (
         <div className="notice notice--success topic-result" role="status">

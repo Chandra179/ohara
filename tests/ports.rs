@@ -5,7 +5,6 @@
 
 #[path = "ports/engine.rs"]
 mod engine;
-#[cfg(feature = "ladybug")]
 #[path = "ports/knowledge.rs"]
 mod knowledge;
 #[path = "ports/retrieval.rs"]

@@ -104,6 +104,29 @@ fn router_with_topic_searcher(
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            eprintln!("ohara: failed to install Ctrl-C handler: {error}");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                eprintln!("ohara: failed to install SIGTERM handler: {error}");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    eprintln!("ohara: failed to install Ctrl-C handler: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
     if let Err(error) = tokio::signal::ctrl_c().await {
         eprintln!("ohara: failed to install Ctrl-C handler: {error}");
     }
@@ -246,10 +269,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_route_reports_invalid_knowledge_artifact() {
-        let (directory, config) = test_config();
-        std::fs::write(directory.path().join("ladybug"), "not a directory")
-            .expect("invalid knowledge artifact");
+    async fn health_route_reports_unavailable_knowledge_services() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config_path = directory.path().join("ohara.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "data_dir = {:?}\n[knowledge]\nfalkordb_url = \"redis://127.0.0.1:1\"\n",
+                directory.path()
+            ),
+        )
+        .expect("config file");
+        let config = Config::load(Some(&config_path)).expect("config");
         let response = router(config)
             .oneshot(
                 Request::builder()

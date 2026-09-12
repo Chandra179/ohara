@@ -1,9 +1,9 @@
-//! ohara — an embedded, zero-daemon pipeline: web scrape → clean → chunk/vectorize
-//! → graph extraction → `GraphRAG` retrieval, all in one Rust process.
+//! ohara — a local pipeline: web scrape → clean → chunk/vectorize → graph
+//! extraction → `GraphRAG` retrieval.
 //!
-//! `SQLite` (WAL) is the control plane ([`control`]), `LadybugDB` is the knowledge
-//! plane ([`knowledge`]), and the fetch ladder ([`engine`]) is the only moving
-//! part (§1.1). The full system design lives in
+//! `SQLite` (WAL) is the control plane ([`control`]), Qdrant and `FalkorDB` are the
+//! knowledge plane ([`knowledge`]), and the fetch ladder ([`engine`]) owns
+//! external HTTP. The full system design lives in
 //! [docs/ARCHITECTURE.md](https://github.com/Chandra179/ohara/blob/main/docs/ARCHITECTURE.md);
 //! code style, API design, and lint policy live in `docs/CODE_GUIDE.md`.
 //!

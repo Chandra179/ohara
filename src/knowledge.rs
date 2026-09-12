@@ -1,15 +1,14 @@
-//! KNOWLEDGE PLANE facade (§1.3) — owns all `LadybugDB` access (§1.2.2): vector
-//! collections and the property graph, behind the [`KnowledgeStore`] port. `SQLite`
-//! and `data/` are the system of record; everything behind this port is a
-//! rebuildable index (§7.9).
+//! KNOWLEDGE PLANE facade (§1.3) — owns the Qdrant vector index and `FalkorDB`
+//! property graph behind the [`KnowledgeStore`] port. `SQLite` remains the
+//! system of record; these services hold rebuildable derived knowledge (§7.9).
 
-#[cfg(feature = "ladybug")]
-mod graph;
-#[cfg(feature = "ladybug")]
-mod vectors;
+mod falkor;
+mod memory;
+mod qdrant;
+mod remote;
 
-#[cfg(feature = "ladybug")]
-pub use vectors::LadybugStore;
+pub use memory::InMemoryKnowledge;
+pub use remote::RemoteKnowledgeStore;
 
 use async_trait::async_trait;
 
@@ -275,8 +274,9 @@ impl KnowledgeError {
 }
 
 /// The knowledge port (§9): vector search plus property graph,
-/// `VectorSpace`-scoped. The current Ladybug implementation uses exact
-/// in-engine cosine KNN; an HNSW implementation can be substituted later.
+/// `VectorSpace`-scoped. The production implementation delegates ANN search to
+/// Qdrant and graph traversal to `FalkorDB`; another implementation can be
+/// injected at the composition boundary.
 ///
 /// Contracts (postconditions, not mechanisms):
 /// - upserts are deterministic — replaying a stage is a no-op on written data (§7.1);
@@ -335,7 +335,7 @@ pub trait KnowledgeStore: Send + Sync {
     async fn link_mention(&self, chunk_id: &str, entity_id: &str) -> Result<(), KnowledgeError>;
 
     /// Folds `loser` away into `winner`: rewires `:MENTIONS` and fact edges, deletes
-    /// the loser node (the Ladybug half of the §7.8 merge protocol).
+    /// the loser node (the graph half of the §7.8 merge protocol).
     ///
     /// # Errors
     /// [`KnowledgeError`] per its taxonomy.

@@ -47,7 +47,7 @@ mod tests {
             object: object.to_string(),
             object_type: "LOCATION".to_string(),
             properties: None,
-            model: "phi4-mini:latest".to_string(),
+            model: "gemma3:1b".to_string(),
         }
     }
 

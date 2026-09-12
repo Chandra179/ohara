@@ -1,7 +1,7 @@
 //! Cross-store recovery and boot reconciliation.
 //!
-//! `SQLite` remains the control-plane owner and `LadybugDB` remains the knowledge-
-//! plane owner. This module owns only the ordering between them for operations
+//! `SQLite` remains the control-plane owner and Qdrant/FalkorDB remain the
+//! knowledge-plane owners. This module owns only the ordering between them for operations
 //! that intentionally span both stores: knowledge-first deletion and audit
 //! retention.
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
 publish = false
-description = "Embedded, zero-daemon web scrape → clean → chunk/vectorize → graph extraction → GraphRAG pipeline."
+description = "Local web scrape → clean → chunk/vectorize → graph extraction → GraphRAG pipeline."
 repository = "https://github.com/Chandra179/ohara"
 license = "MIT"
 keywords = ["graphrag", "scraping", "rag", "sqlite", "embeddings"]
@@ -29,11 +29,10 @@ dbg_macro   = "deny"
 module_name_repetitions = "allow" # plane modules legitimately repeat their plane's name
 
 # Heavy deps are feature-gated (ARCHITECTURE Appendix A); defaults build the full
-# local stack. `--no-default-features` drops the ONNX runtime + Ladybug engine for
-# deployments that inject remote ports at boot instead (§9 provider swap).
+# local stack. `--no-default-features` drops the ONNX runtime for deployments
+# that inject remote ports at boot instead (§9 provider swap).
 [features]
-default = ["ladybug", "onnx-embedder"]
-ladybug = ["dep:lbug"]
+default = ["onnx-embedder"]
 onnx-embedder = ["dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
 
 [dependencies]
@@ -43,7 +42,7 @@ chrono = "0.4.45"
 fs2 = "0.4.3"
 flate2 = "1.1.10"
 html2md = "0.2.17"
-lbug = { version = "0.20.2", optional = true }
+redis = { version = "0.32.7", features = ["tokio-comp"] }
 readability = { version = "0.3", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "json"] }
 rusqlite = { version = "0.39", features = ["bundled"] }

@@ -56,7 +56,17 @@ test("searches and queues a topic from the live Overview", async ({ page }) => {
   await page.goto("/");
 
   await page.getByRole("textbox", { name: "Topic" }).fill("september 2026 news");
+  await page.getByRole("spinbutton", { name: "Max articles" }).fill("2");
+  const topicRequestPromise = page.waitForRequest(
+    (request) => request.url().endsWith("/api/topics/scrape") && request.method() === "POST",
+  );
   await page.getByRole("button", { exact: true, name: "Find & queue" }).click();
+  const topicRequest = await topicRequestPromise;
+
+  expect(topicRequest.postDataJSON()).toEqual({
+    limit: 2,
+    topic: "september 2026 news",
+  });
 
   await expect(page.getByText(/results found for.*september 2026 news/)).toBeVisible();
   await expect(page.getByText(/queued.*already in your library/)).toBeVisible();

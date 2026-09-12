@@ -36,12 +36,20 @@ pub(crate) mod defaults {
     pub const EMBEDDER_MODEL: &str = "bge-small-en-v1.5";
     /// Pinned embedder dimensionality (§4).
     pub const EMBEDDER_DIM: usize = 384;
+    /// Local Qdrant HTTP endpoint used by the knowledge plane.
+    pub const QDRANT_URL: &str = "http://127.0.0.1:6335";
+    /// Local `FalkorDB` Redis endpoint used by the knowledge plane.
+    pub const FALKORDB_URL: &str = "redis://127.0.0.1:6380";
+    /// Graph name inside `FalkorDB`.
+    pub const FALKORDB_GRAPH: &str = "ohara";
+    /// Timeout for knowledge-service requests.
+    pub const KNOWLEDGE_TIMEOUT_SECS: u64 = 10;
     /// Local Ollama endpoint (§2; nothing leaves the machine by default, §12).
     pub const LLM_BASE_URL: &str = "http://localhost:11434";
     /// Pinned extraction model (§11.2).
-    pub const LLM_EXTRACTION_MODEL: &str = "phi4-mini:latest";
+    pub const LLM_EXTRACTION_MODEL: &str = "gemma3:1b";
     /// Default model used for bounded retrieval synthesis (§8 Stage 5.6).
-    pub const LLM_SYNTHESIS_MODEL: &str = "phi4-mini:latest";
+    pub const LLM_SYNTHESIS_MODEL: &str = "gemma3:1b";
     /// Cloud LLM egress is opt-in (§12).
     pub const LLM_CLOUD_ENABLED: bool = false;
     /// §8 Stage 4.2: normalized-name similarity floor for same-supertype
@@ -186,12 +194,15 @@ pub struct RetentionConfig {
     raw_max_age_days: Option<u64>,
 }
 
-/// Knowledge-plane namespace pointers (§4): the read switch is atomic, the write
-/// model dual-writes during a migration.
+/// Knowledge-plane connection and namespace settings (§4).
 #[derive(Debug, Clone)]
 pub struct KnowledgeConfig {
     read_model: String,
     write_model: String,
+    qdrant_url: url::Url,
+    falkordb_url: url::Url,
+    graph_name: String,
+    timeout: Duration,
 }
 
 /// Fetch-ladder knobs (§8 Stage 1, §12). The SSRF guard itself is not a knob:
@@ -369,6 +380,10 @@ struct RawEmbedder {
 struct RawKnowledge {
     read_model: Option<String>,
     write_model: Option<String>,
+    qdrant_url: Option<String>,
+    falkordb_url: Option<String>,
+    graph_name: Option<String>,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -485,10 +500,23 @@ fn build_embedder(raw: Option<&RawEmbedder>) -> EmbedderConfig {
     }
 }
 
-fn build_knowledge(raw: Option<&RawKnowledge>, default_model: &str) -> KnowledgeConfig {
+fn build_knowledge(
+    raw: Option<&RawKnowledge>,
+    default_model: &str,
+) -> Result<KnowledgeConfig, ConfigError> {
     let default_raw = RawKnowledge::default();
     let raw = raw.unwrap_or(&default_raw);
-    KnowledgeConfig {
+    let qdrant_url = parse_url(
+        raw.qdrant_url.as_deref().unwrap_or(defaults::QDRANT_URL),
+        "knowledge.qdrant_url",
+    )?;
+    let falkordb_url = parse_url(
+        raw.falkordb_url
+            .as_deref()
+            .unwrap_or(defaults::FALKORDB_URL),
+        "knowledge.falkordb_url",
+    )?;
+    Ok(KnowledgeConfig {
         read_model: raw
             .read_model
             .clone()
@@ -497,7 +525,19 @@ fn build_knowledge(raw: Option<&RawKnowledge>, default_model: &str) -> Knowledge
             .write_model
             .clone()
             .unwrap_or_else(|| default_model.to_string()),
-    }
+        qdrant_url,
+        falkordb_url,
+        graph_name: raw
+            .graph_name
+            .clone()
+            .unwrap_or_else(|| defaults::FALKORDB_GRAPH.to_string()),
+        timeout: Duration::from_secs(raw.timeout_secs.unwrap_or(defaults::KNOWLEDGE_TIMEOUT_SECS)),
+    })
+}
+
+fn parse_url(value: &str, name: &str) -> Result<url::Url, ConfigError> {
+    url::Url::parse(value)
+        .map_err(|_| ConfigError::Validation(format!("{name} {value:?} is not a valid URL")))
 }
 
 fn build_llm(raw: Option<&RawLlm>) -> Result<LlmConfig, ConfigError> {
@@ -598,7 +638,7 @@ impl Config {
         let pipeline = build_pipeline(raw.pipeline.as_ref());
         let fetcher = build_fetcher(raw.fetcher.as_ref());
         let embedder = build_embedder(raw.embedder.as_ref());
-        let knowledge = build_knowledge(raw.knowledge.as_ref(), &embedder.model_id);
+        let knowledge = build_knowledge(raw.knowledge.as_ref(), &embedder.model_id)?;
         let llm = build_llm(raw.llm.as_ref())?;
         let er = build_er(raw.er.as_ref());
         let retrieval = build_retrieval(raw.retrieval.as_ref());
@@ -956,6 +996,28 @@ impl KnowledgeConfig {
         check(
             self.read_model == self.write_model,
             "knowledge.read_model and knowledge.write_model must match until dual-write migration is implemented",
+        )?;
+        check(
+            matches!(self.qdrant_url.scheme(), "http" | "https"),
+            format!(
+                "knowledge.qdrant_url must be http/https, got {:?}",
+                self.qdrant_url.scheme()
+            ),
+        )?;
+        check(
+            matches!(self.falkordb_url.scheme(), "redis" | "rediss"),
+            format!(
+                "knowledge.falkordb_url must be redis/rediss, got {:?}",
+                self.falkordb_url.scheme()
+            ),
+        )?;
+        check(
+            !self.graph_name.is_empty(),
+            "knowledge.graph_name must be non-empty",
+        )?;
+        check(
+            !self.timeout.is_zero(),
+            "knowledge.timeout_secs must be > 0",
         )
     }
 
@@ -969,6 +1031,30 @@ impl KnowledgeConfig {
     #[must_use]
     pub fn write_model(&self) -> &str {
         &self.write_model
+    }
+
+    /// Qdrant HTTP endpoint for vector operations.
+    #[must_use]
+    pub fn qdrant_url(&self) -> &url::Url {
+        &self.qdrant_url
+    }
+
+    /// `FalkorDB` Redis endpoint for graph operations.
+    #[must_use]
+    pub fn falkordb_url(&self) -> &url::Url {
+        &self.falkordb_url
+    }
+
+    /// `FalkorDB` graph name.
+    #[must_use]
+    pub fn graph_name(&self) -> &str {
+        &self.graph_name
+    }
+
+    /// Timeout applied to Qdrant and `FalkorDB` requests.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 }
 
@@ -1206,8 +1292,8 @@ mod tests {
         assert_eq!(config.embedder().model_id(), "bge-small-en-v1.5");
         assert_eq!(config.embedder().dim(), 384);
         assert_eq!(config.knowledge().read_model(), "bge-small-en-v1.5");
-        assert_eq!(config.llm().extraction_model(), "phi4-mini:latest");
-        assert_eq!(config.llm().synthesis_model(), "phi4-mini:latest");
+        assert_eq!(config.llm().extraction_model(), "gemma3:1b");
+        assert_eq!(config.llm().synthesis_model(), "gemma3:1b");
         assert!(!config.llm().cloud_llm_enabled());
         assert_eq!(config.target_languages(), ["en"]);
         assert!(
