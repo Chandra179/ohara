@@ -2,6 +2,48 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiRequestError, createHttpApi } from "./http";
 
 describe("HTTP API boundary", () => {
+  it("queues a topic and preserves result status", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          topic: "september 2026 news",
+          requested: 2,
+          discovered: 2,
+          enqueued: 1,
+          duplicates: 1,
+          documents: [
+            {
+              title: "Fresh story",
+              sourceUrl: "https://example.test/fresh",
+              documentId: "doc-1",
+              jobId: "job-1",
+              status: "enqueued",
+            },
+            {
+              title: "Existing story",
+              sourceUrl: "https://example.test/existing",
+              documentId: "doc-2",
+              jobId: null,
+              status: "duplicate",
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    const api = createHttpApi({ fetcher });
+
+    await expect(api.scrapeTopic("september 2026 news", 2)).resolves.toMatchObject({
+      discovered: 2,
+      documents: [{ status: "enqueued" }, { status: "duplicate" }],
+      enqueued: 1,
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/topics/scrape",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("maps the overview read model and service status from health", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -36,6 +78,18 @@ describe("HTTP API boundary", () => {
             llm: "unavailable",
             reranker: "identity",
             status: "degraded",
+            worker: {
+              currentJobId: null,
+              currentStage: null,
+              lastError: null,
+              lastHeartbeatAt: "2026-09-12 12:00:00",
+              processId: 42,
+              stale: false,
+              startedAt: "2026-09-12 11:55:00",
+              state: "ready",
+              status: "available",
+              workerId: "worker-test",
+            },
           }),
           { status: 200 },
         ),

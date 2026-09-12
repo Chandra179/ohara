@@ -16,7 +16,7 @@ priority.
 - [x] Add live Rust-backed Playwright coverage for health, metrics, and query,
   including unavailable knowledge/model fixtures.
 
-## P1 — complete read-only product workflows
+## P1 — complete local product workflows
 
 - [x] Add paginated document listing with backend status preservation and wire
   the Documents view.
@@ -27,13 +27,16 @@ priority.
 - [x] Add entity-review listing and merge-preview endpoints and wire the
   Entities view.
 - [x] Extend live Rust-backed Playwright coverage to documents and entity review.
+- [x] Add bounded topic discovery and queueing from Overview, including
+  normalization, duplicate reporting, and a live browser contract.
 
 ## P2 — safe operations
 
-- [ ] Map worker-process readiness after the Rust server can supervise or
-  observe ingestion.
-- [ ] Define request limits, CORS, and local authentication/CSRF behavior before
-  exposing browser-triggered mutations.
+- [x] Map durable worker-process readiness, lifecycle state, and stale heartbeat
+  diagnostics in the shared shell.
+- [ ] Extend the loopback-only topic mutation with CORS and local
+  authentication/CSRF behavior before exposing broader browser-triggered
+  mutations.
 - [ ] Add lifecycle actions only after confirmation, authorization, idempotency,
   and failure behavior are covered by the API contract.
 - [x] Keep the mock adapter injectable for unit tests and local UI demos.

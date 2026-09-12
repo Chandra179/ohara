@@ -16,8 +16,10 @@ boundaries; this file records what is still open.
   state instead of a blank page.
 - [x] Keep the identity reranker as the selected operator-query baseline,
   explicitly document it, and expose the selection in the API and query view.
+- [x] Recover a truncated Ladybug WAL checkpoint tail when the base knowledge
+  index remains valid, and leave non-recoverable artifacts actionable.
 
-## P1 — complete the read-only frontend workflow
+## P1 — complete the local frontend workflow
 
 - [x] Add paginated document and queue read models for Overview and Documents.
 - [x] Align frontend document/status types with the control-plane schema; the
@@ -26,19 +28,19 @@ boundaries; this file records what is still open.
 - [x] Add entity-review listing and merge-preview read models for Entities.
 - [x] Add live Rust-backed Playwright coverage for health, metrics, query,
   documents, and entity-review flows.
-- [x] Keep URL registration as a library operation for this release; the
-  ingestion UI and public URL-add workflow remain future work, so stale
-  `ohara enqueue` references must not be reintroduced.
+- [x] Add bounded topic discovery and queueing from the Overview screen with
+  normalized URLs, duplicate reporting, and Rust-backed browser coverage.
 
 ## P2 — API lifecycle and operational safety
 
 - [x] Keep successful query provider construction process-local and lazy so
   HTTP requests reuse the same behavioral ports without making API startup
   fail before readiness diagnostics can be shown.
-- [ ] Add worker-process readiness and lifecycle reporting after the API can
-  supervise or reliably observe ingestion.
-- [ ] Add request limits, CORS policy, and local authentication/CSRF protection
-  before exposing browser-triggered mutations.
+- [x] Add worker-process readiness and lifecycle observation through durable
+  control-plane heartbeats; API supervision remains out of scope.
+- [ ] Extend the current bounded, loopback-only topic mutation with CORS policy
+  and local authentication/CSRF protection before exposing the API beyond
+  loopback or adding broader browser-triggered mutations.
 - [ ] Add explicit lifecycle API contracts for requeue, archive, and delete,
   including confirmation, authorization, idempotency, and failure behavior.
 - [x] Add a shared readiness/health seam so transport handlers do not construct

@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import type { HealthSnapshot, ReadinessDiagnostic, ServiceStatus } from "../../api/client";
+import type {
+  HealthSnapshot,
+  ReadinessDiagnostic,
+  ServiceStatus,
+  WorkerSnapshot,
+  WorkerState,
+} from "../../api/client";
 import { useApi } from "../../api/useApi";
 import { Icon, type IconName } from "../ui/Icon";
 import { StatusBadge, type StatusTone } from "../ui/StatusBadge";
@@ -93,7 +99,10 @@ export function AppShell() {
 
       <div className="app-main">
         <header className="top-bar">
-          <HealthBadge health={health} />
+          <div className="status-cluster">
+            <HealthBadge health={health} />
+            <WorkerBadge health={health} />
+          </div>
           <button aria-label="Open user menu" className="avatar" type="button">
             U
           </button>
@@ -111,6 +120,37 @@ export function AppShell() {
       </div>
     </div>
   );
+}
+
+function WorkerBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {
+  if (health.status === "loading") {
+    return <StatusBadge tone="muted">Worker · Checking…</StatusBadge>;
+  }
+
+  if (health.status === "error") {
+    return <StatusBadge title={health.error} tone="danger">Worker · Unknown</StatusBadge>;
+  }
+
+  const worker = health.data.worker;
+  const label = workerLabel(worker);
+  const tone: StatusTone = worker.status === "available"
+    ? "healthy"
+    : worker.state === "starting" || worker.state === "stopping"
+    ? "pending"
+    : "danger";
+  const title = worker.lastError ?? (worker.stale ? "The worker heartbeat is stale." : undefined);
+  return <StatusBadge title={title} tone={tone}>{label}</StatusBadge>;
+}
+
+function workerLabel(worker: WorkerSnapshot): string {
+  if (worker.state === null) {
+    return "Worker · Not running";
+  }
+  return `Worker · ${formatWorkerState(worker.state)}`;
+}
+
+function formatWorkerState(state: WorkerState): string {
+  return state.charAt(0).toUpperCase() + state.slice(1);
 }
 
 function HealthBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {

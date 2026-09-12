@@ -64,6 +64,13 @@ impl ApiError {
             message: format!("control store unavailable: {error}"),
         }
     }
+
+    pub(super) fn topic_search(error: &crate::engine::TopicSearchError) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: error.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

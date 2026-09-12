@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
 
@@ -20,6 +21,7 @@ mod health;
 mod metrics;
 mod overview;
 mod query;
+mod topics;
 
 use self::health::health;
 
@@ -69,14 +71,24 @@ pub enum ServerError {
 pub(super) struct AppState {
     pub(super) config: Config,
     pub(super) query_runtime: Arc<crate::runtime::QueryRuntime>,
+    pub(super) topic_searcher: Arc<dyn crate::engine::TopicSearcher>,
 }
 
 fn router(config: Config) -> Router {
+    let topic_searcher = crate::runtime::topic_searcher(&config);
+    router_with_topic_searcher(config, topic_searcher)
+}
+
+fn router_with_topic_searcher(
+    config: Config,
+    topic_searcher: Arc<dyn crate::engine::TopicSearcher>,
+) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/metrics", get(metrics::metrics))
         .route("/api/overview", get(overview::overview))
         .route("/api/documents", get(documents::documents))
+        .route("/api/topics/scrape", post(topics::scrape_topic))
         .route("/api/entities/reviews", get(entities::entity_reviews))
         .route(
             "/api/entities/reviews/{review_id}/preview",
@@ -84,9 +96,11 @@ fn router(config: Config) -> Router {
         )
         .route("/api/query", post(query::query))
         .with_state(Arc::new(AppState {
+            topic_searcher,
             config,
             query_runtime: Arc::new(crate::runtime::QueryRuntime::default()),
         }))
+        .layer(DefaultBodyLimit::max(16 * 1024))
 }
 
 async fn shutdown_signal() {
@@ -99,13 +113,31 @@ async fn shutdown_signal() {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::sync::Arc;
+
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     use super::health::{ComponentStatus, ServiceStatus, overall_status};
-    use super::router;
+    use super::{router, router_with_topic_searcher};
     use crate::config::Config;
+    use crate::engine::{NormalizedUrl, TopicResult, TopicSearchError, TopicSearcher};
+
+    struct FakeTopicSearcher {
+        results: Vec<TopicResult>,
+    }
+
+    #[async_trait::async_trait]
+    impl TopicSearcher for FakeTopicSearcher {
+        async fn search(
+            &self,
+            _topic: &str,
+            _limit: usize,
+        ) -> Result<Vec<TopicResult>, TopicSearchError> {
+            Ok(self.results.clone())
+        }
+    }
 
     fn test_config() -> (tempfile::TempDir, Config) {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -124,6 +156,7 @@ mod tests {
                 ComponentStatus::Available,
                 ComponentStatus::Available,
                 ComponentStatus::Unavailable,
+                ComponentStatus::Available,
             ),
             ServiceStatus::Degraded
         ));
@@ -185,6 +218,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_route_reports_when_ingestion_worker_is_not_running() {
+        let (_directory, config) = test_config();
+        let response = router(config)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["worker"]["status"], "unavailable");
+        assert!(json["worker"]["state"].is_null());
+        assert!(json["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic["component"] == "worker"
+                    && diagnostic["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("no worker process"))
+            })
+        }));
+    }
+
+    #[tokio::test]
     async fn health_route_reports_invalid_knowledge_artifact() {
         let (directory, config) = test_config();
         std::fs::write(directory.path().join("ladybug"), "not a directory")
@@ -220,6 +281,77 @@ mod tests {
                     .uri("/api/query")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"query":""}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn topic_route_queues_discovered_urls_and_reports_duplicates() {
+        let (_directory, config) = test_config();
+        let duplicate_url = NormalizedUrl::parse("https://example.test/duplicate").expect("url");
+        let db = crate::control::connect(config.db_path()).expect("control store");
+        crate::control::insert_new(
+            &db,
+            config.data_dir(),
+            &crate::control::NewDocument {
+                source_url: duplicate_url.as_str().to_string(),
+                source_url_normalized: duplicate_url.as_str().to_string(),
+                priority: crate::control::DEFAULT_JOB_PRIORITY,
+                pipeline_version: "test".to_string(),
+            },
+            "2026-09-12 00:00:00",
+        )
+        .expect("seed duplicate");
+        drop(db);
+
+        let searcher = FakeTopicSearcher {
+            results: vec![
+                TopicResult {
+                    title: "Duplicate story".to_string(),
+                    url: duplicate_url,
+                },
+                TopicResult {
+                    title: "Fresh story".to_string(),
+                    url: NormalizedUrl::parse("https://example.test/fresh").expect("url"),
+                },
+            ],
+        };
+        let response = router_with_topic_searcher(config, Arc::new(searcher))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topics/scrape")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"topic":"september 2026 news","limit":5}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["topic"], "september 2026 news");
+        assert_eq!(json["discovered"], 2);
+        assert_eq!(json["enqueued"], 1);
+        assert_eq!(json["duplicates"], 1);
+        assert_eq!(json["documents"][1]["status"], "enqueued");
+    }
+
+    #[tokio::test]
+    async fn topic_route_rejects_empty_topics() {
+        let (_directory, config) = test_config();
+        let response = router(config)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topics/scrape")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"topic":"  "}"#))
                     .expect("request"),
             )
             .await

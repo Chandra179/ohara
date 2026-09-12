@@ -1,8 +1,8 @@
 # Ohara frontend
 
 The frontend is a React + TypeScript + Vite application. It uses a typed mock
-adapter by default and has an opt-in HTTP adapter for the Rust read-only
-operator surface.
+adapter by default and has an opt-in HTTP adapter for the Rust local operator
+and bounded topic-queue surface.
 
 ## Local development
 
@@ -38,11 +38,26 @@ PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e:live
 The HTTP adapter keeps API base URL configuration at the frontend boundary and
 does not expose SQLite, LadybugDB, or runtime filesystem paths to components.
 
-## Read-only workflow contracts
+## Read and topic-queue contracts
 
 `GET /api/overview` returns `documentsByStatus` using the durable control-plane
 statuses and a bounded `queue` projection. The HTTP adapter combines that
 projection with `/api/health` for the Overview service badge.
+
+`POST /api/topics/scrape` accepts a bounded topic request:
+
+```json
+{
+  "topic": "september 2026 news",
+  "limit": 5
+}
+```
+
+The topic is trimmed and limited to 200 characters. `limit` defaults to 5 and
+must be between 1 and 10. The response reports discovered, newly enqueued, and
+duplicate results, including each document and job identity. The endpoint is
+loopback-only through the local API and queues work; the separate worker must
+run before pages are fetched and indexed.
 
 `GET /api/documents` returns cursor-paginated summaries:
 
@@ -134,7 +149,12 @@ model that could not produce a grounded answer. `grounding` is authoritative;
 the frontend does not infer it from whether `answer` or `citations` happen to
 be present. `reranker` exposes the current deterministic identity baseline.
 
-`GET /api/health` returns component statuses plus a `diagnostics` array. Each
-diagnostic identifies the unavailable component, explains the problem, and
-provides the next action. Missing local embedding files and invalid knowledge
-artifacts are reported this way instead of leaving a page blank.
+`GET /api/health` returns component statuses, worker lifecycle data, and a
+`diagnostics` array. A truncated Ladybug WAL checkpoint tail is recovered during
+store open when it is safe to discard the incomplete tail; other invalid
+artifacts remain unavailable with a rebuild action. Worker data reports the latest boot state and heartbeat;
+the `stale` flag identifies a worker that stopped reporting within the lease
+horizon. Each diagnostic identifies the unavailable component, explains the
+problem, and provides the next action. Missing local embedding files, invalid
+knowledge artifacts, and absent workers are reported this way instead of
+leaving a page blank.

@@ -6,6 +6,7 @@ const frontendPort = 4174;
 
 const backendCommand = [
   "cd ..",
+  "node frontend/e2e/prepare-live-fixture.mjs --live",
   `make backend API_BIND=127.0.0.1:${backendPort} BACKEND_ARGS='serve --bind 127.0.0.1:${backendPort} --config frontend/e2e/live-config.toml'`,
 ].join(" && ");
 
@@ -18,7 +19,8 @@ const invalidKnowledgeCommand = [
 export default defineConfig({
   testDir: "./e2e",
   testMatch: "**/live.spec.ts",
-  fullyParallel: true,
+  fullyParallel: false,
+  workers: 1,
   reporter: "list",
   use: {
     baseURL: `http://127.0.0.1:${frontendPort}`,

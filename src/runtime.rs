@@ -12,9 +12,9 @@ mod providers;
 mod readiness;
 
 pub(crate) use providers::{
-    WorkerPorts, acquire_lock, query_ports, validate_embedder, worker_ports,
+    WorkerPorts, acquire_lock, query_ports, topic_searcher, validate_embedder, worker_ports,
 };
-pub(crate) use readiness::{ReadinessCheck, readiness};
+pub(crate) use readiness::{ReadinessCheck, WorkerReadiness, readiness};
 
 /// Process-local owner for the operator query Adapters.
 ///

@@ -16,11 +16,15 @@ adapter is selected for the local development launcher and currently supports:
 - pending entity-review candidates and read-only similarity previews;
 - operator metrics for the Operations view; and
 - query submission with grounded, ungrounded, unavailable, and ranked-source
-  fallback states.
+  fallback states; and
+- bounded topic discovery that normalizes, deduplicates, and queues article URLs.
 
-The health response includes control-store, knowledge-store, embedder, and LLM
-statuses. It also includes actionable diagnostics for unavailable components
-and exposes `reranker: "identity"`, the deterministic operator-query baseline.
+The health response includes control-store, knowledge-store, embedder, LLM, and
+worker statuses. Worker status includes the latest lifecycle state, boot and
+heartbeat timestamps, current stage/job when available, and a stale flag.
+Actionable diagnostics explain unavailable components or ingestion, and the
+response exposes `reranker: "identity"`, the deterministic operator-query
+baseline.
 
 The query response carries explicit `availability` and `grounding` values. The
 frontend consumes these values directly, so an unreachable language model is
@@ -32,17 +36,34 @@ across successful requests. Construction failures are not cached, allowing a
 repaired local model or knowledge artifact to be retried without restarting the
 API.
 
-The Overview, Documents, and Entities screens now consume read-only HTTP
-models. Document status values are preserved from the control schema and the UI
-does not invent a document type that the schema does not store. Entity review
-previews show both candidates and their similarity score; merge mutations are
+The frontend displays worker readiness in the shared shell. A missing, stopped,
+failed, or stale worker is shown separately from API dependency health so a
+read-only query surface is not confused with ingestion availability.
+
+## Topic discovery and queueing
+
+`POST /api/topics/scrape` accepts `{ "topic": string, "limit": number? }`.
+Topics are limited to 200 characters; the default result limit is 5 and the
+allowed range is 1–10. The Engine searches Bing News RSS, validates HTTP(S)
+article destinations, and returns provider-neutral results. The Control facade
+registers each normalized URL idempotently and reports `enqueued` or
+`duplicate`; the worker later performs the normal fetch-to-index pipeline.
+
+The request body is bounded to 16 KiB. This is a local loopback mutation surface
+for now. CORS, authentication, and CSRF controls are still required before
+binding the API beyond loopback or adding broader browser-triggered mutations.
+
+The Overview, Documents, and Entities screens consume typed HTTP models.
+Document status values are preserved from the control schema and the UI does not
+invent a document type that the schema does not store. Entity review previews
+show both candidates and their similarity score; merge mutations are
 intentionally deferred until the lifecycle contract is ready.
 
 ## Readiness for live use
 
-The P0 live integration slice and P1 read-only workflow now cover health,
-metrics, overview, documents, query, entity reviews, and unavailable
-model/store fixtures through Rust-backed browser checks.
+The live integration slice covers health, metrics, overview, documents, topic
+discovery/queueing, query, entity reviews, and unavailable model/store fixtures
+through Rust-backed browser checks.
 
 Health checks now return actionable diagnostics for missing embedding files and
 invalid knowledge artifacts. Readiness probing is composed centrally and the

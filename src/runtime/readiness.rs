@@ -37,6 +37,19 @@ pub(crate) struct ReadinessReport {
     pub(crate) embedder: ReadinessCheck,
     /// Configured language-model endpoint status.
     pub(crate) llm: ReadinessCheck,
+    /// Durable worker lifecycle and heartbeat status.
+    pub(crate) worker: WorkerReadiness,
+}
+
+/// Worker-specific readiness projection used by the local API.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerReadiness {
+    /// Whether a live worker is ready or executing a stage.
+    pub(crate) available: bool,
+    /// Most recently observed worker, if one has registered.
+    pub(crate) observation: Option<crate::control::WorkerObservation>,
+    /// Actionable diagnostic when ingestion is unavailable.
+    pub(crate) diagnostic: Option<ReadinessDiagnostic>,
 }
 
 /// Checks every default runtime dependency and returns all failures together.
@@ -45,13 +58,23 @@ pub(crate) async fn readiness(config: Config) -> ReadinessReport {
         check_control_store(config.clone()),
         check_knowledge_store(config.clone()),
         check_embedder(config.clone()),
-        check_llm(config),
+        check_llm(config.clone()),
     );
+    let worker = if control_store.available {
+        check_worker(config).await
+    } else {
+        WorkerReadiness {
+            available: false,
+            observation: None,
+            diagnostic: None,
+        }
+    };
     ReadinessReport {
         control_store,
         knowledge_store,
         embedder,
         llm,
+        worker,
     }
 }
 
@@ -69,11 +92,19 @@ fn unavailable(
 ) -> ReadinessCheck {
     ReadinessCheck {
         available: false,
-        diagnostic: Some(ReadinessDiagnostic {
-            component,
-            message: message.into(),
-            action: action.into(),
-        }),
+        diagnostic: Some(diagnostic(component, message, action)),
+    }
+}
+
+fn diagnostic(
+    component: &'static str,
+    message: impl Into<String>,
+    action: impl Into<String>,
+) -> ReadinessDiagnostic {
+    ReadinessDiagnostic {
+        component,
+        message: message.into(),
+        action: action.into(),
     }
 }
 
@@ -167,5 +198,96 @@ async fn check_llm(config: Config) -> ReadinessCheck {
             format!("local language-model endpoint is unavailable: {error}"),
             "Start the configured local provider and retry.",
         ),
+    }
+}
+
+async fn check_worker(config: Config) -> WorkerReadiness {
+    let now = crate::control::now();
+    let stale_after = config.lease_ttl();
+    let result = tokio::task::spawn_blocking(move || {
+        let db = crate::control::connect(config.db_path())?;
+        crate::control::latest_worker_status(&db, &now, stale_after)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(observation))) => {
+            let available = !observation.stale
+                && matches!(
+                    observation.status.state,
+                    crate::control::WorkerState::Ready | crate::control::WorkerState::Running
+                );
+            let diagnostic = (!available).then(|| worker_diagnostic(&observation));
+            WorkerReadiness {
+                available,
+                observation: Some(observation),
+                diagnostic,
+            }
+        }
+        Ok(Ok(None)) => WorkerReadiness {
+            available: false,
+            observation: None,
+            diagnostic: Some(diagnostic(
+                "worker",
+                "no worker process has registered with the control store",
+                "Start the Ohara worker to enable ingestion.",
+            )),
+        },
+        Ok(Err(error)) => WorkerReadiness {
+            available: false,
+            observation: None,
+            diagnostic: Some(diagnostic(
+                "worker",
+                format!("worker status is unavailable: {error}"),
+                "Check the control-store path and worker logs.",
+            )),
+        },
+        Err(error) => WorkerReadiness {
+            available: false,
+            observation: None,
+            diagnostic: Some(diagnostic(
+                "worker",
+                format!("worker health check failed: {error}"),
+                "Restart the local API and check the worker logs.",
+            )),
+        },
+    }
+}
+
+fn worker_diagnostic(observation: &crate::control::WorkerObservation) -> ReadinessDiagnostic {
+    let status = &observation.status;
+    if observation.stale {
+        return ReadinessDiagnostic {
+            component: "worker",
+            message: format!(
+                "worker {} heartbeat is stale; last seen at {}",
+                status.worker_id, status.last_heartbeat_at
+            ),
+            action: "Start or restart the worker and check its logs.".to_string(),
+        };
+    }
+
+    let message = match status.state {
+        crate::control::WorkerState::Starting => {
+            format!("worker {} is still starting", status.worker_id)
+        }
+        crate::control::WorkerState::Stopping => {
+            format!("worker {} is stopping", status.worker_id)
+        }
+        crate::control::WorkerState::Stopped => {
+            format!("worker {} is stopped", status.worker_id)
+        }
+        crate::control::WorkerState::Failed => match &status.last_error {
+            Some(error) => format!("worker {} failed: {error}", status.worker_id),
+            None => format!("worker {} failed without an error detail", status.worker_id),
+        },
+        crate::control::WorkerState::Ready | crate::control::WorkerState::Running => {
+            format!("worker {} is unavailable", status.worker_id)
+        }
+    };
+    ReadinessDiagnostic {
+        component: "worker",
+        message,
+        action: "Check the worker logs and restart it if needed.".to_string(),
     }
 }

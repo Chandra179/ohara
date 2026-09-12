@@ -180,8 +180,7 @@ impl LadybugStore {
         if dim == 0 {
             return Err(KnowledgeError::Backend("embedding dim must be > 0".into()));
         }
-        let db = lbug::Database::new(path, lbug::SystemConfig::default())
-            .map_err(|e| KnowledgeError::Unavailable(e.to_string()))?;
+        let db = open_database(path)?;
         {
             let conn = lbug::Connection::new(&db)
                 .map_err(|e| KnowledgeError::Unavailable(e.to_string()))?;
@@ -252,6 +251,43 @@ impl LadybugStore {
             .filter(|name| name.starts_with("ChunkVec_"))
             .collect())
     }
+}
+
+/// Opens the persistent database and salvages a torn WAL tail when Ladybug
+/// reports the specific frozen-checkpoint failure it can recover from.
+fn open_database(path: &std::path::Path) -> Result<lbug::Database, KnowledgeError> {
+    let strict_config = lbug::SystemConfig::default();
+    match lbug::Database::new(path, strict_config.clone()) {
+        Ok(db) => Ok(db),
+        Err(error) if recoverable_wal_tail(path, &error) => {
+            eprintln!(
+                "ohara: recovering a truncated Ladybug WAL checkpoint at {}",
+                checkpoint_wal_path(path).display()
+            );
+            lbug::Database::new(path, strict_config.throw_on_wal_replay_failure(false)).map_err(
+                |recovery_error| {
+                    KnowledgeError::Unavailable(format!(
+                        "{error}; WAL-tail recovery failed: {recovery_error}"
+                    ))
+                },
+            )
+        }
+        Err(error) => Err(KnowledgeError::Unavailable(error.to_string())),
+    }
+}
+
+fn recoverable_wal_tail(path: &std::path::Path, error: &lbug::Error) -> bool {
+    let message = error.to_string();
+    checkpoint_wal_path(path).is_file()
+        && (message.contains("Reading past the end")
+            || message.contains("Checksum verification failed")
+            || message.contains("WAL file is corrupted"))
+}
+
+fn checkpoint_wal_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut checkpoint = path.as_os_str().to_os_string();
+    checkpoint.push(".wal.checkpoint");
+    checkpoint.into()
 }
 
 fn vec_to_value(v: &[f32]) -> lbug::Value {
@@ -522,6 +558,7 @@ impl KnowledgeStore for LadybugStore {
 mod tests {
     use super::*;
     use crate::knowledge::{KnowledgeStore, ModelId, VectorSpace};
+    use std::io::Write;
 
     fn space(model: &str) -> VectorSpace {
         VectorSpace::Chunks {
@@ -547,6 +584,26 @@ mod tests {
         assert!(schema::string_at(&[], 0).is_err());
         assert!(schema::int_at(&[lbug::Value::String("nope".into())], 0).is_err());
         assert!(schema::double_at(&[lbug::Value::String("nope".into())], 0).is_err());
+    }
+
+    #[test]
+    fn open_recovers_a_truncated_frozen_wal_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ladybug");
+        let store = LadybugStore::open(&path, 4).unwrap();
+        drop(store);
+
+        let checkpoint = checkpoint_wal_path(&path);
+        let mut file = std::fs::File::create(&checkpoint).unwrap();
+        file.write_all(&[0; 16]).unwrap();
+        file.write_all(&[1]).unwrap();
+        drop(file);
+
+        assert!(lbug::Database::new(&path, lbug::SystemConfig::default()).is_err());
+        assert!(checkpoint.exists());
+
+        let _store = LadybugStore::open(&path, 4).unwrap();
+        assert!(!checkpoint.exists());
     }
 
     #[tokio::test]

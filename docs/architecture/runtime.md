@@ -10,10 +10,17 @@ lazily on the first request that can pass readiness checks, then reused through
 cloned behavioral ports. Failed construction is retryable, so repairing a
 missing model or knowledge artifact does not require restarting the API.
 
+The worker registers a unique boot identity in Control, publishes `STARTING`,
+`READY`, `RUNNING`, `STOPPING`, `STOPPED`, or `FAILED`, and refreshes a
+process-local heartbeat independently of long-running stage work. Readiness
+reports the latest worker projection and marks it stale after the lease horizon;
+the API observes this state but does not supervise the worker process.
+
 The pipeline does not construct network clients, database handles, or vendor
 stores. The Engine owns outbound HTTP adapters, Control owns SQLite, and
 Knowledge owns the graph and vector implementation. Runtime composition is the
-small place where those planes are connected.
+small place where those planes are connected. The same composition root assembles
+the Engine topic searcher used by the local topic-queue endpoint.
 
 ## Readiness
 

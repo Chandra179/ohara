@@ -38,14 +38,48 @@ export interface DashboardSnapshot {
   serviceStatus: ServiceStatus;
 }
 
+export type TopicQueueStatus = "duplicate" | "enqueued";
+
+export interface TopicQueueDocument {
+  documentId: string;
+  jobId: string | null;
+  sourceUrl: string;
+  status: TopicQueueStatus;
+  title: string;
+}
+
+export interface TopicScrapeResult {
+  discovered: number;
+  documents: TopicQueueDocument[];
+  duplicates: number;
+  enqueued: number;
+  requested: number;
+  topic: string;
+}
+
 export type ComponentStatus = "available" | "unavailable";
 
-export type HealthComponent = "controlStore" | "embedder" | "knowledgeStore" | "llm";
+export type HealthComponent = "controlStore" | "embedder" | "knowledgeStore" | "llm" | "worker";
+
+export type WorkerState = "failed" | "ready" | "running" | "starting" | "stopped" | "stopping";
 
 export interface ReadinessDiagnostic {
   action: string;
   component: HealthComponent;
   message: string;
+}
+
+export interface WorkerSnapshot {
+  currentJobId: string | null;
+  currentStage: string | null;
+  lastError: string | null;
+  lastHeartbeatAt: string | null;
+  processId: number | null;
+  stale: boolean;
+  startedAt: string | null;
+  state: WorkerState | null;
+  status: ComponentStatus;
+  workerId: string | null;
 }
 
 export interface HealthSnapshot {
@@ -56,6 +90,7 @@ export interface HealthSnapshot {
   llm: ComponentStatus;
   reranker: "identity";
   status: ServiceStatus;
+  worker: WorkerSnapshot;
 }
 
 export interface DocumentRecord {
@@ -158,6 +193,7 @@ export interface OharaApi {
   listDocuments(options?: DocumentListOptions): Promise<DocumentPage>;
   previewEntityMerge(reviewId: string): Promise<MergePreview>;
   queryKnowledgeBase(question: string): Promise<QueryResult>;
+  scrapeTopic(topic: string, limit?: number): Promise<TopicScrapeResult>;
 }
 
 const DEFAULT_DASHBOARD: DashboardSnapshot = {
@@ -212,6 +248,18 @@ const DEFAULT_HEALTH: HealthSnapshot = {
   llm: "available",
   reranker: "identity",
   status: "healthy",
+  worker: {
+    currentJobId: null,
+    currentStage: null,
+    lastError: null,
+    lastHeartbeatAt: "2026-09-12 12:00:00",
+    processId: null,
+    stale: false,
+    startedAt: "2026-09-12 11:55:00",
+    state: "ready",
+    status: "available",
+    workerId: "worker-demo",
+  },
 };
 
 const DEFAULT_DOCUMENTS: DocumentRecord[] = [
@@ -434,6 +482,39 @@ export function createMockApi(
       };
     },
     previewEntityMerge,
+    async scrapeTopic(topic, limit) {
+      const normalizedTopic = topic.trim();
+      return {
+        discovered: 3,
+        documents: [
+          {
+            documentId: "topic-doc-1",
+            jobId: "topic-job-1",
+            sourceUrl: "https://example.com/news/one",
+            status: "enqueued",
+            title: `${normalizedTopic} · lead story`,
+          },
+          {
+            documentId: "topic-doc-2",
+            jobId: "topic-job-2",
+            sourceUrl: "https://example.com/news/two",
+            status: "enqueued",
+            title: `${normalizedTopic} · second story`,
+          },
+          {
+            documentId: "topic-doc-3",
+            jobId: null,
+            sourceUrl: "https://example.com/news/three",
+            status: "duplicate",
+            title: `${normalizedTopic} · already saved`,
+          },
+        ],
+        duplicates: 1,
+        enqueued: 2,
+        requested: limit ?? 5,
+        topic: normalizedTopic,
+      };
+    },
     async queryKnowledgeBase(question) {
       const normalizedQuestion = question.toLowerCase();
       if (normalizedQuestion.includes("error")) {

@@ -17,6 +17,7 @@ mod synthesis;
 mod usage;
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::Class;
 use crate::config::Config;
@@ -162,6 +163,7 @@ impl From<DbError> for StageError {
 pub struct Worker {
     config: Arc<Config>,
     conn: Mutex<ControlDb>,
+    heartbeat_conn: Mutex<ControlDb>,
     handle: tokio::runtime::Handle,
     ports: runtime::WorkerPorts,
     id: String,
@@ -217,14 +219,17 @@ impl Worker {
         runtime_lock: crate::ops::RuntimeLock,
     ) -> Result<Self, crate::BootError> {
         runtime::validate_embedder(&config, ports.embedder.as_ref())?;
-        let id = format!("worker-{}", std::process::id());
+        let id = format!("worker-{}", uuid::Uuid::now_v7());
         let conn = control::connect(config.db_path())?;
+        let heartbeat_conn = control::connect(config.db_path())?;
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             crate::BootError::Worker("ohara must run inside a tokio runtime".to_string())
         })?;
+        control::register_worker(&conn, &id, std::process::id(), &control::now())?;
         Ok(Self {
             config,
             conn: Mutex::new(conn),
+            heartbeat_conn: Mutex::new(heartbeat_conn),
             handle,
             ports,
             id,
@@ -239,6 +244,52 @@ impl Worker {
         self.conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_worker_state(
+        &self,
+        state: control::WorkerState,
+        current_stage: Option<&str>,
+        current_job_id: Option<&str>,
+        last_error: Option<&str>,
+    ) -> Result<(), crate::BootError> {
+        let conn = self.conn();
+        control::update_worker_state(
+            &conn,
+            &self.id,
+            state,
+            current_stage,
+            current_job_id,
+            last_error,
+            &control::now(),
+        )?;
+        Ok(())
+    }
+
+    fn heartbeat(&self) -> Result<(), crate::BootError> {
+        let conn = self
+            .heartbeat_conn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        control::heartbeat_worker(&conn, &self.id, &control::now())?;
+        Ok(())
+    }
+
+    fn spawn_heartbeat(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let worker = Arc::clone(self);
+        let interval = heartbeat_interval(worker.config.lease_ttl());
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let worker = Arc::clone(&worker);
+                match tokio::task::spawn_blocking(move || worker.heartbeat()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("ohara: worker heartbeat failed: {error}"),
+                    Err(error) => eprintln!("ohara: worker heartbeat task failed: {error}"),
+                }
+            }
+        })
     }
 
     /// Runs the full §7.3 boot reconciliation sweep before the loop claims
@@ -282,11 +333,38 @@ impl Worker {
             else {
                 continue;
             };
+            control::update_worker_state(
+                &conn,
+                &self.id,
+                control::WorkerState::Running,
+                Some(stage.as_str()),
+                Some(job.job_id()),
+                None,
+                &now,
+            )?;
             let executor =
                 execution::StageExecutor::new(&self.config, &conn, &self.handle, &self.ports);
             let flow = executor.execute(stage, &job)?;
+            control::update_worker_state(
+                &conn,
+                &self.id,
+                control::WorkerState::Ready,
+                None,
+                None,
+                None,
+                &control::now(),
+            )?;
             return Ok((1, flow));
         }
+        control::update_worker_state(
+            &conn,
+            &self.id,
+            control::WorkerState::Ready,
+            None,
+            None,
+            None,
+            &now,
+        )?;
         Ok((0, execution::Flow::Continue))
     }
 
@@ -298,10 +376,28 @@ impl Worker {
     /// and reconciles at next boot); [`crate::BootError::Worker`] on store
     /// failure.
     pub fn tick_once(&self) -> Result<usize, crate::BootError> {
-        match self.tick().map_err(crate::BootError::Control)? {
+        let result = match self.tick().map_err(crate::BootError::Control)? {
             (_, execution::Flow::Abort(err)) => Err(crate::BootError::Fatal(err)),
             (executed, execution::Flow::Continue) => Ok(executed),
+        };
+        if let Err(error) = &result {
+            let _ = self.set_worker_state(
+                control::WorkerState::Failed,
+                None,
+                None,
+                Some(&error.to_string()),
+            );
         }
+        result
+    }
+}
+
+fn heartbeat_interval(lease_ttl: Duration) -> Duration {
+    let interval = lease_ttl / 3;
+    if interval.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        interval
     }
 }
 
@@ -321,25 +417,41 @@ pub async fn run(config: Config) -> Result<(), crate::BootError> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let worker = Arc::new(Worker::new(Arc::clone(&config))?);
-    worker.reconcile().await?;
+    let heartbeat = worker.spawn_heartbeat();
+    let result: Result<(), crate::BootError> = async {
+        worker.reconcile().await?;
+        worker.set_worker_state(control::WorkerState::Ready, None, None, None)?;
 
-    loop {
-        let executed = tokio::task::spawn_blocking({
-            let worker = Arc::clone(&worker);
-            move || worker.tick_once()
-        })
-        .await
-        .map_err(|join| crate::BootError::Worker(join.to_string()))??;
+        loop {
+            let executed = tokio::task::spawn_blocking({
+                let worker = Arc::clone(&worker);
+                move || worker.tick_once()
+            })
+            .await
+            .map_err(|join| crate::BootError::Worker(join.to_string()))??;
 
-        if executed == 0 {
-            tokio::select! {
-                () = tokio::time::sleep(config.poll_interval()) => {}
-                _ = tokio::signal::ctrl_c() => break,
+            if executed == 0 {
+                tokio::select! {
+                    () = tokio::time::sleep(config.poll_interval()) => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        worker.set_worker_state(control::WorkerState::Stopping, None, None, None)?;
+                        break;
+                    }
+                }
             }
+            // Jobs executed: loop immediately to drain the queue.
         }
-        // Jobs executed: loop immediately to drain the queue.
+        Ok(())
     }
-    Ok(())
+    .await;
+    heartbeat.abort();
+
+    let (state, error) = match &result {
+        Ok(()) => (control::WorkerState::Stopped, None),
+        Err(error) => (control::WorkerState::Failed, Some(error.to_string())),
+    };
+    let _ = worker.set_worker_state(state, None, None, error.as_deref());
+    result
 }
 
 #[cfg(test)]

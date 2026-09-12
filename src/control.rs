@@ -11,6 +11,7 @@ mod models;
 mod read_models;
 mod reconcile;
 mod sites;
+mod workers;
 
 pub use db::{ControlDb, DbError, backup_to, connect};
 pub use documents::{
@@ -21,13 +22,66 @@ pub use entities::{
     EntityDetails, EntityGcCandidate, EntityMerge, ErReview, NameCandidate, NewTriplet, TripletRow,
 };
 pub use metrics::{LlmUsageEvent, LlmUsageOutcome, LlmUsageSnapshot, MetricsSnapshot};
-pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
+pub use models::{
+    ClaimedJob, Completion, DEFAULT_JOB_PRIORITY, DocStatus, Stage, StageEvent, WorkerObservation,
+    WorkerState, WorkerStatus,
+};
 pub use read_models::{
     DocumentListItem, DocumentListQuery, DocumentPage, EntityReviewItem, EntitySummary,
     MAX_DOCUMENT_PAGE_SIZE, OverviewSnapshot, QueueItem,
 };
 pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
+
+/// Registers a worker process before it begins reconciliation.
+pub(crate) fn register_worker(
+    db: &ControlDb,
+    worker_id: &str,
+    process_id: u32,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    workers::register(db.raw(), worker_id, process_id, now_stamp)
+}
+
+/// Updates a worker's lifecycle state and current job projection.
+pub(crate) fn update_worker_state(
+    db: &ControlDb,
+    worker_id: &str,
+    state: WorkerState,
+    current_stage: Option<&str>,
+    current_job_id: Option<&str>,
+    last_error: Option<&str>,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    workers::update_state(
+        db.raw(),
+        worker_id,
+        state,
+        current_stage,
+        current_job_id,
+        last_error,
+        now_stamp,
+    )
+}
+
+/// Refreshes a worker heartbeat without changing its lifecycle projection.
+pub(crate) fn heartbeat_worker(
+    db: &ControlDb,
+    worker_id: &str,
+    now_stamp: &str,
+) -> Result<(), DbError> {
+    workers::heartbeat(db.raw(), worker_id, now_stamp)
+}
+
+/// Reads the most recently observed worker and computes whether its heartbeat
+/// has exceeded the configured lease horizon.
+pub(crate) fn latest_worker_status(
+    db: &ControlDb,
+    now_stamp: &str,
+    stale_after: std::time::Duration,
+) -> Result<Option<WorkerObservation>, DbError> {
+    workers::latest(db.raw(), now_stamp, stale_after)
+}
 
 /// Registers a document and its initial SCRAPE job.
 ///
@@ -41,6 +95,11 @@ pub fn insert_new(
     now_stamp: &str,
 ) -> Result<EnqueueOutcome, DbError> {
     documents::insert_new(db.raw(), data_dir, new, now_stamp)
+}
+
+/// Returns a UTC timestamp in the control-plane format for a new write.
+pub(crate) fn now_stamp() -> String {
+    db::now()
 }
 
 /// Looks up a document by normalized URL.

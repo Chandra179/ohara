@@ -16,9 +16,9 @@ Ollama language models.
 - Citation-preserving answers with a bounded local-language-model fallback.
 - Crash-safe jobs, retries, recovery, backups, lifecycle operations, retention,
   entity cleanup, and durable usage metrics.
-- A local frontend for overview, documents, queries, entity review, and
-  operations; the live read-only workflow now covers overview, documents,
-  query, and entity reviews, while mutation endpoints are still being added.
+- A local frontend for topic discovery, overview, documents, queries, entity
+  review, and operations. Topic results can be normalized, deduplicated, and
+  queued for the worker from the Overview screen.
 
 For a plain-language explanation of the product and its algorithms, read the
 [Ohara overview](docs/OVERVIEW.md).
@@ -97,8 +97,9 @@ make dev
 The API listens on `127.0.0.1:3000` and the frontend on `127.0.0.1:5173`.
 The frontend uses its mock data by default; the development launchers select the
 Rust-backed HTTP mode. The live API supports health, metrics, overview,
-documents, query, and entity-review previews. Lifecycle mutations remain
-tracked work.
+documents, topic discovery/queueing, query, and entity-review previews. The
+worker still runs as a separate process, and lifecycle mutations remain tracked
+work.
 
 Both individual launch commands free their configured TCP port first. Override
 `API_BIND`, `API_PROXY_TARGET`, or `FRONTEND_PORT` when needed.
@@ -116,9 +117,10 @@ The query combines full-text, vector, and graph signals. It returns a bounded
 answer with exact evidence citations when the language model produces grounded
 output. Otherwise it returns the ranked evidence so retrieval remains useful.
 
-URL registration is currently available through the library integration rather
-than a public CLI command. The ingestion UI and a user-facing URL-add workflow
-are planned.
+From the Overview screen, enter a topic such as `september 2026 news` to
+discover a bounded set of news URLs. Ohara normalizes and deduplicates the
+results before adding new documents to the durable queue. Start the worker to
+fetch and index queued documents.
 
 ## Operator commands
 

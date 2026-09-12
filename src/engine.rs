@@ -8,6 +8,7 @@ mod ladder;
 mod llm;
 mod obscura;
 mod robots;
+mod topic_search;
 
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ pub use impersonate::ImpersonationFetcher;
 pub use ladder::FetchLadder;
 pub use llm::Ollama;
 pub use obscura::ObscuraFetcher;
+pub use topic_search::{BingNewsSearcher, TopicResult, TopicSearchError, TopicSearcher};
 
 use async_trait::async_trait;
 

@@ -24,6 +24,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0003_entity_gc",
         include_str!("../../migrations/0003_entity_gc.sql"),
     ),
+    (
+        "0004_worker_status",
+        include_str!("../../migrations/0004_worker_status.sql"),
+    ),
 ];
 
 /// Control-plane errors.
@@ -42,6 +46,9 @@ pub enum DbError {
         #[source]
         source: rusqlite::Error,
     },
+    /// A worker status row contains an invalid state or process id.
+    #[error("invalid worker record: {0}")]
+    WorkerRecord(String),
     /// A stored or computed timestamp does not follow the §5 format.
     #[error("malformed timestamp {value:?}: expected {fmt:?}")]
     Timestamp {
@@ -273,7 +280,7 @@ mod tests {
             })
             .expect("schema_migrations");
         assert_eq!(
-            versions, 3,
+            versions, 4,
             "exactly one row per applied migration recorded"
         );
         let jobs: i64 = conn

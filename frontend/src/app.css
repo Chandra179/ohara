@@ -157,6 +157,12 @@ button:disabled {
   border-bottom: 1px solid #243149;
 }
 
+.status-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+}
+
 .avatar {
   display: grid;
   width: 28px;
@@ -579,6 +585,24 @@ button:disabled {
 .query-form {
   display: grid;
   gap: 10px;
+}
+
+.topic-form {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+}
+
+.topic-form .field {
+  flex: 1;
+}
+
+.topic-form .button {
+  flex: 0 0 auto;
+}
+
+.topic-result {
+  gap: 4px;
 }
 
 .query-form__label {
@@ -1111,6 +1135,15 @@ button:disabled {
   .query-form__row {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .topic-form {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .topic-form .button {
+    width: 100%;
   }
 
   .query-form__row .button {

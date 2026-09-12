@@ -4,6 +4,7 @@ import { useApi } from "../api/useApi";
 import { QueueList } from "../components/ohara/QueueList";
 import { PageHeader } from "../components/ohara/PageHeader";
 import { StatCard } from "../components/ohara/StatCard";
+import { TopicScrapePanel } from "../components/ohara/TopicScrapePanel";
 import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
 import { ErrorState } from "../components/ui/ErrorState";
@@ -87,6 +88,7 @@ export function OverviewPage() {
         </Panel>
       ) : null}
 
+      <TopicScrapePanel onQueued={refreshDashboard} />
       {resource.status === "success" ? <DashboardContent snapshot={resource.data} /> : null}
     </div>
   );

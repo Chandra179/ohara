@@ -12,6 +12,8 @@ data, extraction checkpoints, usage records, and operator metadata.
   audit, and entity-review candidates.
 - Deletion intents, stage events, language-model usage, and entity-GC grace
   state.
+- Worker boot identity, lifecycle state, current stage/job projection, and
+  heartbeat timestamps.
 
 SQLite connections enable foreign keys and WAL mode. Migrations are versioned.
 Audit events intentionally outlive deleted documents; document-owned data is
@@ -46,3 +48,9 @@ The read-model facade also provides cursor-paginated document summaries,
 durable document-status counts, a bounded active queue projection, and hydrated
 pending entity-review candidates. These projections omit raw filesystem paths
 and keep transport concerns outside the control plane.
+
+Worker status is a durable operational projection rather than a job-claim
+authority. Each boot registers a unique worker id, updates its lifecycle state,
+and refreshes a heartbeat while stages run. Runtime readiness marks the latest
+projection stale when it exceeds the configured lease horizon; stale rows remain
+as crash evidence for diagnosis.

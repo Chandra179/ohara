@@ -30,4 +30,7 @@ postcondition.
 The knowledge index can be rebuilt from stored chunk embedding text, triplet
 evidence, and control-plane identity mappings. Cross-store ordering is owned by
 the pipeline recovery flow; the knowledge plane exposes operations but does not
-decide when a control mutation is safe.
+decide when a control mutation is safe. When Ladybug reports a truncated frozen
+WAL checkpoint tail, opening the store retries with the incomplete tail
+discarded and removes that stale checkpoint. Other invalid artifacts remain
+unavailable and require an explicit rebuild or repair action.

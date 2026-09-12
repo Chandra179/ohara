@@ -19,6 +19,11 @@ import type {
   QueryGrounding,
   QueryResult,
   ReadinessDiagnostic,
+  TopicQueueDocument,
+  TopicQueueStatus,
+  TopicScrapeResult,
+  WorkerSnapshot,
+  WorkerState,
 } from "./client";
 
 interface HttpApiOptions {
@@ -86,6 +91,14 @@ export function createHttpApi({ baseUrl = "", fetcher = fetch }: HttpApiOptions 
         method: "POST",
       });
       return mapQueryResponse(parseQueryResponse(response));
+    },
+    scrapeTopic: async (topic, limit) => {
+      const response = await request<unknown>("/api/topics/scrape", {
+        body: JSON.stringify({ limit, topic }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      });
+      return parseTopicScrapeResponse(response);
     },
   };
 }
@@ -181,6 +194,46 @@ function parseOverviewPayload(payload: unknown): Omit<DashboardSnapshot, "servic
   };
 }
 
+function parseTopicScrapeResponse(payload: unknown): TopicScrapeResult {
+  if (
+    !isRecord(payload) ||
+    typeof payload.topic !== "string" ||
+    !isCount(payload.requested) ||
+    !isCount(payload.discovered) ||
+    !isCount(payload.enqueued) ||
+    !isCount(payload.duplicates) ||
+    !Array.isArray(payload.documents)
+  ) {
+    throw invalidResponse("topic scrape");
+  }
+  const documents = payload.documents.map(parseTopicQueueDocument);
+  if (documents.some((document) => document === undefined)) {
+    throw invalidResponse("topic scrape");
+  }
+  return {
+    discovered: payload.discovered,
+    documents: documents as TopicQueueDocument[],
+    duplicates: payload.duplicates,
+    enqueued: payload.enqueued,
+    requested: payload.requested,
+    topic: payload.topic,
+  };
+}
+
+function parseTopicQueueDocument(value: unknown): TopicQueueDocument | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.documentId !== "string" ||
+    !isNullableString(value.jobId) ||
+    typeof value.sourceUrl !== "string" ||
+    !isTopicQueueStatus(value.status) ||
+    typeof value.title !== "string"
+  ) {
+    return undefined;
+  }
+  return value as unknown as TopicQueueDocument;
+}
+
 function parseDocumentPage(payload: unknown): DocumentPage {
   if (!isRecord(payload) || !Array.isArray(payload.items)) {
     throw invalidResponse("documents");
@@ -238,12 +291,14 @@ function parseHealthSnapshot(payload: unknown): HealthSnapshot {
   const knowledgeStore = parseComponentStatus(payload.knowledgeStore);
   const embedder = parseComponentStatus(payload.embedder);
   const llm = parseComponentStatus(payload.llm);
+  const worker = parseWorkerSnapshot(payload.worker);
   if (
     status === undefined ||
     controlStore === undefined ||
     knowledgeStore === undefined ||
     embedder === undefined ||
     llm === undefined ||
+    worker === undefined ||
     payload.reranker !== "identity" ||
     !Array.isArray(payload.diagnostics)
   ) {
@@ -263,7 +318,38 @@ function parseHealthSnapshot(payload: unknown): HealthSnapshot {
     llm,
     reranker: "identity",
     status,
+    worker,
   };
+}
+
+function parseWorkerSnapshot(value: unknown): WorkerSnapshot | undefined {
+  if (
+    !isRecord(value) ||
+    parseComponentStatus(value.status) === undefined ||
+    (value.state !== null && !isWorkerState(value.state)) ||
+    !isNullableString(value.workerId) ||
+    !isNullableNumber(value.processId) ||
+    !isNullableString(value.startedAt) ||
+    !isNullableString(value.lastHeartbeatAt) ||
+    !isNullableString(value.currentStage) ||
+    !isNullableString(value.currentJobId) ||
+    !isNullableString(value.lastError) ||
+    typeof value.stale !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    currentJobId: value.currentJobId,
+    currentStage: value.currentStage,
+    lastError: value.lastError,
+    lastHeartbeatAt: value.lastHeartbeatAt,
+    processId: value.processId,
+    stale: value.stale,
+    startedAt: value.startedAt,
+    state: value.state,
+    status: value.status,
+    workerId: value.workerId,
+  } as WorkerSnapshot;
 }
 
 function parseEntityReviewList(payload: unknown): EntityReview[] {
@@ -452,6 +538,10 @@ function isNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+function isCount(value: unknown): value is number {
+  return isNumber(value) && Number.isInteger(value);
+}
+
 function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
@@ -512,8 +602,29 @@ function isJobStatus(value: unknown): value is Exclude<JobStatus, "DONE"> {
   return value === "DEAD" || value === "PENDING" || value === "RUNNING";
 }
 
+function isTopicQueueStatus(value: unknown): value is TopicQueueStatus {
+  return value === "duplicate" || value === "enqueued";
+}
+
 function isHealthComponent(value: unknown): value is HealthComponent {
-  return value === "controlStore" || value === "embedder" || value === "knowledgeStore" || value === "llm";
+  return (
+    value === "controlStore" ||
+    value === "embedder" ||
+    value === "knowledgeStore" ||
+    value === "llm" ||
+    value === "worker"
+  );
+}
+
+function isWorkerState(value: unknown): value is WorkerState {
+  return (
+    value === "failed" ||
+    value === "ready" ||
+    value === "running" ||
+    value === "starting" ||
+    value === "stopped" ||
+    value === "stopping"
+  );
 }
 
 function invalidResponse(resource: string): Error {

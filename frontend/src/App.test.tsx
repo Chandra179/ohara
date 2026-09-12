@@ -26,6 +26,7 @@ describe("App shell", () => {
     );
     expect(await screen.findByRole("heading", { name: "Ingestion queue" })).toBeInTheDocument();
     expect(screen.getAllByText("Local · Healthy")).toHaveLength(2);
+    expect(screen.getByText("Worker · Ready")).toBeInTheDocument();
     expect(screen.getByText("Product Notes Q1")).toBeInTheDocument();
   });
 
@@ -36,6 +37,17 @@ describe("App shell", () => {
     await user.click(await screen.findByRole("button", { name: "Refresh" }));
 
     expect(await screen.findByText("Ingestion status refreshed")).toBeInTheDocument();
+  });
+
+  it("finds and queues a topic from the overview", async () => {
+    const user = userEvent.setup();
+    renderApp();
+
+    await user.click(await screen.findByRole("button", { name: "Find & queue" }));
+
+    expect(await screen.findByText(/3 results found for/)).toBeInTheDocument();
+    expect(screen.getByText("2 queued · 1 already in your library.")).toBeInTheDocument();
+    expect(await screen.findByText("Topic queued")).toBeInTheDocument();
   });
 
   it("moves focus to the main content after navigation", async () => {

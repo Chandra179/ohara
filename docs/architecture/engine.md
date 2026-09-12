@@ -1,9 +1,10 @@
 # Network engine
 
 The engine owns all outbound network activity and implements the fetcher port.
-It also contains HTTP adapters for provider ports such as local Ollama. It is
-responsible for safe, policy-compliant egress rather than document state,
-language-model semantics, or pipeline scheduling.
+It also contains HTTP adapters for provider ports such as local Ollama and
+topic discovery over Bing News RSS. It is responsible for safe, policy-
+compliant egress rather than document state, language-model semantics, or
+pipeline scheduling.
 
 ## Provider ladder
 
@@ -26,3 +27,8 @@ for recrawls. A 304 is usable only when the local payload still exists.
 URL normalization is performed once at the boundary for stable URL deduplication.
 Provider-native errors are mapped into the common fetch error taxonomy so the
 pipeline can make retry decisions without knowing the provider.
+
+Topic discovery returns validated, normalized HTTP(S) destinations and never
+follows a provider redirect just to extract a result. Its bounded RSS response
+is parsed inside the engine; the API receives only provider-neutral titles and
+URLs.

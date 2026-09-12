@@ -3,7 +3,7 @@
 //! fields stay `pub(crate)` — construction goes through `control` functions (§6).
 
 /// Priority used when a legacy document has no SCRAPE job row to inherit from.
-pub(crate) const DEFAULT_JOB_PRIORITY: i64 = 5;
+pub const DEFAULT_JOB_PRIORITY: i64 = 5;
 
 /// Pipeline stages — one job row per `(doc_id, stage)` (§6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,6 +60,83 @@ impl Stage {
             Stage::Extract => "INDEXED",
         }
     }
+}
+
+/// Durable lifecycle state for one worker process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerState {
+    /// The process registered but has not completed startup reconciliation.
+    Starting,
+    /// The process completed startup reconciliation and is waiting for work.
+    Ready,
+    /// The process is executing a claimed stage.
+    Running,
+    /// The process received a graceful shutdown signal.
+    Stopping,
+    /// The process completed a graceful shutdown.
+    Stopped,
+    /// The process stopped after an unrecoverable boot or loop failure.
+    Failed,
+}
+
+impl WorkerState {
+    /// The durable discriminator stored in the control schema.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "STARTING",
+            Self::Ready => "READY",
+            Self::Running => "RUNNING",
+            Self::Stopping => "STOPPING",
+            Self::Stopped => "STOPPED",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, super::db::DbError> {
+        match value {
+            "STARTING" => Ok(Self::Starting),
+            "READY" => Ok(Self::Ready),
+            "RUNNING" => Ok(Self::Running),
+            "STOPPING" => Ok(Self::Stopping),
+            "STOPPED" => Ok(Self::Stopped),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(super::db::DbError::WorkerRecord(format!(
+                "unknown worker state {value:?}"
+            ))),
+        }
+    }
+}
+
+/// Durable projection of one worker process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerStatus {
+    /// Globally unique process identity for this worker boot.
+    pub worker_id: String,
+    /// Operating-system process id, useful for local diagnostics.
+    pub process_id: u32,
+    /// Current lifecycle state.
+    pub state: WorkerState,
+    /// UTC time at which this worker boot registered.
+    pub started_at: String,
+    /// UTC time of the most recent heartbeat or state update.
+    pub last_heartbeat_at: String,
+    /// Stage currently being executed, if any.
+    pub current_stage: Option<String>,
+    /// Job currently being executed, if any.
+    pub current_job_id: Option<String>,
+    /// Last unrecoverable worker error, if any.
+    pub last_error: Option<String>,
+}
+
+/// Worker status plus the control plane's stale-heartbeat observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerObservation {
+    /// Most recently observed worker projection.
+    pub status: WorkerStatus,
+    /// Whether the last heartbeat is older than the configured horizon.
+    pub stale: bool,
 }
 
 /// What a `DONE` job means for its document and the chain (§6 stage chaining).

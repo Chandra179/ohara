@@ -20,10 +20,13 @@ cloud providers are planned and cloud egress is disabled today.
 - Preserve evidence for every extracted fact and answer citation.
 - Retry temporary failures and recover safely after a process restart.
 - Inspect progress, usage, failed work, and maintenance state locally.
+- Discover a bounded set of news articles from a topic and queue new URLs for
+  ingestion, with duplicate results called out clearly.
 
 The product interface includes views for overview, documents, queries, entity
-review, and operations. The live read-only connection covers health, metrics,
-overview, documents, query, and entity-review previews. Lifecycle actions remain
+review, and operations. The live connection covers health, metrics, overview,
+documents, topic discovery/queueing, query, and entity-review previews. Topic
+queueing adds work for the separate worker; lifecycle actions remain
 deliberately separate until their confirmation and idempotency contract is
 ready.
 
@@ -156,8 +159,11 @@ default.
 - The default vector search is exact rather than HNSW-accelerated.
 - The production query path currently uses the deterministic identity reranker
   baseline.
+- Topic discovery currently uses Bing News RSS and queues URLs; the worker must
+  be running separately to fetch and index them.
 - The live interface connection covers health, metrics, overview, documents,
-  query, and entity-review previews; lifecycle mutations are next.
+  topic discovery/queueing, query, and entity-review previews; lifecycle
+  mutations are next.
 - Entity-resolution thresholds are conservative configuration defaults and still
   need measurement on larger, ambiguous collections.
 - Symspell correction, HyDE query expansion, stage throughput dashboards,

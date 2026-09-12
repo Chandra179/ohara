@@ -164,11 +164,12 @@ an authenticated deployment boundary exists.
 
 ## 13. Observability
 
-Durable stage events, queue and milestone aggregates, recrawl state, entity
-reviews, raw-payload usage, and every language-model attempt form the current
-operator view. The API exposes health, metrics, overview, documents, query, and
-read-only entity-review previews. Stage throughput/latency dashboards and export
-are planned.
+Durable stage events, queue and milestone aggregates, recrawl state, worker
+lifecycle/heartbeat state, entity reviews, raw-payload usage, and every
+language-model attempt form the current
+operator view. The API exposes health, metrics, overview, documents, bounded
+topic discovery/queueing, query, and read-only entity-review previews. Stage
+throughput/latency dashboards and export are planned.
 
 ## 14. Testing strategy
 
@@ -190,12 +191,12 @@ build/runtime details are in [testing and build](architecture/testing-and-build.
    the identity reranker baseline.
 3. Recovery, lifecycle/maintenance operators, and evaluation machinery —
    implemented.
-4. Local UI boundary — health, metrics, query, overview, document, and
-   read-only entity-review transport implemented; lifecycle mutations remain
-   open.
-5. Next work — worker process lifecycle/readiness, transport hardening,
-   lifecycle API contracts, measured ER/retrieval quality, HNSW, throughput metrics,
-   embedding migration, and cloud providers.
+4. Local UI boundary — health, metrics, query, overview, document, bounded topic
+   discovery/queueing, and read-only entity-review transport implemented;
+   lifecycle mutations remain open.
+5. Next work — transport hardening, lifecycle API contracts, measured
+   ER/retrieval quality, HNSW, throughput metrics, embedding migration, and
+   cloud providers.
 
 ## Component documentation
 

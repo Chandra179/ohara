@@ -52,6 +52,16 @@ test("renders the live entity review read model empty state", async ({ page }) =
   await expect(page.getByText("No entities need review")).toBeVisible();
 });
 
+test("searches and queues a topic from the live Overview", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByRole("textbox", { name: "Topic" }).fill("september 2026 news");
+  await page.getByRole("button", { exact: true, name: "Find & queue" }).click();
+
+  await expect(page.getByText(/results found for.*september 2026 news/)).toBeVisible();
+  await expect(page.getByText(/queued.*already in your library/)).toBeVisible();
+});
+
 test("reports an invalid knowledge artifact from the live Rust API", async ({ page }) => {
   const response = await page.request.get("http://127.0.0.1:4314/api/health");
   expect(response.ok()).toBe(true);

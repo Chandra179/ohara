@@ -9,8 +9,8 @@ use crate::BootError;
 use crate::config::Config;
 use crate::engine::Ollama;
 use crate::engine::{
-    FetchLadder, FetchLeg, Fetcher, HttpFetcher, HttpFetcherParams, ImpersonationFetcher,
-    ObscuraFetcher,
+    BingNewsSearcher, FetchLadder, FetchLeg, Fetcher, HttpFetcher, HttpFetcherParams,
+    ImpersonationFetcher, ObscuraFetcher, TopicSearcher,
 };
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
@@ -23,6 +23,14 @@ pub(crate) struct WorkerPorts {
     pub(crate) embedder: Arc<dyn Embedder>,
     pub(crate) knowledge: Arc<dyn KnowledgeStore>,
     pub(crate) llm: Arc<dyn Llm>,
+}
+
+/// Assembles the network-owned topic search adapter for the local API.
+pub(crate) fn topic_searcher(config: &Config) -> Arc<dyn TopicSearcher> {
+    Arc::new(BingNewsSearcher::new(
+        config.fetcher().user_agent().to_string(),
+        config.fetcher().timeout(),
+    ))
 }
 
 /// Assembles the default worker adapters and validates their shared contracts.
