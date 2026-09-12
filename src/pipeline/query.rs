@@ -5,12 +5,24 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::control::{self, ControlDb};
-use crate::knowledge::ModelId;
+use crate::knowledge::{KnowledgeStore, ModelId};
+use crate::llm::Llm;
 
 use super::retrieve::RetrievedContext;
 use super::synthesis;
-use super::{IdentityReranker, Retriever, ScoredChunk, WhatlangNormalizer};
-use crate::runtime::{QueryPorts, query_ports};
+use super::{Embedder, IdentityReranker, Retriever, ScoredChunk, WhatlangNormalizer};
+
+/// The behavioral ports needed by operator retrieval and synthesis.
+///
+/// The pipeline owns this Interface because it is the consumer. Runtime
+/// composition supplies the concrete Adapters, while the query implementation
+/// only relies on these behavioral capabilities.
+#[derive(Clone)]
+pub(crate) struct QueryPorts {
+    pub(crate) embedder: Arc<dyn Embedder>,
+    pub(crate) knowledge: Arc<dyn KnowledgeStore>,
+    pub(crate) llm: Arc<dyn Llm>,
+}
 
 pub use super::synthesis::QueryResponse;
 
@@ -58,7 +70,9 @@ pub async fn query(
     query_text: &str,
     top_k: usize,
 ) -> Result<Vec<ScoredChunk>, QueryError> {
-    Ok(retrieve_context(config, query_text, top_k)
+    validate_query(&config, query_text, top_k)?;
+    let ports = crate::runtime::query_ports(&config)?;
+    Ok(retrieve_context(config, ports, query_text, top_k)
         .await?
         .context
         .chunks)
@@ -79,7 +93,23 @@ pub async fn answer(
     query_text: &str,
     top_k: usize,
 ) -> Result<QueryResponse, QueryError> {
-    let session = retrieve_context(config, query_text, top_k).await?;
+    validate_query(&config, query_text, top_k)?;
+    let ports = crate::runtime::query_ports(&config)?;
+    answer_with_ports(config, ports, query_text, top_k).await
+}
+
+/// Runs operator retrieval with an already assembled set of ports.
+///
+/// Runtime composition uses this Interface for long-lived HTTP processes so
+/// successful provider construction is reused across requests. The public
+/// [`answer`] helper remains available for one-shot CLI callers.
+pub(crate) async fn answer_with_ports(
+    config: Config,
+    ports: QueryPorts,
+    query_text: &str,
+    top_k: usize,
+) -> Result<QueryResponse, QueryError> {
+    let session = retrieve_context(config, ports, query_text, top_k).await?;
     synthesis::run(
         &session.config,
         &session.conn,
@@ -100,6 +130,7 @@ struct QuerySession {
 
 async fn retrieve_context(
     config: Config,
+    ports: QueryPorts,
     query_text: &str,
     top_k: usize,
 ) -> Result<QuerySession, QueryError> {
@@ -110,7 +141,6 @@ async fn retrieve_context(
         std::fs::create_dir_all(parent)?;
     }
 
-    let ports = query_ports(&config)?;
     let conn = control::connect(config.db_path()).map_err(crate::BootError::from)?;
     let normalizer = WhatlangNormalizer::new(config.retrieval().detection_confidence_floor());
     let reranker = IdentityReranker;
@@ -135,7 +165,12 @@ async fn retrieve_context(
     })
 }
 
-fn validate_query(config: &Config, query_text: &str, top_k: usize) -> Result<(), QueryError> {
+/// Validates the operator query before runtime Adapters are initialized.
+pub(crate) fn validate_query(
+    config: &Config,
+    query_text: &str,
+    top_k: usize,
+) -> Result<(), QueryError> {
     if query_text.trim().is_empty() {
         return Err(QueryError::Empty);
     }

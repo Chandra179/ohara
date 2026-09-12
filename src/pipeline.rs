@@ -32,6 +32,7 @@ pub use clean::{CleanOutcome, ExtractError, ExtractedArticle, Extractor, Readabi
 pub use embed::LocalEmbedder;
 pub use embed::{EmbedError, Embedder};
 pub use query::{QueryError, QueryResponse, answer, query};
+pub(crate) use query::{QueryPorts, answer_with_ports, validate_query};
 #[cfg(feature = "onnx-embedder")]
 pub use retrieve::LocalReranker;
 pub use retrieve::{

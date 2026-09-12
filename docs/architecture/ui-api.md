@@ -26,6 +26,12 @@ The query response carries explicit `availability` and `grounding` values. The
 frontend consumes these values directly, so an unreachable language model is
 not confused with an available model that returned malformed or uncited output.
 
+The API owns a process-local query runtime. It lazily assembles the query
+Adapters after the request path is allowed by readiness checks and reuses them
+across successful requests. Construction failures are not cached, allowing a
+repaired local model or knowledge artifact to be retried without restarting the
+API.
+
 The Overview, Documents, and Entities screens now consume read-only HTTP
 models. Document status values are preserved from the control schema and the UI
 does not invent a document type that the schema does not store. Entity review

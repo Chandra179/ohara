@@ -44,7 +44,7 @@ priority.
   stable.
 - [ ] Add stage throughput and latency charts only when backend metrics are
   available; never fabricate operational data in production UI.
-- [ ] Show actionable model and knowledge-store readiness diagnostics in the
+- [x] Show actionable model and knowledge-store readiness diagnostics in the
   shell and affected pages.
 
 ## P4 — release checks

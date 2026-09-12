@@ -14,19 +14,12 @@ use crate::engine::{
 };
 use crate::knowledge::KnowledgeStore;
 use crate::llm::Llm;
-use crate::pipeline::{Embedder, Extractor, ReadabilityExtractor};
+use crate::pipeline::{Embedder, Extractor, QueryPorts, ReadabilityExtractor};
 
 /// The fully assembled default provider set for a worker.
 pub(crate) struct WorkerPorts {
     pub(crate) fetcher: Arc<dyn Fetcher>,
     pub(crate) extractor: Arc<dyn Extractor>,
-    pub(crate) embedder: Arc<dyn Embedder>,
-    pub(crate) knowledge: Arc<dyn KnowledgeStore>,
-    pub(crate) llm: Arc<dyn Llm>,
-}
-
-/// The subset of default providers required by operator retrieval.
-pub(crate) struct QueryPorts {
     pub(crate) embedder: Arc<dyn Embedder>,
     pub(crate) knowledge: Arc<dyn KnowledgeStore>,
     pub(crate) llm: Arc<dyn Llm>,

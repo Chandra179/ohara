@@ -5,6 +5,11 @@ worker and operator query flow through behavioral ports. This is the
 composition root: it selects concrete adapters, validates model and storage
 compatibility, and acquires the process lock for mutating work.
 
+The API keeps a process-local query runtime. Query Adapters are assembled
+lazily on the first request that can pass readiness checks, then reused through
+cloned behavioral ports. Failed construction is retryable, so repairing a
+missing model or knowledge artifact does not require restarting the API.
+
 The pipeline does not construct network clients, database handles, or vendor
 stores. The Engine owns outbound HTTP adapters, Control owns SQLite, and
 Knowledge owns the graph and vector implementation. Runtime composition is the

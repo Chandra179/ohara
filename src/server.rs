@@ -68,6 +68,7 @@ pub enum ServerError {
 #[derive(Clone)]
 pub(super) struct AppState {
     pub(super) config: Config,
+    pub(super) query_runtime: Arc<crate::runtime::QueryRuntime>,
 }
 
 fn router(config: Config) -> Router {
@@ -82,7 +83,10 @@ fn router(config: Config) -> Router {
             get(entities::entity_review_preview),
         )
         .route("/api/query", post(query::query))
-        .with_state(Arc::new(AppState { config }))
+        .with_state(Arc::new(AppState {
+            config,
+            query_runtime: Arc::new(crate::runtime::QueryRuntime::default()),
+        }))
 }
 
 async fn shutdown_signal() {

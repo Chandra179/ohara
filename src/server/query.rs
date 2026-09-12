@@ -54,12 +54,23 @@ pub(super) async fn query(
         .top_k
         .unwrap_or_else(|| state.config.retrieval().top_k());
     let config = state.config.clone();
+    let query_runtime = Arc::clone(&state.query_runtime);
     let query_text = request.query;
     let handle = tokio::runtime::Handle::current();
     let response = tokio::task::spawn_blocking(move || {
-        handle
-            .block_on(crate::pipeline::answer(config, &query_text, top_k))
-            .map_err(|error| ApiError::query(&error))
+        let result = match crate::pipeline::validate_query(&config, &query_text, top_k) {
+            Ok(()) => match query_runtime.ports(&config) {
+                Ok(ports) => handle.block_on(crate::pipeline::answer_with_ports(
+                    config,
+                    ports,
+                    &query_text,
+                    top_k,
+                )),
+                Err(error) => Err(crate::pipeline::QueryError::from(error)),
+            },
+            Err(error) => Err(error),
+        };
+        result.map_err(|error| ApiError::query(&error))
     })
     .await
     .map_err(|error| ApiError::internal(format!("query task failed: {error}")))??;

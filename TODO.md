@@ -32,6 +32,9 @@ boundaries; this file records what is still open.
 
 ## P2 — API lifecycle and operational safety
 
+- [x] Keep successful query provider construction process-local and lazy so
+  HTTP requests reuse the same behavioral ports without making API startup
+  fail before readiness diagnostics can be shown.
 - [ ] Add worker-process readiness and lifecycle reporting after the API can
   supervise or reliably observe ingestion.
 - [ ] Add request limits, CORS policy, and local authentication/CSRF protection
