@@ -288,6 +288,37 @@ impl LocalEmbedder {
     /// truncates at exactly this width.
     pub(crate) const MAX_LENGTH: usize = crate::config::defaults::CHUNK_BUDGET_TOKENS;
 
+    /// Checks whether the pinned local model is already present in the cache.
+    /// This is deliberately a filesystem-only check so health requests never
+    /// start a model download.
+    pub(crate) fn check_cache(cache_dir: &std::path::Path) -> Result<(), EmbedError> {
+        let repo_dir = cache_dir.join("models--Xenova--bge-small-en-v1.5");
+        let reference_path = repo_dir.join("refs").join("main");
+        let revision = std::fs::read_to_string(&reference_path).map_err(|error| {
+            EmbedError::Unavailable(format!(
+                "pinned embedding model is not downloaded; cannot read {}: {error}",
+                reference_path.display()
+            ))
+        })?;
+        let snapshot_dir = repo_dir.join("snapshots").join(revision.trim());
+        for relative_path in [
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "onnx/model.onnx",
+        ] {
+            let path = snapshot_dir.join(relative_path);
+            if !path.is_file() {
+                return Err(EmbedError::Unavailable(format!(
+                    "pinned embedding model is incomplete; missing {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Loads (downloading on first use) the pinned model into `cache_dir`.
     ///
     /// # Errors

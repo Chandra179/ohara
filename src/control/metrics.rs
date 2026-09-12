@@ -76,6 +76,7 @@ pub struct MetricsSnapshot {
 
 /// Aggregated durable LLM usage for the operator view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LlmUsageSnapshot {
     /// Number of recorded attempts.
     pub calls: u64,

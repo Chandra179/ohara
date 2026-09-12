@@ -41,3 +41,8 @@ replacement inserts are forbidden because they churn full-text row mappings.
 The control facade exposes domain records and operations. Other areas do not
 receive SQLite handles or issue SQL. Read-only metrics use a WAL snapshot and
 must remain available while the worker owns the exclusive mutation lock.
+
+The read-model facade also provides cursor-paginated document summaries,
+durable document-status counts, a bounded active queue projection, and hydrated
+pending entity-review candidates. These projections omit raw filesystem paths
+and keep transport concerns outside the control plane.

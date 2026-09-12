@@ -4,6 +4,7 @@ const executablePath = process.env.PLAYWRIGHT_EXECUTABLE_PATH;
 
 export default defineConfig({
   testDir: "./e2e",
+  testIgnore: "**/live.spec.ts",
   fullyParallel: true,
   reporter: "list",
   use: {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import type { DashboardSnapshot, ServiceStatus } from "../api/client";
+import type { DashboardSnapshot, DocumentStatus, ServiceStatus } from "../api/client";
 import { useApi } from "../api/useApi";
 import { QueueList } from "../components/ohara/QueueList";
 import { PageHeader } from "../components/ohara/PageHeader";
@@ -93,12 +93,16 @@ export function OverviewPage() {
 }
 
 function DashboardContent({ snapshot }: { snapshot: DashboardSnapshot }) {
+  const indexedCount = snapshot.documentsByStatus.INDEXED ?? 0;
+  const processingCount = documentCount(snapshot, ["NEW", "SCRAPED", "CLEANED", "VECTORIZED"]);
+  const failedCount = documentCount(snapshot, ["FAILED", "FAILED_QUALITY"]);
+
   return (
     <>
       <div className="metric-grid">
-        <StatCard icon="file" label="Indexed" value={snapshot.indexedCount} />
-        <StatCard icon="activity" label="Processing" value={snapshot.processingCount} />
-        <StatCard icon="flask" label="Failed" value={snapshot.failedCount} />
+        <StatCard icon="file" label="Indexed" value={indexedCount} />
+        <StatCard icon="activity" label="Processing" value={processingCount} />
+        <StatCard icon="flask" label="Failed" value={failedCount} />
       </div>
 
       <Panel>
@@ -123,4 +127,8 @@ function DashboardContent({ snapshot }: { snapshot: DashboardSnapshot }) {
       </Panel>
     </>
   );
+}
+
+function documentCount(snapshot: DashboardSnapshot, statuses: DocumentStatus[]): number {
+  return statuses.reduce((total, status) => total + (snapshot.documentsByStatus[status] ?? 0), 0);
 }

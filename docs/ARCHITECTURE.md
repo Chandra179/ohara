@@ -184,10 +184,11 @@ build/runtime details are in [testing and build](architecture/testing-and-build.
    the identity reranker baseline.
 3. Recovery, lifecycle/maintenance operators, and evaluation machinery —
    implemented.
-4. Local UI boundary — initial health, metrics, and query transport implemented;
-   document/entity/lifecycle API routes remain open.
-5. Next work — live UI integration correctness, read models, readiness and
-   transport hardening, measured ER/retrieval quality, HNSW, throughput metrics,
+4. Local UI boundary — health, metrics, query, overview, document, and
+   read-only entity-review transport implemented; lifecycle mutations remain
+   open.
+5. Next work — worker lifecycle/readiness, transport hardening, lifecycle API
+   contracts, measured ER/retrieval quality, HNSW, throughput metrics,
    embedding migration, and cloud providers.
 
 ## Component documentation

@@ -38,6 +38,28 @@ pub use retrieve::{
     RetrieveError, RetrievedContext, Retriever, ScoredChunk, WhatlangNormalizer,
     fts_match_expression,
 };
+pub use synthesis::{QueryAvailability, QueryGrounding};
+
+/// Checks the default embedder's local readiness without downloading model
+/// files. The server uses this through the pipeline facade so it does not know
+/// the embedder implementation's cache layout.
+#[cfg(feature = "onnx-embedder")]
+pub(crate) fn check_embedder_readiness(config: &Config) -> Result<(), EmbedError> {
+    if config.embedder().model_id() != "bge-small-en-v1.5" {
+        return Err(EmbedError::Unavailable(format!(
+            "configured embedder model {:?} is unsupported by the built-in local provider",
+            config.embedder().model_id()
+        )));
+    }
+    embed::LocalEmbedder::check_cache(&config.data_dir().join("models"))
+}
+
+#[cfg(not(feature = "onnx-embedder"))]
+pub(crate) fn check_embedder_readiness(_config: &Config) -> Result<(), EmbedError> {
+    Err(EmbedError::Unavailable(
+        "ohara was built without the `onnx-embedder` feature; use the default feature set or inject an Embedder".to_string(),
+    ))
+}
 
 /// What a stage body reports on success (§10: domain outcomes are values, not
 /// errors — they never route through [`StageError`]).

@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "e2e:live": "playwright test --config playwright.live.config.ts"
   },
   "dependencies": {
     "react": "^19.1.1",

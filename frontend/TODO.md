@@ -7,26 +7,26 @@ priority.
 
 ## P0 — live integration correctness
 
-- [ ] Fix the live metrics `llmUsage` casing mismatch so Operations cannot crash
+- [x] Fix the live metrics `llmUsage` casing mismatch so Operations cannot crash
   on undefined usage fields.
-- [ ] Preserve the distinction between unavailable LLM synthesis and an
+- [x] Preserve the distinction between unavailable LLM synthesis and an
   ungrounded answer in the HTTP response mapping.
-- [ ] Make every HTTP-backed route render an explicit unavailable/error state;
+- [x] Make every HTTP-backed route render an explicit unavailable/error state;
   no failed API response may produce a blank page.
-- [ ] Add live Rust-backed Playwright coverage for health, metrics, and query,
+- [x] Add live Rust-backed Playwright coverage for health, metrics, and query,
   including unavailable knowledge/model fixtures.
 
 ## P1 — complete read-only product workflows
 
-- [ ] Add paginated document listing with backend status preservation and wire
+- [x] Add paginated document listing with backend status preservation and wire
   the Documents view.
-- [ ] Add document and queue read models for the Overview view.
-- [ ] Align frontend document type/status models with the backend schema before
-  enabling filters; the backend currently has no document-type field and has
-  more statuses than the provisional UI model.
-- [ ] Add entity-review listing and merge-preview endpoints and wire the
+- [x] Add document and queue read models for the Overview view.
+- [x] Align frontend document/status models with the backend schema before
+  enabling filters; the UI preserves all durable statuses and does not invent a
+  document-type field.
+- [x] Add entity-review listing and merge-preview endpoints and wire the
   Entities view.
-- [ ] Extend live Rust-backed Playwright coverage to documents and entity review.
+- [x] Extend live Rust-backed Playwright coverage to documents and entity review.
 
 ## P2 — safe operations
 

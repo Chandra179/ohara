@@ -32,10 +32,46 @@ npm test
 npm run lint
 npm run build
 PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e
+PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e:live
 ```
 
 The HTTP adapter keeps API base URL configuration at the frontend boundary and
 does not expose SQLite, LadybugDB, or runtime filesystem paths to components.
+
+## Read-only workflow contracts
+
+`GET /api/overview` returns `documentsByStatus` using the durable control-plane
+statuses and a bounded `queue` projection. The HTTP adapter combines that
+projection with `/api/health` for the Overview service badge.
+
+`GET /api/documents` returns cursor-paginated summaries:
+
+```json
+{
+  "items": [
+    {
+      "id": "document-id",
+      "sourceUrl": "https://example.com",
+      "title": "Example",
+      "status": "INDEXED",
+      "chunkCount": 12,
+      "createdAt": "2026-09-11 10:00:00",
+      "lastProcessedAt": "2026-09-11 10:30:00",
+      "error": null
+    }
+  ],
+  "nextCursor": null
+}
+```
+
+The optional query parameters are `limit`, `cursor`, `status`, and `search`.
+Status values are the control-plane values: `NEW`, `SCRAPED`, `CLEANED`,
+`VECTORIZED`, `INDEXED`, `FAILED_QUALITY`, `FAILED`, and `ARCHIVED`.
+
+`GET /api/entities/reviews` lists pending candidates. Selecting one loads
+`GET /api/entities/reviews/{id}/preview`, which returns both canonical entity
+candidates and the detector score. Entity merge mutations remain unavailable
+until their confirmation and idempotency contract is implemented.
 
 ## Metrics contract
 
@@ -85,10 +121,20 @@ counters.
 ```json
 {
   "answer": "...",
+  "availability": "available",
   "citations": ["chunk-id"],
-  "chunks": [{ "chunkId": "...", "score": 0.91, "text": "..." }]
+  "chunks": [{ "chunkId": "...", "score": 0.91, "text": "..." }],
+  "grounding": "grounded",
+  "reranker": "identity"
 }
 ```
 
-An absent `answer` is a valid ungrounded response. The frontend maps it to the
-existing fallback state without fabricating document metadata.
+`availability` distinguishes an unreachable language model from an available
+model that could not produce a grounded answer. `grounding` is authoritative;
+the frontend does not infer it from whether `answer` or `citations` happen to
+be present. `reranker` exposes the current deterministic identity baseline.
+
+`GET /api/health` returns component statuses plus a `diagnostics` array. Each
+diagnostic identifies the unavailable component, explains the problem, and
+provides the next action. Missing local embedding files and invalid knowledge
+artifacts are reported this way instead of leaving a page blank.

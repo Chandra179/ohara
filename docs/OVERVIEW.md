@@ -1,6 +1,4 @@
-# Ohara overview
-
-## What is Ohara?
+# Ohara
 
 Ohara is a private knowledge-building application. It takes documents, learns
 their important text and relationships, and lets you ask questions over the
@@ -71,7 +69,7 @@ changes from spreading through the whole application.
 7. **Answer** — retrieve the strongest evidence and optionally write a bounded,
    citation-preserving answer.
 
-## Algorithms in plain language
+## Algorithms
 
 ### URL normalization and duplicate detection
 

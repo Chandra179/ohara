@@ -26,7 +26,7 @@ describe("App shell", () => {
     );
     expect(await screen.findByRole("heading", { name: "Ingestion queue" })).toBeInTheDocument();
     expect(screen.getAllByText("Local · Healthy")).toHaveLength(2);
-    expect(screen.getByText("Product Notes Q1.pdf")).toBeInTheDocument();
+    expect(screen.getByText("Product Notes Q1")).toBeInTheDocument();
   });
 
   it("refreshes ingestion status and announces the result", async () => {
@@ -59,9 +59,9 @@ describe("App shell", () => {
     expect(await screen.findByRole("heading", { name: "8 documents" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Search documents" })).toBeInTheDocument();
 
-    await user.selectOptions(screen.getByRole("combobox", { name: "Status" }), "processing");
-    expect(await screen.findByRole("heading", { name: "2 documents" })).toBeInTheDocument();
-    expect(screen.getByText("Product Notes Q1.pdf")).toBeInTheDocument();
+    await user.selectOptions(screen.getByRole("combobox", { name: "Status" }), "NEW");
+    expect(await screen.findByRole("heading", { name: "1 document" })).toBeInTheDocument();
+    expect(screen.getByText("Product Notes Q1")).toBeInTheDocument();
   });
 
   it("renders the Operations metrics snapshot", async () => {
@@ -121,18 +121,14 @@ describe("App shell", () => {
     expect(await screen.findByText("Local model unavailable")).toBeInTheDocument();
   });
 
-  it("previews and confirms an entity merge", async () => {
+  it("loads an entity review preview", async () => {
     const user = userEvent.setup();
     renderApp();
 
     await user.click(screen.getByRole("link", { name: "Entities" }));
-    await user.click(await screen.findByRole("button", { name: /Ohara Potential duplicate/ }));
+    await user.click(await screen.findByRole("button", { name: /Ohara.*Ohara/ }));
 
-    expect(await screen.findByRole("heading", { name: "Merge preview" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Merge entities" }));
-    expect(screen.getByRole("dialog", { name: "Confirm entity merge" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Confirm merge" }));
-
-    expect(await screen.findByText("Merge completed")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Candidate preview" })).toBeInTheDocument();
+    expect(screen.getAllByText("94.0% match")).toHaveLength(2);
   });
 });

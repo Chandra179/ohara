@@ -696,6 +696,31 @@ button:disabled {
   background: #102a2a;
 }
 
+.notice--error {
+  border-color: #713b42;
+  background: #28161d;
+}
+
+.readiness-notice {
+  margin-bottom: 18px;
+}
+
+.readiness-notice ul {
+  display: grid;
+  gap: 6px;
+  margin: 2px 0 0;
+  padding-left: 18px;
+}
+
+.readiness-notice li {
+  padding-left: 2px;
+}
+
+.readiness-notice li strong {
+  margin-right: 5px;
+  text-transform: capitalize;
+}
+
 .notification-region {
   position: fixed;
   right: 24px;

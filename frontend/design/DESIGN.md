@@ -46,14 +46,16 @@ must be designed before the real query integration.
 
 ### Documents
 
-Provide searchable, filterable document browsing with status, source, type,
-and last-updated information. A document detail view can follow the first
-vertical slice.
+Provide searchable, cursor-paginated document browsing with the durable status,
+source URL, chunk count, and last-processed information. The control schema does
+not currently provide a document type, so the UI does not display one. A
+document detail view can follow the first vertical slice.
 
 ### Entities
 
-Show pending review candidates and a clear merge preview. The merge action must
-state which entity survives and remain reversible until the user confirms it.
+Show pending review candidates and a clear similarity preview. Merge actions
+remain a later operation until the API defines survivor selection, confirmation,
+authorization, and idempotency.
 
 ### Operations
 

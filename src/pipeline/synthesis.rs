@@ -10,11 +10,31 @@ use std::collections::HashSet;
 use crate::config::Config;
 use crate::control::{self, ControlDb, DbError};
 use crate::knowledge::Fact;
-use crate::llm::{CompletionRequest, Llm};
+use crate::llm::{CompletionRequest, Llm, LlmError};
 
 use super::ScoredChunk;
 use super::retrieve::RetrievedContext;
 use super::usage::{CompletionContext, UsageError};
+
+/// Whether the configured language-model provider could be reached for a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryAvailability {
+    /// The provider responded, whether or not its output was grounded.
+    Available,
+    /// The provider could not complete the synthesis request.
+    Unavailable,
+}
+
+/// Whether the query response contains an accepted, evidence-backed answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryGrounding {
+    /// The answer is non-empty and cites exact retrieved evidence ids.
+    Grounded,
+    /// No acceptable evidence-backed answer was produced.
+    Ungrounded,
+}
 
 /// The operator query response. When synthesis is unavailable or invalid,
 /// `answer` is `None` and the immutable ranked chunk sources remain available.
@@ -26,6 +46,16 @@ pub struct QueryResponse {
     pub citations: Vec<String>,
     /// Ranked retrieval sources, always present even during synthesis fallback.
     pub chunks: Vec<ScoredChunk>,
+    /// Availability of the provider used for synthesis.
+    pub availability: QueryAvailability,
+    /// Grounding outcome of the returned answer.
+    pub grounding: QueryGrounding,
+}
+
+enum CompletionOutcome {
+    Response(crate::llm::CompletionResponse),
+    Unavailable,
+    Invalid,
 }
 
 /// Attempts bounded synthesis with the configured primary model and optional
@@ -38,13 +68,15 @@ pub(crate) async fn run(
     query: &str,
     context: RetrievedContext,
 ) -> Result<QueryResponse, DbError> {
-    let fallback = || QueryResponse {
+    let fallback = |availability| QueryResponse {
         answer: None,
         citations: Vec::new(),
         chunks: context.chunks.clone(),
+        availability,
+        grounding: QueryGrounding::Ungrounded,
     };
     if context.chunks.is_empty() {
-        return Ok(fallback());
+        return Ok(fallback(QueryAvailability::Available));
     }
 
     let (prompt, allowed_citations) = render_prompt(
@@ -73,13 +105,15 @@ pub(crate) async fn run(
         attempt,
     )
     .await?;
-    if let Some(response) = primary
+    if let CompletionOutcome::Response(response) = &primary
         && let Some((answer, citations)) = parse(&response.text, &allowed_citations)
     {
         return Ok(QueryResponse {
             answer: Some(answer),
             citations,
             chunks: context.chunks,
+            availability: QueryAvailability::Available,
+            grounding: QueryGrounding::Grounded,
         });
     }
 
@@ -87,8 +121,8 @@ pub(crate) async fn run(
         .llm()
         .fallback_model()
         .filter(|model| *model != primary_model);
-    if let Some(fallback_model) = fallback_model {
-        let fallback_response = complete_attempt(
+    let fallback_response = if let Some(fallback_model) = fallback_model {
+        let response = complete_attempt(
             config,
             conn,
             llm,
@@ -102,17 +136,28 @@ pub(crate) async fn run(
             attempt,
         )
         .await?;
-        if let Some(response) = fallback_response
-            && let Some((answer, citations)) = parse(&response.text, &allowed_citations)
+        if let CompletionOutcome::Response(completion) = &response
+            && let Some((answer, citations)) = parse(&completion.text, &allowed_citations)
         {
             return Ok(QueryResponse {
                 answer: Some(answer),
                 citations,
                 chunks: context.chunks,
+                availability: QueryAvailability::Available,
+                grounding: QueryGrounding::Grounded,
             });
         }
-    }
-    Ok(fallback())
+        Some(response)
+    } else {
+        None
+    };
+    let availability = match (&primary, fallback_response.as_ref()) {
+        (CompletionOutcome::Unavailable, None | Some(CompletionOutcome::Unavailable)) => {
+            QueryAvailability::Unavailable
+        }
+        _ => QueryAvailability::Available,
+    };
+    Ok(fallback(availability))
 }
 
 async fn complete_attempt(
@@ -121,10 +166,13 @@ async fn complete_attempt(
     llm: &dyn Llm,
     request: CompletionRequest,
     context: CompletionContext<'_>,
-) -> Result<Option<crate::llm::CompletionResponse>, DbError> {
+) -> Result<CompletionOutcome, DbError> {
     match super::usage::complete(config, conn, llm, request, context).await {
-        Ok(response) => Ok(Some(response)),
-        Err(UsageError::Provider(_)) => Ok(None),
+        Ok(response) => Ok(CompletionOutcome::Response(response)),
+        Err(UsageError::Provider(LlmError::Unavailable(_) | LlmError::RateLimited)) => {
+            Ok(CompletionOutcome::Unavailable)
+        }
+        Err(UsageError::Provider(LlmError::InvalidResponse(_))) => Ok(CompletionOutcome::Invalid),
         Err(UsageError::Ledger(error)) => Err(error),
     }
 }
@@ -366,6 +414,8 @@ mod tests {
                 answer: Some("Use WAL mode.".to_string()),
                 citations: vec!["chunk-a".to_string()],
                 chunks: context().chunks,
+                availability: super::QueryAvailability::Available,
+                grounding: super::QueryGrounding::Grounded,
             }
         );
         let request = llm.request.lock().unwrap().take().unwrap();
@@ -392,6 +442,8 @@ mod tests {
         assert_eq!(response.answer, None);
         assert!(response.citations.is_empty());
         assert_eq!(response.chunks, context().chunks);
+        assert_eq!(response.availability, super::QueryAvailability::Available);
+        assert_eq!(response.grounding, super::QueryGrounding::Ungrounded);
     }
 
     #[tokio::test]
@@ -411,6 +463,38 @@ mod tests {
 
         assert_eq!(response.answer, None);
         assert!(llm.request.lock().unwrap().is_none());
+        assert_eq!(response.availability, super::QueryAvailability::Available);
+        assert_eq!(response.grounding, super::QueryGrounding::Ungrounded);
+    }
+
+    struct UnavailableLlm;
+
+    #[async_trait]
+    impl Llm for UnavailableLlm {
+        fn provider_name(&self) -> &'static str {
+            "unavailable-test"
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Err(LlmError::Unavailable("provider is offline".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_distinguishes_provider_unavailability_from_invalid_grounding() {
+        let config = Config::load(None).unwrap();
+        let conn = control::testing::boot();
+
+        let response = run(&config, &conn, &UnavailableLlm, "question", context())
+            .await
+            .unwrap();
+
+        assert_eq!(response.answer, None);
+        assert_eq!(response.availability, super::QueryAvailability::Unavailable);
+        assert_eq!(response.grounding, super::QueryGrounding::Ungrounded);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import type { HealthSnapshot, ServiceStatus } from "../../api/client";
+import type { HealthSnapshot, ReadinessDiagnostic, ServiceStatus } from "../../api/client";
 import { useApi } from "../../api/useApi";
 import { Icon, type IconName } from "../ui/Icon";
 import { StatusBadge, type StatusTone } from "../ui/StatusBadge";
@@ -105,6 +105,7 @@ export function AppShell() {
           ref={mainRef}
           tabIndex={-1}
         >
+          <ReadinessNotice health={health} />
           <Outlet />
         </main>
       </div>
@@ -113,13 +114,61 @@ export function AppShell() {
 }
 
 function HealthBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {
-  if (health.status !== "success") {
+  if (health.status === "loading") {
     return <StatusBadge tone="muted">Local · Checking…</StatusBadge>;
   }
 
+  if (health.status === "error") {
+    return <StatusBadge title={health.error} tone="danger">Local · Unavailable</StatusBadge>;
+  }
+
   return (
-    <StatusBadge tone={SERVICE_TONES[health.data.status]}>
+    <StatusBadge
+      title={health.data.diagnostics.map((diagnostic) => `${diagnostic.message} ${diagnostic.action}`).join(" ")}
+      tone={SERVICE_TONES[health.data.status]}
+    >
       {SERVICE_LABELS[health.data.status]}
     </StatusBadge>
   );
+}
+
+function ReadinessNotice({ health }: { health: AsyncResource<HealthSnapshot> }) {
+  if (health.status === "error") {
+    return (
+      <div className="notice notice--error readiness-notice" role="alert">
+        <strong>Local API unavailable</strong>
+        <span>{health.error}. Start the Rust API and try again.</span>
+      </div>
+    );
+  }
+
+  if (health.status !== "success" || health.data.diagnostics.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="notice notice--error readiness-notice" role="status">
+      <strong>Local readiness needs attention</strong>
+      <ul>
+        {health.data.diagnostics.map((diagnostic) => (
+          <ReadinessItem diagnostic={diagnostic} key={`${diagnostic.component}-${diagnostic.message}`} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ReadinessItem({ diagnostic }: { diagnostic: ReadinessDiagnostic }) {
+  return (
+    <li>
+      <strong>{formatComponent(diagnostic.component)}</strong>
+      <span>
+        {diagnostic.message} {diagnostic.action}
+      </span>
+    </li>
+  );
+}
+
+function formatComponent(component: ReadinessDiagnostic["component"]): string {
+  return component.replace(/([A-Z])/g, " $1").toLowerCase();
 }

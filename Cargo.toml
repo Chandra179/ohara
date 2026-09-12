@@ -37,7 +37,7 @@ ladybug = ["dep:lbug"]
 onnx-embedder = ["dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
 
 [dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 async-trait = "0.1.92"
 chrono = "0.4.45"
 fs2 = "0.4.3"

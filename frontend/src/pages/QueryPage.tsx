@@ -164,7 +164,9 @@ function QueryResultView({ onRetry, result }: { onRetry: () => void; result: Que
             <p className="eyebrow">Response</p>
             <h2>Answer</h2>
           </div>
-          <span className="muted-copy">Just now</span>
+          <span className="muted-copy">
+            Just now · {result.reranker === "identity" ? "Identity baseline" : result.reranker}
+          </span>
         </div>
         <p className="answer-copy">{result.answer}</p>
       </Panel>

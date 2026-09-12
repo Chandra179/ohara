@@ -20,17 +20,14 @@ test("completes the grounded query journey", async ({ page }) => {
   await expect(page.getByText("Query completed")).toBeVisible();
 });
 
-test("completes the entity merge journey", async ({ page }) => {
+test("reviews an entity candidate without mutating the store", async ({ page }) => {
   await page.goto("/entities");
 
-  await page.getByRole("button", { name: /Ohara Potential duplicate/ }).click();
-  await expect(page.getByRole("heading", { exact: true, name: "Merge preview" })).toBeVisible();
-  await page.getByRole("button", { exact: true, name: "Merge entities" }).click();
-  await expect(page.getByRole("dialog", { name: "Confirm entity merge" })).toBeVisible();
-  await page.getByRole("button", { exact: true, name: "Confirm merge" }).click();
-
-  await expect(page.getByText("Merge completed", { exact: true })).toBeVisible();
-  await expect(page.getByText("Entity merge completed")).toBeVisible();
+  await page.getByRole("button", { name: /Ohara.*Ohara/ }).click();
+  await expect(page.getByRole("heading", { exact: true, name: "Candidate preview" })).toBeVisible();
+  await expect(page.locator(".result-entity strong")).toHaveText("94.0% match");
+  await expect(page.getByText("Review the candidates before taking an offline merge action.")).toBeVisible();
+  await expect(page.getByRole("button", { exact: true, name: "Close preview" })).toBeVisible();
 });
 
 test("shows read-only Operations metrics", async ({ page }) => {

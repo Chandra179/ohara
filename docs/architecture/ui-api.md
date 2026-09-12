@@ -11,26 +11,34 @@ The mock adapter remains the default for offline design and unit tests. The HTTP
 adapter is selected for the local development launcher and currently supports:
 
 - health and service-status display;
+- overview document counts and a bounded live queue projection;
+- cursor-paginated document summaries with durable status and search filtering;
+- pending entity-review candidates and read-only similarity previews;
 - operator metrics for the Operations view; and
 - query submission with grounded, ungrounded, unavailable, and ranked-source
   fallback states.
 
-The Overview, Documents, and Entities screens are implemented visually but use
-unsupported HTTP methods until their read models and contracts land. Lifecycle
-actions are intentionally not exposed yet. Frontend document type/status models
-are provisional: the current control schema has no document-type field and has
-more statuses than the UI model.
+The health response includes control-store, knowledge-store, embedder, and LLM
+statuses. It also includes actionable diagnostics for unavailable components
+and exposes `reranker: "identity"`, the deterministic operator-query baseline.
+
+The query response carries explicit `availability` and `grounding` values. The
+frontend consumes these values directly, so an unreachable language model is
+not confused with an available model that returned malformed or uncited output.
+
+The Overview, Documents, and Entities screens now consume read-only HTTP
+models. Document status values are preserved from the control schema and the UI
+does not invent a document type that the schema does not store. Entity review
+previews show both candidates and their similarity score; merge mutations are
+intentionally deferred until the lifecycle contract is ready.
 
 ## Readiness for live use
 
-The live frontend is not release-ready until the nested metrics usage DTO is
-camel-cased, all unsupported screens have explicit unavailable states, and a
-Rust-backed browser suite covers health, metrics, query, and entity-review
-flows. The HTTP adapter should preserve the distinction between an unavailable
-LLM and an ungrounded answer. Missing models or invalid local knowledge
-artifacts must surface as actionable readiness errors rather than blank pages.
+The P0 live integration slice and P1 read-only workflow now cover health,
+metrics, overview, documents, query, entity reviews, and unavailable
+model/store fixtures through Rust-backed browser checks.
 
-The current metrics response has a nested LLM-usage casing mismatch with the
-frontend contract. Health also probes concrete local providers at the transport
-boundary; a shared readiness seam should be introduced before the API grows
-more provider-specific checks.
+Health checks now return actionable diagnostics for missing embedding files and
+invalid knowledge artifacts. Health still probes the default local providers at
+the transport boundary; a shared readiness seam should be introduced before
+the API grows more provider-specific checks.

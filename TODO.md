@@ -6,29 +6,29 @@ boundaries; this file records what is still open.
 
 ## P0 — release-blocking correctness
 
-- [ ] Fix the nested `llmUsage` metrics DTO to use the frontend's camelCase
+- [x] Fix the nested `llmUsage` metrics DTO to use the frontend's camelCase
   contract and add a Rust-route plus browser regression test. The live
   Operations view currently crashes when it receives the server response.
-- [ ] Preserve the distinction between unavailable LLM synthesis and an
+- [x] Preserve the distinction between unavailable LLM synthesis and an
   ungrounded answer in the HTTP adapter and API response contract.
-- [ ] Add actionable readiness diagnostics for missing embedding models and
+- [x] Add actionable readiness diagnostics for missing embedding models and
   invalid knowledge-store artifacts; every frontend route must show an error
   state instead of a blank page.
-- [ ] Wire the configured local ONNX reranker into the operator query path, or
-  explicitly document and expose the identity reranker as the selected baseline.
+- [x] Keep the identity reranker as the selected operator-query baseline,
+  explicitly document it, and expose the selection in the API and query view.
 
 ## P1 — complete the read-only frontend workflow
 
-- [ ] Add paginated document and queue read models for Overview and Documents.
-- [ ] Align frontend document/status types with the control-plane schema; the
+- [x] Add paginated document and queue read models for Overview and Documents.
+- [x] Align frontend document/status types with the control-plane schema; the
   control schema has no document-type field and supports more statuses than the
   current UI model.
-- [ ] Add entity-review listing and merge-preview read models for Entities.
-- [ ] Add live Rust-backed Playwright coverage for health, metrics, query,
+- [x] Add entity-review listing and merge-preview read models for Entities.
+- [x] Add live Rust-backed Playwright coverage for health, metrics, query,
   documents, and entity-review flows.
-- [ ] Decide whether URL registration needs a public CLI command; current URL
-  registration is a library operation, so stale `ohara enqueue` references
-  must not be reintroduced.
+- [x] Keep URL registration as a library operation for this release; the
+  ingestion UI and public URL-add workflow remain future work, so stale
+  `ohara enqueue` references must not be reintroduced.
 
 ## P2 — API lifecycle and operational safety
 

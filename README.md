@@ -17,8 +17,8 @@ Ollama language models.
 - Crash-safe jobs, retries, recovery, backups, lifecycle operations, retention,
   entity cleanup, and durable usage metrics.
 - A local frontend for overview, documents, queries, entity review, and
-  operations; the mock-driven product surface is complete, while live document,
-  entity, and mutation endpoints are still being added.
+  operations; the live read-only workflow now covers overview, documents,
+  query, and entity reviews, while mutation endpoints are still being added.
 
 For a plain-language explanation of the product and its algorithms, read the
 [Ohara overview](docs/OVERVIEW.md).
@@ -85,9 +85,9 @@ make dev
 
 The API listens on `127.0.0.1:3000` and the frontend on `127.0.0.1:5173`.
 The frontend uses its mock data by default; the development launchers select the
-Rust-backed HTTP mode. The initial live API supports health, metrics, and query.
-The remaining document, entity-review, and lifecycle operations are tracked
-work.
+Rust-backed HTTP mode. The live API supports health, metrics, overview,
+documents, query, and entity-review previews. Lifecycle mutations remain
+tracked work.
 
 Both individual launch commands free their configured TCP port first. Override
 `API_BIND`, `API_PROXY_TARGET`, or `FRONTEND_PORT` when needed.

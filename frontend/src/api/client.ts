@@ -1,42 +1,84 @@
 export type ServiceStatus = "degraded" | "healthy" | "offline";
 
-export type QueueStatus = "failed" | "indexed" | "processing";
+export type DocumentStatus =
+  | "ARCHIVED"
+  | "CLEANED"
+  | "FAILED"
+  | "FAILED_QUALITY"
+  | "INDEXED"
+  | "NEW"
+  | "SCRAPED"
+  | "VECTORIZED";
 
-export type DocumentType = "DOCX" | "MD" | "PDF" | "TXT";
+export type JobStatus = "DEAD" | "DONE" | "PENDING" | "RUNNING";
 
-export type EntityType = "CONCEPT" | "ORGANIZATION" | "PERSON" | "PRODUCT";
+export type EntityType =
+  | "CONCEPT"
+  | "EVENT"
+  | "LOCATION"
+  | "ORGANIZATION"
+  | "PERSON"
+  | "PRODUCT";
 
 export interface QueueItem {
+  documentId: string;
+  documentStatus: DocumentStatus;
+  error: string | null;
   id: string;
-  name: string;
-  status: QueueStatus;
+  jobStatus: Exclude<JobStatus, "DONE">;
+  sourceUrl: string;
+  stage: string;
+  title: string | null;
   updatedAt: string;
 }
 
 export interface DashboardSnapshot {
-  serviceStatus: ServiceStatus;
-  indexedCount: number;
-  processingCount: number;
-  failedCount: number;
+  documentsByStatus: Partial<Record<DocumentStatus, number>>;
   queue: QueueItem[];
+  serviceStatus: ServiceStatus;
 }
 
 export type ComponentStatus = "available" | "unavailable";
 
+export type HealthComponent = "controlStore" | "embedder" | "knowledgeStore" | "llm";
+
+export interface ReadinessDiagnostic {
+  action: string;
+  component: HealthComponent;
+  message: string;
+}
+
 export interface HealthSnapshot {
   controlStore: ComponentStatus;
+  diagnostics: ReadinessDiagnostic[];
+  embedder: ComponentStatus;
   knowledgeStore: ComponentStatus;
   llm: ComponentStatus;
+  reranker: "identity";
   status: ServiceStatus;
 }
 
 export interface DocumentRecord {
+  chunkCount: number;
+  createdAt: string;
+  error: string | null;
   id: string;
-  name: string;
-  source: string;
-  status: QueueStatus;
-  type: DocumentType;
-  updatedAt: string;
+  lastProcessedAt: string | null;
+  sourceUrl: string;
+  status: DocumentStatus;
+  title: string | null;
+}
+
+export interface DocumentPage {
+  items: DocumentRecord[];
+  nextCursor: string | null;
+}
+
+export interface DocumentListOptions {
+  cursor?: string;
+  limit?: number;
+  search?: string;
+  status?: DocumentStatus;
 }
 
 export interface Citation {
@@ -55,27 +97,28 @@ export interface QueryResult {
   availability: QueryAvailability;
   citations: Citation[];
   grounding: QueryGrounding;
+  reranker: "identity";
 }
 
 export interface EntityRecord {
+  aliases: number;
+  id: string;
   name: string;
-  references: number;
   type: EntityType;
 }
 
 export interface EntityReview {
-  duplicate: EntityRecord;
+  candidateA: EntityRecord;
+  candidateB: EntityRecord;
   id: string;
-  matchCount: number;
-  reason: string;
-  winner: EntityRecord;
+  score: number | null;
 }
 
 export interface MergePreview {
-  merged: EntityRecord;
+  candidateA: EntityRecord;
+  candidateB: EntityRecord;
   reviewId: string;
-  loser: EntityRecord;
-  winner: EntityRecord;
+  score: number | null;
 }
 
 export interface MergeResult {
@@ -117,79 +160,179 @@ export interface OharaApi {
   getEntityReviews(): Promise<EntityReview[]>;
   getHealth(): Promise<HealthSnapshot>;
   getMetrics(): Promise<MetricsSnapshot>;
-  listDocuments(): Promise<DocumentRecord[]>;
+  listDocuments(options?: DocumentListOptions): Promise<DocumentPage>;
   mergeEntities(reviewId: string): Promise<MergeResult>;
   previewEntityMerge(reviewId: string): Promise<MergePreview>;
   queryKnowledgeBase(question: string): Promise<QueryResult>;
 }
 
 const DEFAULT_DASHBOARD: DashboardSnapshot = {
+  documentsByStatus: {
+    FAILED: 3,
+    INDEXED: 2847,
+    NEW: 2,
+  },
   serviceStatus: "healthy",
-  indexedCount: 2847,
-  processingCount: 12,
-  failedCount: 3,
   queue: [
-    { id: "queue-1", name: "Product Notes Q1.pdf", status: "processing", updatedAt: "2 min ago" },
-    { id: "queue-2", name: "Research Draft.docx", status: "processing", updatedAt: "4 min ago" },
-    { id: "queue-3", name: "Design System v2.pdf", status: "indexed", updatedAt: "12 min ago" },
-    { id: "queue-4", name: "Meeting Transcript.txt", status: "indexed", updatedAt: "18 min ago" },
-    { id: "queue-5", name: "Old Notes.pdf", status: "failed", updatedAt: "25 min ago" },
+    {
+      documentId: "doc-1",
+      documentStatus: "NEW",
+      error: null,
+      id: "job-1",
+      jobStatus: "RUNNING",
+      sourceUrl: "https://example.com/product-notes",
+      stage: "SCRAPE",
+      title: "Product Notes Q1",
+      updatedAt: "2 min ago",
+    },
+    {
+      documentId: "doc-2",
+      documentStatus: "SCRAPED",
+      error: null,
+      id: "job-2",
+      jobStatus: "PENDING",
+      sourceUrl: "https://example.com/research-draft",
+      stage: "CLEAN",
+      title: "Research Draft",
+      updatedAt: "4 min ago",
+    },
+    {
+      documentId: "doc-3",
+      documentStatus: "FAILED",
+      error: "The extraction provider failed",
+      id: "job-3",
+      jobStatus: "DEAD",
+      sourceUrl: "https://example.com/old-notes",
+      stage: "EXTRACT",
+      title: "Old Notes",
+      updatedAt: "25 min ago",
+    },
   ],
 };
 
 const DEFAULT_HEALTH: HealthSnapshot = {
   controlStore: "available",
+  diagnostics: [],
+  embedder: "available",
   knowledgeStore: "available",
   llm: "available",
+  reranker: "identity",
   status: "healthy",
 };
 
 const DEFAULT_DOCUMENTS: DocumentRecord[] = [
-  { id: "doc-1", name: "Product Notes Q1.pdf", type: "PDF", source: "Local", status: "processing", updatedAt: "2 min ago" },
-  { id: "doc-2", name: "Research Draft.docx", type: "DOCX", source: "Local", status: "processing", updatedAt: "4 min ago" },
-  { id: "doc-3", name: "Design System v2.pdf", type: "PDF", source: "Local", status: "indexed", updatedAt: "12 min ago" },
-  { id: "doc-4", name: "Meeting Transcript.txt", type: "TXT", source: "Local", status: "indexed", updatedAt: "18 min ago" },
-  { id: "doc-5", name: "Ohara Overview.md", type: "MD", source: "Local", status: "indexed", updatedAt: "1 hour ago" },
-  { id: "doc-6", name: "Knowledge Workflow.pdf", type: "PDF", source: "Local", status: "indexed", updatedAt: "3 hours ago" },
-  { id: "doc-7", name: "Ideas & Notes.md", type: "MD", source: "Local", status: "indexed", updatedAt: "5 hours ago" },
-  { id: "doc-8", name: "Readme.txt", type: "TXT", source: "Local", status: "indexed", updatedAt: "1 day ago" },
+  {
+    chunkCount: 0,
+    createdAt: "2026-09-11 10:00:00",
+    error: null,
+    id: "doc-1",
+    lastProcessedAt: null,
+    sourceUrl: "https://example.com/product-notes",
+    status: "NEW",
+    title: "Product Notes Q1",
+  },
+  {
+    chunkCount: 0,
+    createdAt: "2026-09-11 09:00:00",
+    error: null,
+    id: "doc-2",
+    lastProcessedAt: "2026-09-11 09:30:00",
+    sourceUrl: "https://example.com/research-draft",
+    status: "SCRAPED",
+    title: "Research Draft",
+  },
+  {
+    chunkCount: 24,
+    createdAt: "2026-09-10 12:00:00",
+    error: null,
+    id: "doc-3",
+    lastProcessedAt: "2026-09-10 12:30:00",
+    sourceUrl: "https://example.com/design-system",
+    status: "INDEXED",
+    title: "Design System v2",
+  },
+  {
+    chunkCount: 16,
+    createdAt: "2026-09-10 11:00:00",
+    error: null,
+    id: "doc-4",
+    lastProcessedAt: "2026-09-10 11:30:00",
+    sourceUrl: "https://example.com/meeting-transcript",
+    status: "INDEXED",
+    title: "Meeting Transcript",
+  },
+  {
+    chunkCount: 12,
+    createdAt: "2026-09-09 14:00:00",
+    error: null,
+    id: "doc-5",
+    lastProcessedAt: "2026-09-09 14:30:00",
+    sourceUrl: "https://example.com/ohara-overview",
+    status: "INDEXED",
+    title: "Ohara Overview",
+  },
+  {
+    chunkCount: 0,
+    createdAt: "2026-09-09 12:00:00",
+    error: "The document did not meet the quality threshold",
+    id: "doc-6",
+    lastProcessedAt: "2026-09-09 12:30:00",
+    sourceUrl: "https://example.com/old-notes",
+    status: "FAILED_QUALITY",
+    title: "Old Notes",
+  },
+  {
+    chunkCount: 0,
+    createdAt: "2026-09-08 12:00:00",
+    error: "The fetch job exhausted its retry budget",
+    id: "doc-7",
+    lastProcessedAt: "2026-09-08 12:30:00",
+    sourceUrl: "https://example.com/failed-import",
+    status: "FAILED",
+    title: "Failed Import",
+  },
+  {
+    chunkCount: 8,
+    createdAt: "2026-09-07 12:00:00",
+    error: null,
+    id: "doc-8",
+    lastProcessedAt: "2026-09-07 12:30:00",
+    sourceUrl: "https://example.com/archived-notes",
+    status: "ARCHIVED",
+    title: "Archived Notes",
+  },
 ];
 
 const DEFAULT_ENTITY_REVIEWS: EntityReview[] = [
   {
-    duplicate: { name: "Ohara", references: 2, type: "PRODUCT" },
+    candidateA: { aliases: 2, id: "entity-1", name: "Ohara", type: "PRODUCT" },
+    candidateB: { aliases: 3, id: "entity-2", name: "Ohara", type: "PRODUCT" },
     id: "review-1",
-    matchCount: 2,
-    reason: "Potential duplicate",
-    winner: { name: "Ohara", references: 3, type: "PRODUCT" },
+    score: 0.94,
   },
   {
-    duplicate: { name: "Local-first", references: 2, type: "CONCEPT" },
+    candidateA: { aliases: 2, id: "entity-3", name: "Local-first", type: "CONCEPT" },
+    candidateB: { aliases: 4, id: "entity-4", name: "Local first", type: "CONCEPT" },
     id: "review-2",
-    matchCount: 2,
-    reason: "Potential duplicate",
-    winner: { name: "Local-first", references: 4, type: "CONCEPT" },
+    score: 0.88,
   },
   {
-    duplicate: { name: "Semantic search", references: 1, type: "CONCEPT" },
+    candidateA: { aliases: 1, id: "entity-5", name: "Semantic search", type: "CONCEPT" },
+    candidateB: { aliases: 3, id: "entity-6", name: "Semantic retrieval", type: "CONCEPT" },
     id: "review-3",
-    matchCount: 2,
-    reason: "Needs confirmation",
-    winner: { name: "Semantic retrieval", references: 3, type: "CONCEPT" },
+    score: 0.76,
   },
   {
-    duplicate: { name: "Product", references: 1, type: "CONCEPT" },
+    candidateA: { aliases: 1, id: "entity-7", name: "Product", type: "CONCEPT" },
+    candidateB: { aliases: 5, id: "entity-8", name: "Product", type: "PRODUCT" },
     id: "review-4",
-    matchCount: 3,
-    reason: "Ambiguous entity",
-    winner: { name: "Product", references: 5, type: "PRODUCT" },
+    score: 0.61,
   },
   {
-    duplicate: { name: "Knowledge graph", references: 2, type: "CONCEPT" },
+    candidateA: { aliases: 2, id: "entity-9", name: "Knowledge graph", type: "CONCEPT" },
+    candidateB: { aliases: 5, id: "entity-10", name: "Knowledge graph", type: "CONCEPT" },
     id: "review-5",
-    matchCount: 2,
-    reason: "Potential duplicate",
-    winner: { name: "Knowledge graph", references: 5, type: "CONCEPT" },
+    score: 0.9,
   },
 ];
 
@@ -251,13 +394,10 @@ export function createMockApi(
     }
 
     return {
-      merged: {
-        ...review.winner,
-        references: review.winner.references + review.duplicate.references,
-      },
+      candidateA: { ...review.candidateA },
+      candidateB: { ...review.candidateB },
       reviewId,
-      loser: { ...review.duplicate },
-      winner: { ...review.winner },
+      score: review.score,
     };
   };
 
@@ -277,8 +417,30 @@ export function createMockApi(
     async getMetrics() {
       return cloneMetrics(metricsSnapshot);
     },
-    async listDocuments() {
-      return documents.map((document) => ({ ...document }));
+    async listDocuments(options = {}) {
+      const normalizedSearch = options.search?.trim().toLowerCase() ?? "";
+      const filtered = documents
+        .filter((document) => options.status === undefined || document.status === options.status)
+        .filter(
+          (document) =>
+            normalizedSearch.length === 0 ||
+            document.title?.toLowerCase().includes(normalizedSearch) === true ||
+            document.sourceUrl.toLowerCase().includes(normalizedSearch),
+        )
+        .sort((left, right) => right.id.localeCompare(left.id));
+      const start = options.cursor === undefined
+        ? 0
+        : Math.max(0, filtered.findIndex((document) => document.id === options.cursor) + 1);
+      const limit = options.limit ?? 25;
+      const pageItems = filtered.slice(start, start + limit + 1);
+      const hasNext = pageItems.length > limit;
+      if (hasNext) {
+        pageItems.pop();
+      }
+      return {
+        items: pageItems.map((document) => ({ ...document })),
+        nextCursor: hasNext ? pageItems.at(-1)?.id ?? null : null,
+      };
     },
     async mergeEntities(reviewId) {
       const preview = await previewEntityMerge(reviewId);
@@ -298,6 +460,7 @@ export function createMockApi(
           availability: "unavailable",
           citations: [],
           grounding: "ungrounded",
+          reranker: "identity",
         };
       }
 
@@ -307,6 +470,7 @@ export function createMockApi(
           availability: "available",
           citations: [],
           grounding: "ungrounded",
+          reranker: "identity",
         };
       }
 
@@ -335,6 +499,7 @@ export function createMockApi(
           },
         ],
         grounding: "grounded",
+        reranker: "identity",
       };
     },
   };
@@ -343,8 +508,8 @@ export function createMockApi(
 function cloneEntityReview(review: EntityReview): EntityReview {
   return {
     ...review,
-    duplicate: { ...review.duplicate },
-    winner: { ...review.winner },
+    candidateA: { ...review.candidateA },
+    candidateB: { ...review.candidateB },
   };
 }
 

@@ -8,19 +8,12 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { ErrorState } from "../components/ui/ErrorState";
 import { Icon } from "../components/ui/Icon";
 import { LoadingState } from "../components/ui/LoadingState";
-import { Modal } from "../components/ui/Modal";
 import { Panel } from "../components/ui/Panel";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { useAsyncResource } from "../hooks/useAsyncResource";
 import { useNotifications } from "../notifications/useNotifications";
 
 type PreviewState =
-  | { status: "idle" }
-  | { status: "loading" }
-  | { error: string; status: "error" }
-  | { data: MergePreview; status: "success" };
-
-type MergeState =
   | { status: "idle" }
   | { status: "loading" }
   | { error: string; status: "error" }
@@ -34,8 +27,6 @@ export function EntitiesPage() {
   const refreshPending = useRef(false);
   const [selectedId, setSelectedId] = useState<string>();
   const [preview, setPreview] = useState<PreviewState>({ status: "idle" });
-  const [mergeState, setMergeState] = useState<MergeState>({ status: "idle" });
-  const [confirming, setConfirming] = useState(false);
 
   const refreshReviews = useCallback(() => {
     refreshPending.current = true;
@@ -80,32 +71,6 @@ export function EntitiesPage() {
     [api, notify],
   );
 
-  const confirmMerge = useCallback(async () => {
-    if (!selectedId) {
-      return;
-    }
-
-    setConfirming(false);
-    setMergeState({ status: "loading" });
-
-    try {
-      const result = await api.mergeEntities(selectedId);
-      setMergeState({ data: result.preview, status: "success" });
-      setSelectedId(undefined);
-      setPreview({ status: "idle" });
-      notify({
-        message: `${result.preview.merged.name} is now the canonical entity.`,
-        title: "Entity merge completed",
-        tone: "success",
-      });
-      await reload();
-    } catch (error: unknown) {
-      const message = errorMessage(error);
-      setMergeState({ error: message, status: "error" });
-      notify({ message, title: "Entity merge failed", tone: "error" });
-    }
-  }, [api, notify, reload, selectedId]);
-
   return (
     <div className="page-stack">
       <PageHeader
@@ -122,17 +87,6 @@ export function EntitiesPage() {
         description="Review and resolve people, places, and concepts."
         label="Entities"
       />
-
-      {mergeState.status === "success" ? (
-        <div className="notice notice--success" role="status">
-          <strong>Merge completed</strong>
-          <span>{mergeState.data.merged.name} is now the canonical entity.</span>
-        </div>
-      ) : null}
-
-      {mergeState.status === "error" ? (
-        <ErrorState description={mergeState.error} onRetry={() => void confirmMerge()} />
-      ) : null}
 
       {resource.status === "loading" ? (
         <Panel>
@@ -158,55 +112,34 @@ export function EntitiesPage() {
 
       {resource.status === "success" && resource.data.length > 0 ? (
         <ReviewWorkspace
-          confirming={confirming}
-          merging={mergeState.status === "loading"}
-          onCancelConfirm={() => setConfirming(false)}
           onClear={() => {
             setSelectedId(undefined);
             setPreview({ status: "idle" });
           }}
-          onConfirm={confirmMerge}
           onSelect={selectReview}
           preview={preview}
           reviews={resource.data}
           selectedId={selectedId}
-          setConfirming={setConfirming}
         />
-      ) : null}
-
-      {mergeState.status === "loading" ? (
-        <Panel>
-          <LoadingState label="Applying entity merge" />
-        </Panel>
       ) : null}
     </div>
   );
 }
 
 interface ReviewWorkspaceProps {
-  confirming: boolean;
-  merging: boolean;
-  onCancelConfirm: () => void;
   onClear: () => void;
-  onConfirm: () => void;
   onSelect: (reviewId: string) => void;
   preview: PreviewState;
   reviews: EntityReview[];
   selectedId: string | undefined;
-  setConfirming: (value: boolean) => void;
 }
 
 function ReviewWorkspace({
-  confirming,
-  merging,
-  onCancelConfirm,
   onClear,
-  onConfirm,
   onSelect,
   preview,
   reviews,
   selectedId,
-  setConfirming,
 }: ReviewWorkspaceProps) {
   return (
     <div className="entities-layout">
@@ -230,10 +163,12 @@ function ReviewWorkspace({
             >
               <Icon name="nodes" />
               <span className="review-row__copy">
-                <strong>{review.duplicate.name}</strong>
-                <small>{review.reason}</small>
+                <strong>
+                  {review.candidateA.name} ↔ {review.candidateB.name}
+                </strong>
+                <small>{scoreLabel(review.score)}</small>
               </span>
-              <span className="review-row__matches">{review.matchCount} matches</span>
+              <span className="review-row__matches">{review.candidateA.type}</span>
             </button>
           ))}
         </div>
@@ -242,15 +177,15 @@ function ReviewWorkspace({
       <Panel className="merge-panel">
         <div className="panel-heading">
           <div>
-            <p className="eyebrow">Identity decision</p>
-            <h2>Merge preview</h2>
+            <p className="eyebrow">Identity review</p>
+            <h2>Candidate preview</h2>
           </div>
           {preview.status === "success" ? <StatusBadge tone="healthy">Ready</StatusBadge> : null}
         </div>
 
         {preview.status === "idle" ? (
           <EmptyState
-            description="Select a pending candidate to inspect the proposed merge."
+            description="Select a pending candidate to inspect the similarity evidence."
             icon="nodes"
             title="Select a candidate"
           />
@@ -265,22 +200,18 @@ function ReviewWorkspace({
         {preview.status === "success" ? (
           <>
             <div className="entity-merge-flow">
-              <EntityCard entity={preview.data.loser} label="Duplicate" />
+              <EntityCard entity={preview.data.candidateA} label="Candidate A" />
               <span aria-hidden="true" className="merge-arrow">
-                →
+                ↔
               </span>
-              <EntityCard entity={preview.data.winner} label="Keep" />
+              <EntityCard entity={preview.data.candidateB} label="Candidate B" />
             </div>
             <div className="result-entity">
-              <span className="entity-card__label">Resulting entity</span>
-              <strong>{preview.data.merged.name}</strong>
-              <span>{preview.data.merged.type.toLowerCase()}</span>
-              <small>{preview.data.merged.references} references after merge</small>
+              <span className="entity-card__label">Similarity score</span>
+              <strong>{scoreLabel(preview.data.score)}</strong>
+              <small>Review the candidates before taking an offline merge action.</small>
             </div>
             <div className="merge-actions">
-              <Button disabled={merging} onClick={() => setConfirming(true)}>
-                Merge entities
-              </Button>
               <Button onClick={onClear} variant="secondary">
                 Close preview
               </Button>
@@ -288,24 +219,12 @@ function ReviewWorkspace({
           </>
         ) : null}
       </Panel>
-
-      {confirming && preview.status === "success" ? (
-        <Modal onClose={onCancelConfirm} title="Confirm entity merge">
-          <p>
-            Merge <strong>{preview.data.loser.name}</strong> into{" "}
-            <strong>{preview.data.winner.name}</strong>?
-            This updates graph references and cannot be undone from this screen.
-          </p>
-          <div className="merge-actions">
-            <Button onClick={onConfirm}>Confirm merge</Button>
-            <Button onClick={onCancelConfirm} variant="secondary">
-              Cancel
-            </Button>
-          </div>
-        </Modal>
-      ) : null}
     </div>
   );
+}
+
+function scoreLabel(score: number | null): string {
+  return score === null ? "No score recorded" : `${(score * 100).toFixed(1)}% match`;
 }
 
 function errorMessage(error: unknown): string {

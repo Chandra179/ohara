@@ -8,6 +8,7 @@ mod entities;
 mod jobs;
 mod metrics;
 mod models;
+mod read_models;
 mod reconcile;
 mod sites;
 
@@ -21,6 +22,10 @@ pub use entities::{
 };
 pub use metrics::{LlmUsageEvent, LlmUsageOutcome, LlmUsageSnapshot, MetricsSnapshot};
 pub use models::{ClaimedJob, Completion, DocStatus, Stage, StageEvent};
+pub use read_models::{
+    DocumentListItem, DocumentListQuery, DocumentPage, EntityReviewItem, EntitySummary,
+    MAX_DOCUMENT_PAGE_SIZE, OverviewSnapshot, QueueItem,
+};
 pub use reconcile::ReconcileReport;
 pub use sites::{LadderHint, SitePolicy};
 
@@ -69,6 +74,22 @@ pub fn find_id_by_content_hash(
 /// Returns [`DbError`] if the control-plane query fails.
 pub fn get(db: &ControlDb, doc_id: &str) -> Result<Option<Document>, DbError> {
     documents::get(db.raw(), doc_id)
+}
+
+/// Reads one bounded page of document summaries for operator surfaces.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn list_documents(db: &ControlDb, query: &DocumentListQuery) -> Result<DocumentPage, DbError> {
+    read_models::list_documents(db.raw(), query)
+}
+
+/// Reads the document counts and active queue rows used by the overview.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails.
+pub fn overview(db: &ControlDb, queue_limit: usize) -> Result<OverviewSnapshot, DbError> {
+    read_models::overview(db.raw(), queue_limit)
 }
 
 /// Lists documents eligible for the raw retention operator.
@@ -443,6 +464,16 @@ pub fn entity_merges(db: &ControlDb) -> Result<Vec<EntityMerge>, DbError> {
 /// Returns [`DbError`] if the control-plane query fails.
 pub fn pending_er_reviews(db: &ControlDb) -> Result<Vec<ErReview>, DbError> {
     entities::pending_er_reviews(db.raw())
+}
+
+/// Reads pending entity-review rows with the canonical entity metadata needed
+/// by an operator surface.
+///
+/// # Errors
+/// Returns [`DbError`] if the control-plane query fails or a review references
+/// an entity that no longer exists.
+pub fn entity_review_items(db: &ControlDb) -> Result<Vec<EntityReviewItem>, DbError> {
+    read_models::entity_review_items(db.raw())
 }
 
 /// Records the `SQLite` half of an offline entity merge.

@@ -81,6 +81,11 @@ fn http_params(config: &Config) -> HttpFetcherParams {
 
 /// Assembles the default adapters required by the operator query path.
 pub(crate) fn query_ports(config: &Config) -> Result<QueryPorts, BootError> {
+    // The API query path must fail fast when the model is absent. Health has
+    // already reported the actionable download instruction; starting a second
+    // network download from a request would leave the browser waiting on a
+    // provider operation with no useful progress state.
+    super::check_embedder_readiness(config)?;
     let embedder = default_embedder(config)?;
     validate_embedder(config, embedder.as_ref())?;
     let knowledge = default_knowledge(config)?;

@@ -11,7 +11,7 @@ export function EntityCard({ entity, label }: EntityCardProps) {
       <span className="entity-card__label">{label}</span>
       <strong>{entity.name}</strong>
       <span>{entity.type.toLowerCase()}</span>
-      <small>{entity.references} references</small>
+      <small>{entity.aliases} known aliases</small>
     </div>
   );
 }
