@@ -7,7 +7,7 @@ archived under `docs/archive/`; unchecked items are intentionally open.
 
 - [x] Add a deterministic pipeline fixture harness for scrape → clean → index
   → query.
-- [ ] Add cold and warm latency benchmarks with p50 and p95 thresholds.
+- [x] Add cold and warm latency benchmarks with p50 and p95 thresholds.
 - [ ] Measure peak RSS for every process with a representative corpus.
 - [ ] Add authenticated process-to-process HTTP when stages are deployed on
   different hosts instead of a shared volume.

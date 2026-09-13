@@ -30,3 +30,5 @@ Archived on 2026-09-13 after the five-process workspace migration.
 - [x] Add input/output counters and latency metrics for each process.
 - [x] Add a deterministic process-boundary fixture harness for the
   scrape-to-query path.
+- [x] Add deterministic cold and warm latency benchmarks with p50 and p95
+  thresholds.

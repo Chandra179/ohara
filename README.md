@@ -94,6 +94,19 @@ It starts the real scraper, cleaning, indexer, and retrieval binaries against
 fixture RSS/HTML, Qdrant, and Ollama endpoints. It does not use external
 network services or download an embedding model.
 
+Measure deterministic retrieval latency with cold process starts and warm
+repeated queries:
+
+```sh
+make pipeline-benchmark
+```
+
+The benchmark reports p50 and p95 for cold startup-plus-first-query and warm
+query latency. It fails when the default limits are exceeded; override them
+with `OHARA_BENCHMARK_COLD_P50_MS`, `OHARA_BENCHMARK_COLD_P95_MS`,
+`OHARA_BENCHMARK_WARM_P50_MS`, or `OHARA_BENCHMARK_WARM_P95_MS` when a machine
+needs an explicitly documented budget.
+
 To rebuild the derived Qdrant collection and FalkorDB graph from durable
 artifacts, stop the five Rust processes and run:
 
@@ -110,7 +123,7 @@ raw, clean, indexed, or catalog artifacts.
 ```sh
 make verify
 cd frontend && npm run lint && npm test -- --run && npm run build && npm run e2e
-cd .. && make pipeline-fixture
+cd .. && make pipeline-fixture && make pipeline-benchmark
 ```
 
 Runtime data under `data/` is local and ignored by git. The bounded replay

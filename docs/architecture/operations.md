@@ -48,6 +48,12 @@ and retrieval binaries against deterministic local RSS/HTML, Qdrant, and
 Ollama test doubles. The harness uses `OHARA_EMBEDDING_MODE=deterministic` so
 it does not download a model and is suitable for CI.
 
+Run `make pipeline-benchmark` to measure retrieval cold and warm latency with
+the same local test doubles. Cold latency includes process startup through the
+first successful query; warm latency measures repeated queries after startup.
+The command gates both p50 and p95 against configurable millisecond limits and
+prints the startup and first-query components for diagnosis.
+
 The app containers use the current host UID/GID when started through
 `make docker-up`, so their bind-mounted artifacts remain writable. Direct
 Compose users can set `OHARA_CONTAINER_USER=uid:gid` for their account.

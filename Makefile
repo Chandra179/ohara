@@ -24,7 +24,7 @@ CARGO = OHARA_DATA_DIR="$(DATA_DIR)" OHARA_QDRANT_URL="$(QDRANT_URL)" OHARA_FALK
 .PHONY: help toolchain fmt fmt-check clippy test doc verify build \
         providers providers-down providers-logs docker-up docker-down docker-logs \
         scraper cleaning indexer graph retrieval frontend replay rebuild \
-        pipeline-fixture dev clean
+        pipeline-fixture pipeline-benchmark dev clean
 
 help:
 	@printf '%s\n' \
@@ -40,6 +40,7 @@ help:
 		'  make replay         Retry dead-letter artifacts (STAGE=cleaning LIMIT=10)' \
 		'  make rebuild        Recreate derived stores and replay durable artifacts' \
 		'  make pipeline-fixture Run the deterministic scrape-to-query harness' \
+		'  make pipeline-benchmark Measure cold/warm latency with p50/p95 gates' \
 		'  make dev            Start providers and all local processes' \
 		'' \
 		'  make docker-up      Build and run Rust processes in Compose' \
@@ -187,6 +188,10 @@ rebuild:
 pipeline-fixture:
 	$(CARGO) build --workspace
 	python3 scripts/pipeline_fixture.py
+
+pipeline-benchmark:
+	$(CARGO) build --workspace
+	python3 scripts/pipeline_benchmark.py
 
 dev:
 	@set -eu; \
