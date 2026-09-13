@@ -107,6 +107,18 @@ with `OHARA_BENCHMARK_COLD_P50_MS`, `OHARA_BENCHMARK_COLD_P95_MS`,
 `OHARA_BENCHMARK_WARM_P50_MS`, or `OHARA_BENCHMARK_WARM_P95_MS` when a machine
 needs an explicitly documented budget.
 
+Measure peak resident memory for every process with a representative corpus:
+
+```sh
+make pipeline-resource-benchmark
+```
+
+The measurement runs each process in isolation with local test doubles and
+samples Linux process high-water RSS. It uses deterministic embeddings by
+default; set `OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE` when measuring a local
+embedding model. Set `OHARA_RESOURCE_BENCHMARK_OUTPUT=path.json` to save the
+per-process result for capacity planning.
+
 To rebuild the derived Qdrant collection and FalkorDB graph from durable
 artifacts, stop the five Rust processes and run:
 
@@ -124,6 +136,7 @@ raw, clean, indexed, or catalog artifacts.
 make verify
 cd frontend && npm run lint && npm test -- --run && npm run build && npm run e2e
 cd .. && make pipeline-fixture && make pipeline-benchmark
+cd .. && make pipeline-resource-benchmark
 ```
 
 Runtime data under `data/` is local and ignored by git. The bounded replay

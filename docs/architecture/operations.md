@@ -54,6 +54,15 @@ first successful query; warm latency measures repeated queries after startup.
 The command gates both p50 and p95 against configurable millisecond limits and
 prints the startup and first-query components for diagnosis.
 
+Run `make pipeline-resource-benchmark` to measure peak RSS for scraper,
+cleaning, indexer, graph, and retrieval. It runs each process separately with
+eight representative documents, local standard-library provider doubles, and
+deterministic embeddings. The Linux `/proc/<pid>/status` `VmHWM` value is
+sampled while the workload runs. This is a process-memory measurement, not a
+container-limit check; model-backed indexer memory should be measured by
+setting `OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE` to the configured mode. Set
+`OHARA_RESOURCE_BENCHMARK_OUTPUT=path.json` to persist the result.
+
 The app containers use the current host UID/GID when started through
 `make docker-up`, so their bind-mounted artifacts remain writable. Direct
 Compose users can set `OHARA_CONTAINER_USER=uid:gid` for their account.

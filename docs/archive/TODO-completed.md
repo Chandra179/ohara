@@ -32,3 +32,4 @@ Archived on 2026-09-13 after the five-process workspace migration.
   scrape-to-query path.
 - [x] Add deterministic cold and warm latency benchmarks with p50 and p95
   thresholds.
+- [x] Measure peak RSS for every process with a representative corpus.

@@ -40,6 +40,9 @@ jobs:
       - name: Run deterministic latency benchmark
         run: make pipeline-benchmark
 
+      - name: Run deterministic resource benchmark
+        run: make pipeline-resource-benchmark
+
   frontend:
     name: Frontend quality gates
     runs-on: ubuntu-latest
