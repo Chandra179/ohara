@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "document_id": "fixture-doc",
+  "source_url": "https://example.test/fixture",
+  "title": "Fixture article",
+  "raw_path": "raw/fixture-doc.html",
+  "fetched_at": "0"
+}

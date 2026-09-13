@@ -1,16 +1,12 @@
-# Architecture components
+# Architecture modules
 
-Start with the [general overview](../OVERVIEW.md) for the product, features, and
-algorithms. Then read the [system architecture overview](../ARCHITECTURE.md).
-These pages hold the detailed contracts for one module at a time:
+Read [system architecture](../ARCHITECTURE.md) first. These pages describe the
+five process modules and the seams between them:
 
-- [Control plane](control-plane.md)
-- [Fetch engine](engine.md)
-- [Knowledge plane](knowledge-plane.md)
-- [Pipeline and stages](pipeline.md)
-- [Retrieval and evaluation](retrieval.md)
-- [Language-model services](llm.md)
-- [Runtime composition and readiness](runtime.md)
-- [Operator services](operations.md)
-- [Frontend and local API](ui-api.md)
-- [Testing and build](testing-and-build.md)
+- [Scraper](scraper.md) — discovery, URL policy, and raw HTML.
+- [Cleaning](cleaning.md) — article extraction and quality normalization.
+- [Indexer](indexer.md) — canonical chunks, embeddings, and Qdrant.
+- [Graph](graph.md) — entity/mention extraction and FalkorDB.
+- [Retrieval](retrieval.md) — frontend HTTP, search, and cited synthesis.
+- [Artifact contracts](artifacts.md) — the JSON handoff shapes and retry rules.
+- [Build and operations](operations.md) — Compose, resource budgets, and checks.

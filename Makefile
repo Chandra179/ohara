@@ -2,190 +2,150 @@ SHELL := /bin/sh
 
 RUSTUP ?= rustup
 TOOLCHAIN ?= 1.95.0
-API_BIND ?= 127.0.0.1:3000
-API_PORT := $(lastword $(subst :, ,$(API_BIND)))
+DATA_DIR ?= $(CURDIR)/data
+RETRIEVAL_BIND ?= 127.0.0.1:3000
+RETRIEVAL_URL ?= http://$(RETRIEVAL_BIND)
+SCRAPER_BIND ?= 127.0.0.1:3010
+SCRAPER_URL ?= http://$(SCRAPER_BIND)
 FRONTEND_HOST ?= 127.0.0.1
 FRONTEND_PORT ?= 5173
-API_PROXY_TARGET ?= http://$(API_BIND)
-BACKEND_READY_ATTEMPTS ?= 120
-BACKEND_READY_INTERVAL ?= 0.25
-CONFIG_ARGS ?=
-BACKEND_ARGS ?= serve --bind $(API_BIND) $(CONFIG_ARGS)
-WORKER_ARGS ?= $(CONFIG_ARGS)
-RUSTFLAGS ?=
-RUSTDOCFLAGS ?=
+QDRANT_URL ?= http://127.0.0.1:6335
+FALKORDB_URL ?= redis://127.0.0.1:6380
+LLM_URL ?= http://127.0.0.1:11434
+LLM_MODEL ?= phi4-mini:latest
+CONTAINER_USER ?= $(shell id -u):$(shell id -g)
+STAGE ?= cleaning
+LIMIT ?= 10
 
-CARGO_CMD = RUSTFLAGS="$(RUSTFLAGS)" RUSTDOCFLAGS="$(RUSTDOCFLAGS)" $(RUSTUP) run $(TOOLCHAIN) cargo
-CARGO_FMT_CMD = $(CARGO_CMD) fmt
-CARGO_CLIPPY_CMD = $(CARGO_CMD) clippy
-OHARA_BIN ?= $(CURDIR)/target/debug/ohara
-COMPOSE_SERVICES := qdrant falkordb
+CARGO = OHARA_DATA_DIR="$(DATA_DIR)" OHARA_QDRANT_URL="$(QDRANT_URL)" OHARA_FALKORDB_URL="$(FALKORDB_URL)" OHARA_LLM_URL="$(LLM_URL)" OHARA_LLM_MODEL="$(LLM_MODEL)" OHARA_SCRAPER_BIND="$(SCRAPER_BIND)" OHARA_SCRAPER_URL="$(SCRAPER_URL)" OHARA_RETRIEVAL_BIND="$(RETRIEVAL_BIND)" $(RUSTUP) run $(TOOLCHAIN) cargo
 
 .DEFAULT_GOAL := help
-
-.PHONY: help toolchain fmt fmt-check check check-minimal clippy test test-lib test-integration test-eval test-real-eval doc verify build build-minimal run worker kill-port kill-api-port kill-frontend-port wait-api backend frontend services services-down services-logs dev clean
+.PHONY: help toolchain fmt fmt-check clippy test doc verify build \
+        providers providers-down providers-logs docker-up docker-down docker-logs \
+        scraper cleaning indexer graph retrieval frontend replay dev clean
 
 help:
 	@printf '%s\n' \
 		'Ohara commands:' \
 		'' \
-		'  make dev              Start backend, worker, and frontend (recommended)' \
-		'  make backend          Start only the Rust API' \
-		'  make worker           Start only the ingestion worker' \
-		'  make frontend         Start only the Vite frontend' \
-		'  make services         Start Qdrant and FalkorDB with Docker Compose' \
-		'  make services-down    Stop the Compose knowledge services' \
-		'  make services-logs    Follow the Compose knowledge-service logs' \
+		'  make providers      Start Qdrant and FalkorDB' \
+		'  make scraper        Start topic discovery and raw ingestion' \
+		'  make cleaning       Start the cleaning process' \
+		'  make indexer        Start chunking and Qdrant indexing' \
+		'  make graph          Start FalkorDB graph extraction' \
+		'  make retrieval      Start the frontend-facing HTTP interface' \
+		'  make frontend       Start the local Vite frontend' \
+		'  make replay         Retry dead-letter artifacts (STAGE=cleaning LIMIT=10)' \
+		'  make dev            Start providers and all local processes' \
 		'' \
-		'  make run ARGS=...     Run one CLI/operator command' \
+		'  make docker-up      Build and run Rust processes in Compose' \
+		'  make docker-down    Stop all Compose containers' \
+		'  make docker-logs    Follow Compose logs' \
 		'' \
-		'  make verify           Run all Rust quality gates' \
-		'  make build            Build the default Rust feature set' \
-		'  make toolchain        Install the pinned Rust toolchain' \
-		'  make clean            Remove Cargo build artifacts' \
-		'' \
-		'make dev starts Docker services and all Ohara processes in one terminal.' \
-		'Run make services once before the separate backend/worker/frontend targets.' \
-		'Use make dev CONFIG_ARGS="--config /path/to/ohara.toml" for a custom config.'
+		'  make verify         Run Rust formatting, lint, test, and docs' \
+		'  make toolchain      Install the pinned Rust toolchain' \
+		'  make clean          Remove Cargo build artifacts'
 
 toolchain:
 	$(RUSTUP) toolchain install $(TOOLCHAIN) --profile minimal --component rustfmt --component clippy
 
 fmt:
-	$(CARGO_FMT_CMD) --all
+	$(CARGO) fmt --all
 
 fmt-check:
-	$(CARGO_FMT_CMD) --all -- --check
-
-check:
-	$(CARGO_CMD) check --workspace --all-targets
-
-check-minimal:
-	$(CARGO_CMD) check --workspace --lib --bins --no-default-features
+	$(CARGO) fmt --all -- --check
 
 clippy:
-	$(CARGO_CLIPPY_CMD) --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets -- -D warnings
 
 test:
-	$(CARGO_CMD) test --workspace
-
-test-lib:
-	$(CARGO_CMD) test --lib
-
-test-integration:
-	$(CARGO_CMD) test --test integration
-
-test-eval:
-	$(CARGO_CMD) test --test integration 'eval::' -- --nocapture
-
-test-real-eval:
-	$(CARGO_CMD) test --test integration eval_retrieval_baseline_real_models -- --ignored --nocapture
+	$(CARGO) test --workspace
 
 doc:
-	$(CARGO_CMD) doc --workspace --no-deps
+	$(CARGO) doc --workspace --no-deps
 
 verify: fmt-check clippy test doc
 
 build:
-	$(CARGO_CMD) build
+	$(CARGO) build --workspace
 
-build-minimal:
-	$(CARGO_CMD) build --no-default-features
+providers:
+	docker compose up -d --wait qdrant falkordb
 
-services:
-	docker compose up -d --wait $(COMPOSE_SERVICES)
+providers-down:
+	docker compose stop qdrant falkordb
 
-services-down:
-	docker compose down
-
-services-logs:
+providers-logs:
 	docker compose logs -f --tail=100 qdrant falkordb
 
-ifeq ($(strip $(ARGS)),)
-run:
-	@echo "make: ARGS is required; use 'make worker' to run the ingestion worker" >&2
-	@exit 2
-else
-run:
-	$(CARGO_CMD) run -- $(ARGS)
-endif
+docker-up:
+	OHARA_CONTAINER_USER="$(CONTAINER_USER)" docker compose up -d --build
 
-# Service targets build once, then exec the real process so signals reach it.
-worker:
-	@$(CARGO_CMD) build; \
-	exec "$(OHARA_BIN)" $(WORKER_ARGS)
+docker-down:
+	docker compose down
 
-kill-port:
+docker-logs:
+	docker compose logs -f --tail=100
+
+scraper:
+	@$(CARGO) run -p ohara-scraper
+
+cleaning:
+	@$(CARGO) run -p ohara-cleaning
+
+indexer:
+	@$(CARGO) run -p ohara-indexer
+
+graph:
+	@$(CARGO) run -p ohara-graph
+
+retrieval:
+	@$(CARGO) run -p ohara-retrieval
+
+frontend:
+	@cd frontend && OHARA_API_PROXY_TARGET="$(RETRIEVAL_URL)" VITE_OHARA_API_MODE=http npm run dev -- --host $(FRONTEND_HOST) --port $(FRONTEND_PORT) --strictPort
+
+replay:
 	@set -eu; \
-	if [ -z "$(PORT)" ]; then echo "make: PORT is required" >&2; exit 2; fi; \
-	command -v fuser >/dev/null 2>&1 || { echo "make: fuser is required to free TCP ports" >&2; exit 1; }; \
-	if fuser -s "$(PORT)/tcp" 2>/dev/null; then \
-		echo "make: stopping process on TCP port $(PORT)" >&2; \
-		fuser -k -TERM "$(PORT)/tcp" >/dev/null 2>&1 || true; \
-		attempt=0; \
-		while fuser -s "$(PORT)/tcp" 2>/dev/null; do \
-			attempt=$$((attempt + 1)); \
-			if [ "$$attempt" -ge 20 ]; then fuser -k -KILL "$(PORT)/tcp" >/dev/null 2>&1 || true; break; fi; \
-			sleep 0.1; \
+		case "$(STAGE)" in \
+			cleaning|indexer|graph) ;; \
+			*) echo 'STAGE must be cleaning, indexer, or graph' >&2; exit 2 ;; \
+		esac; \
+		case "$(LIMIT)" in \
+			''|*[!0-9]*) echo 'LIMIT must be a non-negative integer' >&2; exit 2 ;; \
+		esac; \
+		inbox="$(DATA_DIR)/inbox/$(STAGE)"; \
+		dead_letter="$(DATA_DIR)/dead-letter/$(STAGE)"; \
+		mkdir -p "$$inbox" "$$dead_letter"; \
+		count=0; \
+		for path in "$$dead_letter"/*.json; do \
+			[ -f "$$path" ] || continue; \
+			[ "$$count" -lt "$(LIMIT)" ] || break; \
+			mv "$$path" "$$inbox/$$(basename "$$path")"; \
+			count=$$((count + 1)); \
 		done; \
-	fi
-
-kill-api-port:
-	@$(MAKE) --no-print-directory kill-port PORT=$(API_PORT)
-
-kill-frontend-port:
-	@$(MAKE) --no-print-directory kill-port PORT=$(FRONTEND_PORT)
-
-wait-api:
-	@set -eu; \
-	command -v curl >/dev/null 2>&1 || { echo "make: curl is required to wait for the API" >&2; exit 1; }; \
-	attempt=0; \
-	until curl --fail --silent --show-error --max-time 1 "$(API_PROXY_TARGET)/api/health" >/dev/null 2>&1; do \
-		attempt=$$((attempt + 1)); \
-		if [ "$$attempt" -ge "$(BACKEND_READY_ATTEMPTS)" ]; then \
-			echo "make: Rust API did not become ready at $(API_PROXY_TARGET)" >&2; \
-			exit 1; \
-		fi; \
-		sleep "$(BACKEND_READY_INTERVAL)"; \
-	done
-
-backend: kill-api-port
-	@$(CARGO_CMD) build; \
-	exec "$(OHARA_BIN)" $(BACKEND_ARGS)
-
-frontend: kill-frontend-port wait-api
-	@cd frontend && OHARA_API_PROXY_TARGET="$(API_PROXY_TARGET)" VITE_OHARA_API_MODE=http npm run dev -- --host $(FRONTEND_HOST) --port $(FRONTEND_PORT) --strictPort
+		echo "Replayed $$count $(STAGE) dead-letter artifact(s)"
 
 dev:
 	@set -eu; \
-	backend_pid=; \
-	worker_pid=; \
-	cleanup() { \
-		status=$$?; \
-		trap - INT TERM EXIT; \
-		if [ -n "$$backend_pid" ]; then kill -INT "$$backend_pid" 2>/dev/null || true; fi; \
-		if [ -n "$$worker_pid" ]; then kill -INT "$$worker_pid" 2>/dev/null || true; fi; \
-		if [ -n "$$backend_pid" ]; then wait "$$backend_pid" 2>/dev/null || true; fi; \
-		if [ -n "$$worker_pid" ]; then wait "$$worker_pid" 2>/dev/null || true; fi; \
-		$(MAKE) --no-print-directory kill-api-port || true; \
-		$(MAKE) --no-print-directory kill-frontend-port || true; \
-		$(MAKE) --no-print-directory services-down || true; \
-		exit "$$status"; \
-	}; \
-	trap cleanup INT TERM EXIT; \
-	$(MAKE) --no-print-directory services; \
-	$(MAKE) --no-print-directory kill-api-port; \
-	$(MAKE) --no-print-directory kill-frontend-port; \
-	$(CARGO_CMD) build; \
-	printf '%s\n' 'ohara: starting backend'; \
-	"$(OHARA_BIN)" $(BACKEND_ARGS) & \
-	backend_pid=$$!; \
-	printf '%s\n' 'ohara: starting worker'; \
-	"$(OHARA_BIN)" $(WORKER_ARGS) & \
-	worker_pid=$$!; \
-	$(MAKE) --no-print-directory wait-api; \
-	printf '%s\n' 'ohara: starting frontend'; \
-	(cd frontend && OHARA_API_PROXY_TARGET="$(API_PROXY_TARGET)" VITE_OHARA_API_MODE=http npm run dev -- --host $(FRONTEND_HOST) --port $(FRONTEND_PORT) --strictPort)
+		pids=; \
+		cleanup() { \
+			status=$$?; \
+			trap - INT TERM EXIT; \
+			for pid in $$pids; do kill -TERM "$$pid" 2>/dev/null || true; done; \
+			for pid in $$pids; do wait "$$pid" 2>/dev/null || true; done; \
+			$(MAKE) --no-print-directory providers-down >/dev/null 2>&1 || true; \
+			exit "$$status"; \
+		}; \
+		trap cleanup INT TERM EXIT; \
+		$(MAKE) --no-print-directory providers; \
+		$(CARGO) run -p ohara-scraper & pids="$$pids $$!"; \
+		$(CARGO) run -p ohara-cleaning & pids="$$pids $$!"; \
+		$(CARGO) run -p ohara-indexer & pids="$$pids $$!"; \
+		$(CARGO) run -p ohara-graph & pids="$$pids $$!"; \
+		$(CARGO) run -p ohara-retrieval & pids="$$pids $$!"; \
+		sleep 2; \
+		cd frontend && OHARA_API_PROXY_TARGET="$(RETRIEVAL_URL)" VITE_OHARA_API_MODE=http npm run dev -- --host $(FRONTEND_HOST) --port $(FRONTEND_PORT) --strictPort
 
 clean:
-	$(CARGO_CMD) clean
+	$(CARGO) clean

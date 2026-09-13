@@ -1,104 +1,64 @@
 # TODO
 
-Prioritized implementation queue for the core pipeline and its local operator
-surface. The [system architecture](docs/ARCHITECTURE.md) describes the target
-boundaries; this file records what is still open.
+Prioritized work for the five-process Rust workspace. Completed items describe
+the new architecture; unchecked items are intentionally open.
 
-## P0 — release-blocking correctness
+## P0 — correctness and operability
 
-- [x] Fix the nested `llmUsage` metrics DTO to use the frontend's camelCase
-  contract and add a Rust-route plus browser regression test. The live
-  Operations view currently crashes when it receives the server response.
-- [x] Preserve the distinction between unavailable LLM synthesis and an
-  ungrounded answer in the HTTP adapter and API response contract.
-- [x] Add actionable readiness diagnostics for missing embedding models and
-  invalid knowledge-store artifacts; every frontend route must show an error
-  state instead of a blank page.
-- [x] Keep the identity reranker as the selected operator-query baseline,
-  explicitly document it, and expose the selection in the API and query view.
-- [x] Replace the embedded knowledge backend with Qdrant vectors and FalkorDB
-  graph storage, including service readiness and deterministic remote adapters.
-- [x] Handle worker/API termination signals gracefully and make `make dev`
-  signal the actual service processes before waiting for them to exit.
-- [ ] Add an explicit knowledge-index rebuild/reindex operation for durable
-  documents whose derived service data is lost.
+- [x] Split the monolithic Rust crate into `scraper`, `cleaning`, `indexer`,
+  `graph`, and `retrieval` packages.
+- [x] Give every Rust package its own source tree and Dockerfile.
+- [x] Define atomic JSON artifact handoffs and deterministic document/chunk ids.
+- [x] Replace the old SQLite/Ladybug runtime with Qdrant, FalkorDB, and the
+  shared artifact directory.
+- [x] Keep the frontend-facing HTTP interface in retrieval and keep frontend
+  execution local with npm.
+- [x] Add Compose builds, local commands, and small per-process CPU/RAM limits.
+- [x] Keep the Makefile aligned with the five-process workspace and remove
+  monolith-only run, worker, and port-management targets.
+- [x] Remove the legacy root implementation.
+- [x] Remove legacy root migrations and tests.
+- [x] Add durable per-stage dead-letter directories for failed artifacts.
+- [x] Add an explicit, stage-scoped replay command with a per-run item limit.
+- [ ] Add a rebuild command that clears derived Qdrant/FalkorDB data and replays
+  clean or indexed artifacts safely.
 
-## P1 — complete the local frontend workflow
+## P1 — stage contracts and production readiness
 
-- [x] Add paginated document and queue read models for Overview and Documents.
-- [x] Align frontend document/status types with the control-plane schema; the
-  control schema has no document-type field and supports more statuses than the
-  current UI model.
-- [x] Add entity-review listing and merge-preview read models for Entities.
-- [x] Add live Rust-backed Playwright coverage for health, metrics, query,
-  documents, and entity-review flows.
-- [x] Add bounded topic discovery and queueing from the Overview screen with
-  normalized URLs, duplicate reporting, and Rust-backed browser coverage.
+- [x] Add contract fixtures for every artifact version and reject incompatible
+  versions before processing.
+- [x] Add per-document processing state and failure reason to catalog updates.
+- [ ] Add input/output counters and latency metrics for each process.
+- [ ] Add authenticated process-to-process HTTP when stages are deployed on
+  different hosts instead of a shared volume.
+- [ ] Add graceful drain behavior so a process stops claiming new inbox items
+  before shutdown.
+- [ ] Add resource-usage documentation based on measured indexer model memory.
 
-## P2 — API lifecycle and operational safety
+## P2 — retrieval quality
 
-- [x] Keep successful query provider construction process-local and lazy so
-  HTTP requests reuse the same behavioral ports without making API startup
-  fail before readiness diagnostics can be shown.
-- [x] Add worker-process readiness and lifecycle observation through durable
-  control-plane heartbeats; API supervision remains out of scope.
-- [ ] Extend the current bounded, loopback-only topic mutation with CORS policy
-  and local authentication/CSRF protection before exposing the API beyond
-  loopback or adding broader browser-triggered mutations.
-- [ ] Add explicit lifecycle API contracts for requeue, archive, and delete,
-  including confirmation, authorization, idempotency, and failure behavior.
-- [x] Add a shared readiness/health seam so transport handlers do not construct
-  concrete provider implementations directly.
-- [x] Keep default provider assembly in the runtime composition root so the
-  pipeline names ports rather than concrete network or datastore adapters.
-- [x] Keep document and entity read handlers on public facades; transport code
-  does not expose SQL, graph queries, filesystem paths, or CLI subprocesses.
-- [x] Move the Ollama HTTP adapter into the Engine plane and keep the LLM port
-  provider-neutral.
-- [x] Split the Stage 4 extraction/graph, entity merge/review, and HTTP health
-  and error implementations into focused modules.
-- [x] Replace the bespoke query encoder with the `url` crate serializer and add
-  encoded-key regression coverage.
-- [x] Add Rust and frontend quality gates to repository CI.
+- [ ] Add full-text and graph-path signals to retrieval alongside Qdrant.
+- [ ] Replace the graph capitalized-phrase baseline with structured extraction
+  and typed entity resolution.
+- [ ] Measure ER thresholds on ambiguous and cross-document cases.
+- [ ] Benchmark HNSW against exact Qdrant search and gate adoption on recall.
+- [ ] Evaluate Symspell and HyDE independently for quality and latency.
+- [ ] Expand grounded-answer regression fixtures for malformed citations and
+  unavailable Ollama responses.
 
-## P3 — retrieval and entity-resolution quality
+## P3 — frontend and operations
 
-- [ ] Measure ER name and embedding thresholds on entity-aware, ambiguous, and
-  cross-document golden-set cases; report precision, recall, review volume, and
-  merge error cost before changing defaults.
-- [ ] Expand retrieval evaluation with graph-path recall, multi-hop context,
-  duplicate/deletion cases, quality-gate cases, and failure/retry cases.
-- [ ] Evaluate Symspell correction and HyDE independently for quality, latency,
-  and query-rewrite regressions before enabling either.
-- [ ] Add HNSW behind the knowledge port only after benchmarking it against exact
-  KNN and gating adoption on recall.
-- [ ] Add stage throughput and latency metrics, then expose them through an
-  operator dashboard/export contract.
+- [ ] Add stage-level progress and throughput charts after backend metrics exist.
+- [ ] Add lifecycle actions only with confirmation, authorization, and
+  idempotency contracts.
+- [ ] Add accessibility, live-stack, and resource-limit checks to CI.
+- [ ] Add a quality lab after retrieval and entity-resolution measurements are
+  stable.
 
-## P4 — providers and migrations
+## P4 — deployment
 
-- [ ] Add cloud LLM providers behind the `Llm` port with explicit opt-in egress,
-  usage accounting, and contract tests.
-- [ ] Implement and acceptance-test embedding dual-write migration before
-  allowing different read and write model namespaces.
-- [ ] Extend the Fetcher contract suite for each additional provider or ladder
-  leg.
-
-## Completed baseline
-
-- [x] Implement the local pipeline stages, recovery, leases, retry/dead-letter
-  handling, and audit events.
-- [x] Implement the fetch ladder, URL normalization, SSRF/robots/politeness
-  policy, browser-profile leg, and optional Obscura adapter.
-- [x] Implement exact vector retrieval, BM25/vector/graph fusion, graph
-  extraction, typed entity resolution, and offline ER merge.
-- [x] Implement citation-preserving local synthesis, fallback behavior, durable
-  LLM usage accounting, and the `query` operator command.
-- [x] Implement staged backups, lifecycle operators, entity GC, raw retention,
-  and read-only operator metrics.
-- [x] Implement the initial loopback API for health, metrics, and query plus the
-  typed frontend HTTP adapter and its contract tests.
-- [x] Remove the unsupported frontend entity-merge mutation from the read-only
-  interface until the lifecycle contract is implemented.
-- [x] Align component documentation with the current read-only API and live
-  browser coverage.
+- [ ] Add separate production Compose overrides for persistent volumes and
+  external provider URLs.
+- [ ] Add cloud LLM adapters behind an explicit opt-in process configuration.
+- [ ] Add horizontal stage partitioning with a durable queue for multi-host
+  deployment.

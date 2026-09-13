@@ -1,77 +1,29 @@
-[package]
-name = "ohara"
+[workspace]
+resolver = "3"
+members = [
+    "scraper",
+    "cleaning",
+    "indexer",
+    "graph",
+    "retrieval",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95.0"
-publish = false
-description = "Local web scrape → clean → chunk/vectorize → graph extraction → GraphRAG pipeline."
-repository = "https://github.com/Chandra179/ohara"
 license = "MIT"
-keywords = ["graphrag", "scraping", "rag", "sqlite", "embeddings"]
-categories = ["database", "text-processing"]
 authors = ["Chandra"]
 
-# Lint policy — docs/CODE_GUIDE.md §5 (C-LINT). Warnings are errors in CI.
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
 
-[lints.clippy]
-all       = { level = "warn", priority = -1 }
-pedantic  = { level = "warn", priority = -1 }
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
-expect_used = "warn"   # allowed only with the invariant stated in the message (ARCHITECTURE §10)
-panic       = "warn"   # deliberate invariant panics must be visibly reviewed
-todo        = "deny"
-dbg_macro   = "deny"
-
-# Permitted pedantic exceptions — one-line justification each (CODE_GUIDE §5).
-module_name_repetitions = "allow" # plane modules legitimately repeat their plane's name
-
-# Heavy deps are feature-gated (ARCHITECTURE Appendix A); defaults build the full
-# local stack. `--no-default-features` drops the ONNX runtime for deployments
-# that inject remote ports at boot instead (§9 provider swap).
-[features]
-default = ["onnx-embedder"]
-onnx-embedder = ["dep:fastembed", "dep:hf-hub", "dep:tokenizers"]
-
-[dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-async-trait = "0.1.92"
-chrono = "0.4.45"
-fs2 = "0.4.3"
-flate2 = "1.1.10"
-html2md = "0.2.17"
-redis = { version = "0.32.7", features = ["tokio-comp"] }
-readability = { version = "0.3", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "gzip", "json"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
-quick-xml = "0.38.3"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "time", "signal", "fs", "io-util", "macros", "process", "net"] }
-toml = "1.1.5"
-unicode-normalization = "0.1.25"
-url = "2.5.8"
-uuid = { version = "1.26.0", features = ["v7"] }
-whatlang = "0.18.0"
-
-# ONNX embedder stack (§4): pinned bge-small-en-v1.5 via fastembed. rustls-only —
-# never native-tls (§12 posture); model/tokenizer files come from the HF hub and
-# are cached under the configured models dir.
-fastembed = { version = "6.0.2", optional = true, default-features = false, features = [
-    "ort-download-binaries-rustls-tls",
-    "hf-hub-rustls-tls",
-] }
-hf-hub = { version = "0.5.0", optional = true, default-features = false, features = [
-    "rustls-tls",
-    "tokio",
-    "ureq",
-] }
-tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["onig"] }
-
-[dev-dependencies]
-tempfile = "3.27.0"
-tower = { version = "0.5", features = ["util"] }
+expect_used = "warn"
+panic = "warn"
+todo = "deny"
+dbg_macro = "deny"

@@ -1,62 +1,56 @@
-# Ohara Domain Context
+# Ohara domain context
 
-Ohara ingests documents into a local GraphRAG index and records the work and
-provider activity needed to reproduce, audit, and operate that index.
+Ohara turns a topic into a local knowledge base through five independently
+runnable process modules. The processes exchange explicit JSON artifacts and
+use Qdrant, FalkorDB, and Ollama as local providers.
 
-## Language
+## Domain language
 
-**Document**:
-A registered source whose fetched content moves through the scrape, clean,
-vectorize, and optional graph-extraction stages.
+**Document** — a normalized source URL and its raw, clean, and indexed forms.
 
-**Job**:
-The durable execution record for one stage of one Document.
+**Raw artifact** — fetched HTML plus source metadata produced by scraper.
 
-**Completion Attempt**:
-One request made to an LLM provider for a stage or operator query, regardless
-of whether the provider succeeds.
+**Clean artifact** — extracted, sanitized Markdown produced by cleaning.
 
-**Usage Ledger**:
-An immutable control-plane record for each Completion Attempt, including its
-provider, model, token counts, outcome, and cost estimate.
+**Chunk** — one canonical bounded piece of clean Markdown produced by indexer.
 
-**Quality Fallback**:
-A second bounded synthesis attempt through a configured model after the primary
-attempt fails at the provider boundary or produces invalid grounding.
+**Indexed artifact** — a document's chunks and evidence metadata produced by
+indexer and consumed by graph and retrieval.
 
-**GC Candidate**:
-An unmerged entity with a durable `zero_since` observation proving that no graph
-mentions were present; it becomes collectible only after the configured grace
-period and a final relationship recheck.
+**Entity** — a named person, organization, place, event, concept, or product
+recognized in indexed evidence.
 
-**Fetcher Contract**:
-The shared behavioral guarantees every fetch Adapter must satisfy, including
-policy enforcement, conditional 304 handling, response-size limits, and error
-classification.
+**Mention** — a graph relationship connecting a chunk to an entity.
+
+**Grounded answer** — non-empty Ollama output returned with one or more exact
+chunk ids from the retrieved evidence.
+
+**Artifact contract** — the persisted JSON fields, invariants, and ordering
+rules at a process seam.
 
 ## Relationships
 
-- A **Document** produces one **Job** per pipeline stage.
-- A **Completion Attempt** may be associated with a **Document** and **Job**,
-  or with an operator query.
-- A **Usage Ledger** records exactly one **Completion Attempt**.
-- A **Quality Fallback** is a second Completion Attempt and therefore gets its
-  own Usage Ledger record.
-- A **GC Candidate** is discovered by an operator sweep and is deleted only when
-  the knowledge-facing graph recheck still finds no relationships.
+- A topic produces zero or more Documents.
+- A Document produces one Raw artifact, one Clean artifact, and one Indexed
+  artifact.
+- An Indexed artifact contains ordered Chunks.
+- A Chunk can produce Entity Mentions in FalkorDB.
+- Retrieval uses Chunks as evidence for a grounded answer.
 
-## Example dialogue
+## Architectural decisions
 
-> **Dev:** "The extraction request failed; should the usage count increase?"
-> **Domain expert:** "Yes. It is still a **Completion Attempt**, so the
-> **Usage Ledger** must retain its egress and token usage when available."
+- Each Rust package has one process responsibility and no local package
+  dependency on another process.
+- JSON artifacts are the local handoff medium; there is no shared `contracts`
+  or `control-client` crate.
+- Producers own their artifact shape and consumers validate required fields.
+- Deterministic hashes make document and chunk replay idempotent.
+- Qdrant and FalkorDB are derived stores and can be rebuilt from artifacts.
+- The frontend talks only to retrieval.
+- Loopback binding is the default until authentication exists.
 
-## Flagged ambiguities
+## Intentional limitations
 
-- "Usage counter" previously meant the in-memory cumulative value. Resolved:
-  durable per-attempt records are the **Usage Ledger**; counters and costs are
-  derived metrics.
-- "Entity deletion" previously had no explicit boundary. Resolved: the
-  `KnowledgeStore::delete_entity` Interface owns graph/vector deletion, while
-  the `ops::collect_entity_garbage` Adapter coordinates it with the control
-  registry under the runtime lock.
+The current graph extractor is a lightweight capitalized-phrase baseline.
+HNSW, entity-resolution threshold measurement, richer failure queues, and
+multi-host durable messaging are future work.

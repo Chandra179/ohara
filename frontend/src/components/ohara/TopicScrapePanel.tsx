@@ -70,7 +70,7 @@ export function TopicScrapePanel({ onQueued }: TopicScrapePanelProps) {
         </div>
       </div>
       <p className="panel-copy">
-        Find recent news and queue the article pages for the local worker to process.
+        Find recent news and queue the article pages for the local ingestion stages to process.
       </p>
       <form className="topic-form" onSubmit={submit}>
         <Input
@@ -99,8 +99,8 @@ export function TopicScrapePanel({ onQueued }: TopicScrapePanelProps) {
         </Button>
       </form>
       <p className="panel-note" id="topic-scrape-help">
-        Search between {MIN_TOPIC_LIMIT} and {MAX_TOPIC_LIMIT} articles per request. The worker must be
-        running to fetch and index them.
+        Search between {MIN_TOPIC_LIMIT} and {MAX_TOPIC_LIMIT} articles per request. The scraper,
+        cleaning, and indexer processes must be running to fetch and index them.
       </p>
       {result ? (
         <div className="notice notice--success topic-result" role="status">

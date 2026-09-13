@@ -1,0 +1,23 @@
+[package]
+name = "ohara-cleaning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Article extraction and quality normalization for Ohara."
+
+[lints]
+workspace = true
+
+[dependencies]
+html2md = "0.2.17"
+readability = { version = "0.3", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
+url = "2.5.8"
+whatlang = "0.18.0"

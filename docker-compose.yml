@@ -11,6 +11,8 @@ services:
         soft: 65536
         hard: 65536
     restart: unless-stopped
+    cpus: "${QDRANT_CPUS:-1.0}"
+    mem_limit: "${QDRANT_MEMORY:-2g}"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/127.0.0.1/6333'"]
       interval: 5s
@@ -30,11 +32,107 @@ services:
         soft: 65536
         hard: 65536
     restart: unless-stopped
+    cpus: "${FALKORDB_CPUS:-0.5}"
+    mem_limit: "${FALKORDB_MEMORY:-512m}"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+  scraper:
+    build:
+      context: .
+      dockerfile: scraper/Dockerfile
+    environment:
+      OHARA_DATA_DIR: /app/data
+      OHARA_SCRAPER_BIND: 0.0.0.0:3010
+    volumes:
+      - ./data:/app/data
+    user: "${OHARA_CONTAINER_USER:-1000:1000}"
+    ports:
+      - "127.0.0.1:${SCRAPER_PORT:-3010}:3010"
+    cpus: "${SCRAPER_CPUS:-0.25}"
+    mem_limit: "${SCRAPER_MEMORY:-256m}"
+    restart: unless-stopped
+
+  cleaning:
+    build:
+      context: .
+      dockerfile: cleaning/Dockerfile
+    environment:
+      OHARA_DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    user: "${OHARA_CONTAINER_USER:-1000:1000}"
+    cpus: "${CLEANING_CPUS:-0.25}"
+    mem_limit: "${CLEANING_MEMORY:-256m}"
+    restart: unless-stopped
+
+  indexer:
+    build:
+      context: .
+      dockerfile: indexer/Dockerfile
+    environment:
+      OHARA_DATA_DIR: /app/data
+      OHARA_QDRANT_URL: http://qdrant:6333
+    volumes:
+      - ./data:/app/data
+    user: "${OHARA_CONTAINER_USER:-1000:1000}"
+    cpus: "${INDEXER_CPUS:-1.0}"
+    mem_limit: "${INDEXER_MEMORY:-1g}"
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+  graph:
+    build:
+      context: .
+      dockerfile: graph/Dockerfile
+    environment:
+      OHARA_DATA_DIR: /app/data
+      OHARA_FALKORDB_URL: redis://falkordb:6379
+      OHARA_FALKORDB_GRAPH: ohara
+    volumes:
+      - ./data:/app/data
+    user: "${OHARA_CONTAINER_USER:-1000:1000}"
+    cpus: "${GRAPH_CPUS:-0.25}"
+    mem_limit: "${GRAPH_MEMORY:-256m}"
+    restart: unless-stopped
+    depends_on:
+      falkordb:
+        condition: service_healthy
+
+  retrieval:
+    build:
+      context: .
+      dockerfile: retrieval/Dockerfile
+    environment:
+      OHARA_DATA_DIR: /app/data
+      OHARA_RETRIEVAL_BIND: 0.0.0.0:3000
+      OHARA_QDRANT_URL: http://qdrant:6333
+      OHARA_FALKORDB_URL: redis://falkordb:6379
+      OHARA_SCRAPER_URL: http://scraper:3010
+      OHARA_LLM_URL: ${OHARA_LLM_URL:-http://host.docker.internal:11434}
+      OHARA_LLM_MODEL: ${OHARA_LLM_MODEL:-phi4-mini:latest}
+    volumes:
+      - ./data:/app/data
+    user: "${OHARA_CONTAINER_USER:-1000:1000}"
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    cpus: "${RETRIEVAL_CPUS:-0.5}"
+    mem_limit: "${RETRIEVAL_MEMORY:-512m}"
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+      scraper:
+        condition: service_started
 
 volumes:
   qdrant_data:

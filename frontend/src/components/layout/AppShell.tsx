@@ -4,8 +4,6 @@ import type {
   HealthSnapshot,
   ReadinessDiagnostic,
   ServiceStatus,
-  WorkerSnapshot,
-  WorkerState,
 } from "../../api/client";
 import { useApi } from "../../api/useApi";
 import { Icon, type IconName } from "../ui/Icon";
@@ -101,7 +99,7 @@ export function AppShell() {
         <header className="top-bar">
           <div className="status-cluster">
             <HealthBadge health={health} />
-            <WorkerBadge health={health} />
+            <PipelineBadge health={health} />
           </div>
           <button aria-label="Open user menu" className="avatar" type="button">
             U
@@ -122,35 +120,27 @@ export function AppShell() {
   );
 }
 
-function WorkerBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {
+function PipelineBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {
   if (health.status === "loading") {
-    return <StatusBadge tone="muted">Worker · Checking…</StatusBadge>;
+    return <StatusBadge tone="muted">Pipeline · Checking…</StatusBadge>;
   }
 
   if (health.status === "error") {
-    return <StatusBadge title={health.error} tone="danger">Worker · Unknown</StatusBadge>;
+    return <StatusBadge title={health.error} tone="danger">Pipeline · Unknown</StatusBadge>;
   }
 
-  const worker = health.data.worker;
-  const label = workerLabel(worker);
-  const tone: StatusTone = worker.status === "available"
-    ? "healthy"
-    : worker.state === "starting" || worker.state === "stopping"
-    ? "pending"
-    : "danger";
-  const title = worker.lastError ?? (worker.stale ? "The worker heartbeat is stale." : undefined);
-  return <StatusBadge title={title} tone={tone}>{label}</StatusBadge>;
-}
-
-function workerLabel(worker: WorkerSnapshot): string {
-  if (worker.state === null) {
-    return "Worker · Not running";
-  }
-  return `Worker · ${formatWorkerState(worker.state)}`;
-}
-
-function formatWorkerState(state: WorkerState): string {
-  return state.charAt(0).toUpperCase() + state.slice(1);
+  const processes = Object.values(health.data.processes);
+  const ready = processes.filter((status) => status === "available").length;
+  const allReady = ready === processes.length;
+  const title = health.data.diagnostics
+    .filter((diagnostic) => diagnostic.component in health.data.processes)
+    .map((diagnostic) => `${diagnostic.message} ${diagnostic.action}`)
+    .join(" ");
+  return (
+    <StatusBadge title={title || undefined} tone={allReady ? "healthy" : "pending"}>
+      {allReady ? "Pipeline · Ready" : `Pipeline · ${ready}/${processes.length} ready`}
+    </StatusBadge>
+  );
 }
 
 function HealthBadge({ health }: { health: AsyncResource<HealthSnapshot> }) {

@@ -1,22 +1,45 @@
-# Operator services
+# Build and operations
 
-Operator services are process-local workflows over the public plane facades.
-They cover query, backup, document lifecycle, offline entity merge, entity GC,
-raw retention, and read-only metrics.
+The root is a Cargo workspace with five packages. Each Rust package owns its
+`Cargo.toml`, `src/`, and Dockerfile. The frontend is a local npm application
+and has no Dockerfile.
 
-Mutating workflows share the runtime lock with the worker. Backups checkpoint
-and snapshot SQLite, copy the closed knowledge/runtime artifacts into staging,
-write a manifest, and publish only after the complete snapshot is ready.
+Local development:
 
-Deletion is an intent-first workflow. Requeue, archive, delete, merge, GC, and
-prune are idempotent and preserve the control/knowledge consistency protocol.
-Read-only metrics use a control-plane snapshot and do not require the exclusive
-mutation lock.
+```text
+make providers
+make scraper
+make cleaning
+make indexer
+make graph
+make retrieval
+make frontend
+```
 
-The local HTTP API exposes health, metrics, overview, documents, topic
-discovery/queueing, query, and read-only entity-review previews. Topic queueing
-is bounded and idempotent, and it only registers work for the separate worker;
-it does not supervise ingestion. The API observes the worker's durable lifecycle
-and heartbeat projection. Lifecycle mutations remain a planned contract so
-confirmation, authorization, idempotency, and failure behavior can be specified
-before browser-triggered writes are enabled.
+`make providers` starts only Qdrant and FalkorDB. Use `make providers-down` or
+`make providers-logs` to manage or inspect those two provider containers. The
+per-process targets keep each Rust log stream separate; `make dev` combines all
+five Rust processes and the frontend in one terminal.
+
+`make docker-up` builds and runs the Rust packages and databases through Compose;
+`make docker-down` stops the entire Compose stack. Qdrant uses host port 6335
+and FalkorDB uses 6380 by default.
+
+Failed inbox artifacts are retained under `data/dead-letter/<stage>/`. Retry a
+bounded number of items with `make replay STAGE=cleaning LIMIT=10` (or
+`indexer`/`graph`). The command only moves files back to that stage's inbox;
+the owning process performs the retry and records the next result.
+
+The app containers use the current host UID/GID when started through
+`make docker-up`, so their bind-mounted artifacts remain writable. Direct
+Compose users can set `OHARA_CONTAINER_USER=uid:gid` for their account.
+
+Starting resource budgets are defined in Compose, not Dockerfiles: scraper and
+cleaning 256 MB, graph 256 MB, retrieval 512 MB, and indexer 1 GB. Qdrant uses
+2 GB and FalkorDB 512 MB. These are initial limits; embedding memory and query
+latency should be measured before tightening them.
+
+Required checks are `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo test --workspace`, and `cargo doc
+--workspace --no-deps`. Frontend checks remain npm lint, unit tests, build, and
+browser tests.

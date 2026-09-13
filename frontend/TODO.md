@@ -1,89 +1,37 @@
 # Frontend TODO
 
-Implementation queue for the approved design in
-[design/DESIGN.md](design/DESIGN.md). Complete each vertical slice with
-loading, empty, unavailable, and failure states before moving to the next
-priority.
+The frontend is a local React + TypeScript + Vite application. It talks only to
+the retrieval process and remains outside Docker for local development.
 
-## P0 — live integration correctness
+## P0 — current workflow
 
-- [x] Fix the live metrics `llmUsage` casing mismatch so Operations cannot crash
-  on undefined usage fields.
-- [x] Preserve the distinction between unavailable LLM synthesis and an
-  ungrounded answer in the HTTP response mapping.
-- [x] Make every HTTP-backed route render an explicit unavailable/error state;
-  no failed API response may produce a blank page.
-- [x] Add live Rust-backed Playwright coverage for health, metrics, and query,
-  including unavailable knowledge/model fixtures.
+- [x] Keep loading, empty, unavailable, and error states for every retrieval
+  route.
+- [x] Wire overview, documents, query, entities, operations, and topic queueing
+  to the retrieval HTTP interface.
+- [x] Send the selected article limit with topic requests.
+- [x] Automatically expire success and info notifications after ten seconds.
+- [x] Avoid a request for every character in document search; debounce input.
 
-## P1 — complete local product workflows
+## P1 — new process architecture
 
-- [x] Add paginated document listing with backend status preservation and wire
-  the Documents view.
-- [x] Add document and queue read models for the Overview view.
-- [x] Align frontend document/status models with the backend schema before
-  enabling filters; the UI preserves all durable statuses and does not invent a
-  document-type field.
-- [x] Add entity-review listing and merge-preview endpoints and wire the
-  Entities view.
-- [x] Extend live Rust-backed Playwright coverage to documents and entity review.
-- [x] Add bounded topic discovery and queueing from Overview, including
-  normalization, duplicate reporting, and a live browser contract.
+- [ ] Show scraper, cleaning, indexer, graph, and retrieval readiness as
+  separate process indicators.
+- [ ] Display the artifact stage and latest failure reason for each document.
+- [ ] Add a retry action after the backend exposes durable retry contracts.
+- [ ] Show indexing progress from stage metrics when those metrics exist.
 
-## P2 — safe operations
+## P2 — quality and safety
 
-- [x] Map durable worker-process readiness, lifecycle state, and stale heartbeat
-  diagnostics in the shared shell.
-- [ ] Extend the loopback-only topic mutation with CORS and local
-  authentication/CSRF behavior before exposing broader browser-triggered
-  mutations.
-- [ ] Add lifecycle actions only after confirmation, authorization, idempotency,
-  and failure behavior are covered by the API contract.
-- [x] Keep the mock adapter injectable for unit tests and local UI demos.
+- [ ] Add query citation links when retrieval exposes source metadata.
+- [ ] Add a clear stale-data indicator when the shared artifact directory is
+  unavailable.
+- [ ] Add local authentication/CSRF protection before binding retrieval beyond
+  loopback.
+- [ ] Add accessibility and live-stack checks to CI.
 
-## P3 — quality and observability
+## P3 — quality lab
 
-- [ ] Add the Quality Lab after retrieval and ER measurement contracts are
-  stable.
-- [ ] Add stage throughput and latency charts only when backend metrics are
-  available; never fabricate operational data in production UI.
-- [x] Show actionable model and knowledge-store readiness diagnostics in the
-  shell and affected pages.
-
-## P4 — release checks
-
-- [x] Run the production frontend build in CI.
-- [ ] Audit the production bundle to verify that no secrets or runtime data are
-  bundled.
-- [ ] Run format, lint, unit, integration, accessibility, and end-to-end checks
-  before the first frontend release.
-- [ ] Keep `design/DESIGN.md` current when the visual system changes.
-
-## Completed maintenance
-
-- [x] Remove the unsupported entity-merge mutation from the read-only client
-  interface and keep merge preview read-only until lifecycle contracts exist.
-- [x] Align mock metrics fixtures with durable backend document statuses.
-- [x] Keep frontend documentation and CI expectations aligned with the live
-  read-only workflow.
-- [x] Run frontend lint, unit tests, production build, and mock browser tests in
-  repository CI.
-
-## Completed foundation
-
-- [x] Create the React + TypeScript + Vite application in this directory.
-- [x] Add Tailwind CSS and design tokens from `design/DESIGN.md`.
-- [x] Implement reusable UI primitives, loading/empty/error states, and
-  accessible notifications.
-- [x] Implement the shared shell, responsive layout, focus styles, and route
-  boundaries.
-- [x] Define typed frontend models and a mock-adapter API boundary.
-- [x] Add Vitest, Testing Library, and Playwright smoke-test configuration.
-- [x] Implement the Overview, Documents, Query, Entities, and Operations
-  screens against the mock adapter.
-- [x] Verify keyboard navigation, focus management, contrast, reduced motion,
-  responsive layouts, retry, and refresh behavior.
-- [x] Add the HTTP adapter, Vite `/api` proxy, health/status mapping, metrics
-  wiring, and query wiring.
-- [x] Document frontend local development, environment variables, and API
-  setup in the frontend README.
+- [ ] Add retrieval and entity-resolution evaluation views after their backend
+  measurement contracts are stable.
+- [ ] Add HNSW and threshold comparison views only from measured backend data.

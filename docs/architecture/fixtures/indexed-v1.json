@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "document_id": "fixture-doc",
+  "source_url": "https://example.test/fixture",
+  "title": "Fixture article",
+  "chunks": [
+    {
+      "chunk_id": "fixture-chunk",
+      "document_id": "fixture-doc",
+      "title": "Fixture article",
+      "source_url": "https://example.test/fixture",
+      "text": "This is a fixture article with enough words for the indexed artifact contract.",
+      "sequence": 0
+    }
+  ],
+  "indexed_at": "0"
+}

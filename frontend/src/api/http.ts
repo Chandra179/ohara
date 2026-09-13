@@ -10,6 +10,8 @@ import type {
   EntityType,
   HealthSnapshot,
   HealthComponent,
+  HealthProcess,
+  HealthProvider,
   JobStatus,
   MetricCounts,
   MergePreview,
@@ -22,8 +24,6 @@ import type {
   TopicQueueDocument,
   TopicQueueStatus,
   TopicScrapeResult,
-  WorkerSnapshot,
-  WorkerState,
 } from "./client";
 
 interface HttpApiOptions {
@@ -37,7 +37,6 @@ interface QueryResponsePayload {
   citations: string[];
   chunks: Array<{ chunkId: string; score: number; text: string }>;
   grounding: QueryGrounding;
-  reranker: "identity";
 }
 
 interface QueuePayload {
@@ -287,19 +286,20 @@ function parseHealthSnapshot(payload: unknown): HealthSnapshot {
   }
 
   const status = parseServiceStatus(payload.status);
-  const controlStore = parseComponentStatus(payload.controlStore);
-  const knowledgeStore = parseComponentStatus(payload.knowledgeStore);
-  const embedder = parseComponentStatus(payload.embedder);
-  const llm = parseComponentStatus(payload.llm);
-  const worker = parseWorkerSnapshot(payload.worker);
+  const processes = parseHealthComponents<HealthProcess>(
+    payload.processes,
+    isHealthProcess,
+    ["cleaning", "graph", "indexer", "retrieval", "scraper"],
+  );
+  const providers = parseHealthComponents<HealthProvider>(
+    payload.providers,
+    isHealthProvider,
+    ["artifactStore", "embeddingModel", "falkordb", "ollama", "qdrant"],
+  );
   if (
     status === undefined ||
-    controlStore === undefined ||
-    knowledgeStore === undefined ||
-    embedder === undefined ||
-    llm === undefined ||
-    worker === undefined ||
-    payload.reranker !== "identity" ||
+    processes === undefined ||
+    providers === undefined ||
     !Array.isArray(payload.diagnostics)
   ) {
     throw invalidResponse("health");
@@ -311,45 +311,32 @@ function parseHealthSnapshot(payload: unknown): HealthSnapshot {
   }
 
   return {
-    controlStore,
     diagnostics: diagnostics as ReadinessDiagnostic[],
-    embedder,
-    knowledgeStore,
-    llm,
-    reranker: "identity",
+    processes,
+    providers,
     status,
-    worker,
   };
 }
 
-function parseWorkerSnapshot(value: unknown): WorkerSnapshot | undefined {
+function parseHealthComponents<T extends string>(
+  value: unknown,
+  isComponent: (value: unknown) => value is T,
+  expected: readonly T[],
+): Record<T, ComponentStatus> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const entries = Object.entries(value);
   if (
-    !isRecord(value) ||
-    parseComponentStatus(value.status) === undefined ||
-    (value.state !== null && !isWorkerState(value.state)) ||
-    !isNullableString(value.workerId) ||
-    !isNullableNumber(value.processId) ||
-    !isNullableString(value.startedAt) ||
-    !isNullableString(value.lastHeartbeatAt) ||
-    !isNullableString(value.currentStage) ||
-    !isNullableString(value.currentJobId) ||
-    !isNullableString(value.lastError) ||
-    typeof value.stale !== "boolean"
+    entries.length !== expected.length ||
+    expected.some((key) => !(key in value)) ||
+    entries.some(
+      ([key, status]) => !isComponent(key) || parseComponentStatus(status) === undefined,
+    )
   ) {
     return undefined;
   }
-  return {
-    currentJobId: value.currentJobId,
-    currentStage: value.currentStage,
-    lastError: value.lastError,
-    lastHeartbeatAt: value.lastHeartbeatAt,
-    processId: value.processId,
-    stale: value.stale,
-    startedAt: value.startedAt,
-    state: value.state,
-    status: value.status,
-    workerId: value.workerId,
-  } as WorkerSnapshot;
+  return Object.fromEntries(entries) as Record<T, ComponentStatus>;
 }
 
 function parseEntityReviewList(payload: unknown): EntityReview[] {
@@ -456,7 +443,6 @@ function parseQueryResponse(payload: unknown): QueryResponsePayload {
     !chunks.every(isChunkPayload) ||
     availability === undefined ||
     grounding === undefined ||
-    payload.reranker !== "identity" ||
     (grounding === "grounded" && (answer === null || citations.length === 0))
   ) {
     throw invalidResponse("query");
@@ -468,7 +454,6 @@ function parseQueryResponse(payload: unknown): QueryResponsePayload {
     citations,
     chunks,
     grounding,
-    reranker: "identity",
   };
 }
 
@@ -489,7 +474,6 @@ function mapQueryResponse(response: QueryResponsePayload): QueryResult {
       title: id,
     })),
     grounding: response.grounding,
-    reranker: response.reranker,
   };
 }
 
@@ -607,23 +591,26 @@ function isTopicQueueStatus(value: unknown): value is TopicQueueStatus {
 }
 
 function isHealthComponent(value: unknown): value is HealthComponent {
+  return isHealthProcess(value) || isHealthProvider(value);
+}
+
+function isHealthProcess(value: unknown): value is HealthProcess {
   return (
-    value === "controlStore" ||
-    value === "embedder" ||
-    value === "knowledgeStore" ||
-    value === "llm" ||
-    value === "worker"
+    value === "cleaning" ||
+    value === "graph" ||
+    value === "indexer" ||
+    value === "retrieval" ||
+    value === "scraper"
   );
 }
 
-function isWorkerState(value: unknown): value is WorkerState {
+function isHealthProvider(value: unknown): value is HealthProvider {
   return (
-    value === "failed" ||
-    value === "ready" ||
-    value === "running" ||
-    value === "starting" ||
-    value === "stopped" ||
-    value === "stopping"
+    value === "artifactStore" ||
+    value === "embeddingModel" ||
+    value === "falkordb" ||
+    value === "ollama" ||
+    value === "qdrant"
   );
 }
 

@@ -1,0 +1,9 @@
+target
+data
+frontend/node_modules
+frontend/dist
+.git
+.github
+*.md
+!Cargo.toml
+!Cargo.lock

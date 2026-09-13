@@ -59,9 +59,16 @@ export interface TopicScrapeResult {
 
 export type ComponentStatus = "available" | "unavailable";
 
-export type HealthComponent = "controlStore" | "embedder" | "knowledgeStore" | "llm" | "worker";
+export type HealthProcess = "cleaning" | "graph" | "indexer" | "retrieval" | "scraper";
 
-export type WorkerState = "failed" | "ready" | "running" | "starting" | "stopped" | "stopping";
+export type HealthProvider =
+  | "artifactStore"
+  | "embeddingModel"
+  | "falkordb"
+  | "ollama"
+  | "qdrant";
+
+export type HealthComponent = HealthProcess | HealthProvider;
 
 export interface ReadinessDiagnostic {
   action: string;
@@ -69,28 +76,11 @@ export interface ReadinessDiagnostic {
   message: string;
 }
 
-export interface WorkerSnapshot {
-  currentJobId: string | null;
-  currentStage: string | null;
-  lastError: string | null;
-  lastHeartbeatAt: string | null;
-  processId: number | null;
-  stale: boolean;
-  startedAt: string | null;
-  state: WorkerState | null;
-  status: ComponentStatus;
-  workerId: string | null;
-}
-
 export interface HealthSnapshot {
-  controlStore: ComponentStatus;
   diagnostics: ReadinessDiagnostic[];
-  embedder: ComponentStatus;
-  knowledgeStore: ComponentStatus;
-  llm: ComponentStatus;
-  reranker: "identity";
+  processes: Record<HealthProcess, ComponentStatus>;
+  providers: Record<HealthProvider, ComponentStatus>;
   status: ServiceStatus;
-  worker: WorkerSnapshot;
 }
 
 export interface DocumentRecord {
@@ -132,7 +122,6 @@ export interface QueryResult {
   availability: QueryAvailability;
   citations: Citation[];
   grounding: QueryGrounding;
-  reranker: "identity";
 }
 
 export interface EntityRecord {
@@ -241,25 +230,22 @@ const DEFAULT_DASHBOARD: DashboardSnapshot = {
 };
 
 const DEFAULT_HEALTH: HealthSnapshot = {
-  controlStore: "available",
   diagnostics: [],
-  embedder: "available",
-  knowledgeStore: "available",
-  llm: "available",
-  reranker: "identity",
-  status: "healthy",
-  worker: {
-    currentJobId: null,
-    currentStage: null,
-    lastError: null,
-    lastHeartbeatAt: "2026-09-12 12:00:00",
-    processId: null,
-    stale: false,
-    startedAt: "2026-09-12 11:55:00",
-    state: "ready",
-    status: "available",
-    workerId: "worker-demo",
+  processes: {
+    cleaning: "available",
+    graph: "available",
+    indexer: "available",
+    retrieval: "available",
+    scraper: "available",
   },
+  providers: {
+    artifactStore: "available",
+    embeddingModel: "available",
+    falkordb: "available",
+    ollama: "available",
+    qdrant: "available",
+  },
+  status: "healthy",
 };
 
 const DEFAULT_DOCUMENTS: DocumentRecord[] = [
@@ -530,7 +516,6 @@ export function createMockApi(
           availability: "unavailable",
           citations: [],
           grounding: "ungrounded",
-          reranker: "identity",
         };
       }
 
@@ -540,7 +525,6 @@ export function createMockApi(
           availability: "available",
           citations: [],
           grounding: "ungrounded",
-          reranker: "identity",
         };
       }
 
@@ -569,7 +553,6 @@ export function createMockApi(
           },
         ],
         grounding: "grounded",
-        reranker: "identity",
       };
     },
   };

@@ -1,36 +1,21 @@
-# Retrieval and evaluation
+# Retrieval module
 
-Retrieval combines complementary signals and preserves a useful degraded result
-at every optional boundary.
+Retrieval is the only frontend-facing Rust process. It exposes health, overview,
+documents, metrics, topic proxying, entity-review placeholders, and query
+routes. It reads catalog/index artifacts and never lets the browser access local
+paths or provider credentials.
 
-## Query path
+Health reports the five process states (`scraper`, `cleaning`, `indexer`,
+`graph`, and `retrieval`) separately from provider states (`artifactStore`,
+`qdrant`, `falkordb`, `embeddingModel`, and `ollama`). A stale stage heartbeat
+is a degraded readiness diagnostic, not a hidden worker state.
 
-1. Normalize and language-check the query.
-2. Resolve typed query entities through aliases and entity-name vectors.
-3. Collect BM25, exact vector KNN, and graph-mention candidates.
-4. Fuse lists with reciprocal-rank fusion.
-5. Rerank the bounded pool; if reranking fails, retain fusion order.
-6. Assemble bounded chunks and graph facts for structured synthesis.
-7. Accept only non-empty answers citing immutable evidence ids; otherwise return
-   ranked chunks.
+Queries are embedded with the same model used by the indexer, sent to Qdrant,
+and returned as ranked evidence. The bounded evidence is sent to the configured
+Ollama model (`phi4-mini:latest` by default). A non-empty synthesis is marked
+grounded and cites the returned chunk ids; missing model output remains an
+explicit unavailable or ungrounded result.
 
-The current machinery evaluator reports recall@20 for each path, fused MRR, and
-reranking change. Its baseline is recall@20 = 1.000 per path, fused MRR = 0.723,
-and rerank delta = 0.000. These are regression measurements, not production
-quality claims.
-
-The identity reranker is currently selected by the operator query assembly. The
-local ONNX reranker exists behind its feature gate but is not yet wired into that
-path by default.
-
-## Open quality work
-
-Symspell correction and HyDE remain unevaluated because they change query text,
-latency, or both. Entity-resolution and retrieval similarity thresholds are
-validated configuration defaults, not measured conclusions. Threshold work
-must use entity-aware queries, graph-path coverage, ambiguity cases, and a
-review-cost metric before changing defaults.
-
-HNSW, if introduced, must meet a recall gate against exact KNN before it becomes
-the default. Its search parameters are implementation details of that future
-adapter, not current runtime behavior.
+The retrieval process does not run ingestion. Topic requests are forwarded to
+the scraper process, which makes the process seam visible and independently
+operable.

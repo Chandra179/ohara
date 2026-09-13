@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "document_id": "fixture-doc",
+  "source_url": "https://example.test/fixture",
+  "title": "Fixture article",
+  "markdown": "This is a fixture article with enough words for the clean artifact contract.",
+  "language": "eng",
+  "cleaned_at": "0"
+}

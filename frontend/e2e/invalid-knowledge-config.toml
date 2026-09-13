@@ -1,3 +1,0 @@
-data_dir = "frontend/e2e/.invalid-runtime"
-[knowledge]
-falkordb_url = "redis://127.0.0.1:1"

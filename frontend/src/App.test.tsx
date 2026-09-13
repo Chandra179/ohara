@@ -27,7 +27,7 @@ describe("App shell", () => {
     );
     expect(await screen.findByRole("heading", { name: "Ingestion queue" })).toBeInTheDocument();
     expect(screen.getAllByText("Local · Healthy")).toHaveLength(2);
-    expect(screen.getByText("Worker · Ready")).toBeInTheDocument();
+    expect(screen.getByText("Pipeline · Ready")).toBeInTheDocument();
     expect(screen.getByText("Product Notes Q1")).toBeInTheDocument();
   });
 

@@ -1,0 +1,23 @@
+[package]
+name = "ohara-scraper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Topic discovery and raw web document ingestion for Ohara."
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+quick-xml = "0.38.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+url = "2.5.8"

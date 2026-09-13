@@ -1,52 +1,50 @@
 # Ohara frontend
 
-The frontend is a React + TypeScript + Vite application. It uses a typed mock
-adapter by default and has an opt-in HTTP adapter for the Rust local operator
-and bounded topic-queue surface.
+The frontend is a React + TypeScript + Vite application. It runs locally with
+npm and communicates only with the `retrieval` Rust process.
 
-## Local development
+## Development
 
 ```sh
 npm install
 npm run dev
 ```
 
-The default development mode uses the mock adapter. From the repository root,
-start the complete local stack with:
+For the live local stack, run from the repository root:
 
 ```sh
-make dev
+make providers
+make scraper
+make cleaning
+make indexer
+make graph
+make retrieval
+make frontend
 ```
 
-The combined launcher starts the API, ingestion worker, and Vite in one terminal
-so all three service logs are visible. For separate terminals, use `make
-backend`, `make worker`, and `make frontend` from the repository root.
-For normal use, `make dev` is the only launch command you need.
-`make frontend` keeps the requested port strict, waits for the API, and proxies
-`/api` to the configured `API_BIND`. For frontend-only work, `npm run dev` keeps
-using the mock adapter. Set `VITE_OHARA_API_BASE_URL` only when the API is hosted
-at another origin; it is not a secret.
+`make dev` starts all five Rust processes and Vite together. `make docker-up`
+builds and runs the Rust processes and local databases in Compose; frontend is
+still started with npm.
 
-Run the frontend checks with:
+For browser checks against a running local stack, keep `make dev` or Compose
+running in another terminal and run `npm run e2e:live`. The default `npm run
+e2e` suite uses the frontend's deterministic mock adapter.
 
-```sh
-npm test
-npm run lint
-npm run build
-PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e
-PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e:live
-```
+## HTTP interface
 
-The HTTP adapter keeps API base URL configuration at the frontend boundary and
-does not expose SQLite, Qdrant, FalkorDB, or runtime filesystem paths to components.
+The Vite development proxy forwards `/api` to retrieval at
+`http://127.0.0.1:3000`. The frontend uses these retrieval routes:
 
-## Read and topic-queue contracts
+- `GET /api/health`
+- `GET /api/overview`
+- `GET /api/documents`
+- `GET /api/metrics`
+- `POST /api/topics/scrape`
+- `POST /api/query`
+- `GET /api/entities/reviews`
+- `GET /api/entities/reviews/{id}/preview`
 
-`GET /api/overview` returns `documentsByStatus` using the durable control-plane
-statuses and a bounded `queue` projection. The HTTP adapter combines that
-projection with `/api/health` for the Overview service badge.
-
-`POST /api/topics/scrape` accepts a bounded topic request:
+Topic requests include the selected maximum article count:
 
 ```json
 {
@@ -55,108 +53,14 @@ projection with `/api/health` for the Overview service badge.
 }
 ```
 
-The topic is trimmed and limited to 200 characters. The Overview form sends the
-selected maximum article count; `limit` defaults to 5 and must be between 1 and
-10. The response reports discovered, newly enqueued, and duplicate results,
-including each document and job identity. The endpoint is loopback-only through
-the local API and queues work; the worker then fetches and indexes the queued
-pages.
+Retrieval forwards the request to scraper. The frontend does not know about
+the shared artifact directory, Qdrant, FalkorDB, Ollama, or Docker.
 
-`GET /api/documents` returns cursor-paginated summaries:
+## Checks
 
-```json
-{
-  "items": [
-    {
-      "id": "document-id",
-      "sourceUrl": "https://example.com",
-      "title": "Example",
-      "status": "INDEXED",
-      "chunkCount": 12,
-      "createdAt": "2026-09-11 10:00:00",
-      "lastProcessedAt": "2026-09-11 10:30:00",
-      "error": null
-    }
-  ],
-  "nextCursor": null
-}
+```sh
+npm run lint
+npm test -- --run
+npm run build
+PLAYWRIGHT_EXECUTABLE_PATH=/usr/bin/google-chrome npm run e2e:live
 ```
-
-The optional query parameters are `limit`, `cursor`, `status`, and `search`.
-Status values are the control-plane values: `NEW`, `SCRAPED`, `CLEANED`,
-`VECTORIZED`, `INDEXED`, `FAILED_QUALITY`, `FAILED`, and `ARCHIVED`.
-
-`GET /api/entities/reviews` lists pending candidates. Selecting one loads
-`GET /api/entities/reviews/{id}/preview`, which returns both canonical entity
-candidates and the detector score. Entity merge mutations remain unavailable
-until their confirmation and idempotency contract is implemented.
-
-## Metrics contract
-
-The Operations screen consumes the read-only `GET /api/metrics` contract below.
-The Rust server exposes this endpoint with the frontend's `camelCase` transport
-names; `createMockApi()` provides a fixture with the same shape. The existing
-Rust `ohara metrics --json` command remains a separate CLI contract and emits
-the same fields in `snake_case`.
-
-```json
-{
-  "capturedAt": "2026-09-11T00:00:00.000Z",
-  "documentsByStatus": { "INDEXED": 2847 },
-  "jobsByStageStatus": { "SCRAPE": { "PENDING": 8, "DONE": 2860 } },
-  "eventsByOutcome": { "DONE": 112 },
-  "eventsByStage": { "SCRAPE": 37 },
-  "pendingErReviews": 5,
-  "dueForRecrawl": 8,
-  "rawFiles": 42,
-  "rawBytes": 18874368,
-  "rawMaxBytes": 536870912,
-  "rawMaxAgeDays": 30,
-  "llmUsage": {
-    "calls": 84,
-    "successfulCalls": 81,
-    "failedCalls": 3,
-    "promptTokens": 46200,
-    "completionTokens": 12480,
-    "estimatedCostMicros": 0
-  }
-}
-```
-
-Counts are non-negative integers. `rawMaxBytes` and `rawMaxAgeDays` are
-nullable when retention limits are not configured. `estimatedCostMicros` is an
-estimated USD amount in millionths of a dollar, not a billing guarantee.
-
-The contract intentionally has no throughput or latency fields. The UI must
-not draw operational charts until the backend records and exposes those
-counters.
-
-## Query contract
-
-`POST /api/query` accepts a JSON body with a required `query` and optional
-`topK`. It returns immutable chunk citations and ranked evidence:
-
-```json
-{
-  "answer": "...",
-  "availability": "available",
-  "citations": ["chunk-id"],
-  "chunks": [{ "chunkId": "...", "score": 0.91, "text": "..." }],
-  "grounding": "grounded",
-  "reranker": "identity"
-}
-```
-
-`availability` distinguishes an unreachable language model from an available
-model that could not produce a grounded answer. `grounding` is authoritative;
-the frontend does not infer it from whether `answer` or `citations` happen to
-be present. `reranker` exposes the current deterministic identity baseline.
-
-`GET /api/health` returns component statuses, worker lifecycle data, and a
-`diagnostics` array. Qdrant and FalkorDB availability are reported together as
-the knowledge-store status. Worker data reports the latest boot state and heartbeat;
-the `stale` flag identifies a worker that stopped reporting within the lease
-horizon. Each diagnostic identifies the unavailable component, explains the
-problem, and provides the next action. Missing local embedding files, invalid
-knowledge artifacts, and absent workers are reported this way instead of
-leaving a page blank.

@@ -56,7 +56,7 @@ export function OperationsPage() {
             {resource.status === "loading" ? "Refreshing…" : "Refresh"}
           </Button>
         }
-        description="Inspect worker health and operational activity."
+        description="Inspect process health and operational activity."
         label="Operations"
       />
 
