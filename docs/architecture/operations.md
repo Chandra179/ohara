@@ -25,6 +25,15 @@ five Rust processes and the frontend in one terminal.
 `make docker-down` stops the entire Compose stack. Qdrant uses host port 6335
 and FalkorDB uses 6380 by default.
 
+The scraper defaults to Bing News RSS. Edit `scraper/config.yaml` to select
+`google-news`, `brave`, `duckduckgo`, or `rss`, or to change the page fetcher.
+Brave additionally needs the `OHARA_SCRAPER_BRAVE_API_KEY` environment
+override. DuckDuckGo discovery needs an Obscura binary and a configured
+`fetch.obscura_binary` path. Set `fetch.kind: obscura` when destination pages
+require JavaScript rendering. `search.url` can point the `rss` adapter at a
+local fixture or internal RSS gateway. The complete provider contract is
+documented in `docs/architecture/scraper.md`.
+
 Failed inbox artifacts are retained under `data/dead-letter/<stage>/`. Retry a
 bounded number of items with `make replay STAGE=cleaning LIMIT=10` (or
 `indexer`/`graph`). The command only moves files back to that stage's inbox;
@@ -37,6 +46,11 @@ every clean artifact for the indexer and every indexed artifact for graph
 publication. Raw, clean, indexed, and catalog artifacts are preserved. The
 processes must be stopped during the command so they cannot consume or replace
 the rebuild inbox while it is being populated.
+
+Cleaning, indexer, and graph handle `SIGINT` and `SIGTERM` with a bounded
+graceful drain. A worker finishes the artifact already in progress, checks the
+shutdown state before claiming another inbox item, and exits. Unstarted inbox
+items remain durable for the next process start or an explicit replay.
 
 Each process also writes cumulative input, output, failure, and latency
 measurements under `data/state/`. Retrieval returns those snapshots from
@@ -60,8 +74,33 @@ eight representative documents, local standard-library provider doubles, and
 deterministic embeddings. The Linux `/proc/<pid>/status` `VmHWM` value is
 sampled while the workload runs. This is a process-memory measurement, not a
 container-limit check; model-backed indexer memory should be measured by
-setting `OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE` to the configured mode. Set
+setting `OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE` to the configured mode. The
+model cache is taken from `data/models` by default; override it with
+`OHARA_RESOURCE_BENCHMARK_MODEL_CACHE=/path/to/models` when needed. Set
 `OHARA_RESOURCE_BENCHMARK_OUTPUT=path.json` to persist the result.
+
+Two model-backed runs measured on 2026-09-13 produced this baseline range:
+
+| Process | Workload | Observed peak RSS |
+| --- | --- | ---: |
+| scraper | topic scrape and raw publication | 11.2–11.3 MiB |
+| cleaning | representative raw corpus extraction | 12.4–12.6 MiB |
+| indexer | chunking and `bge-small-en-v1.5` embedding | 322.6–323.9 MiB |
+| graph | representative indexed corpus publication | 6.3 MiB |
+| retrieval | ranked query, embedding, and synthesis | 213.4–214.8 MiB |
+
+This baseline used eight representative documents, the local cached model, and
+the standard-library provider doubles. It is a sizing reference, not a
+production capacity guarantee. The current Compose limits remain 1 GiB for
+the indexer and 512 MiB for retrieval, leaving room for larger batches,
+allocator variance, and provider-client buffers. Repeat the benchmark on the
+deployment host before tightening either limit.
+
+Run `make retrieval-quality` to evaluate the real retrieval HTTP process against
+the versioned golden fixture. The command reports macro recall@1/3/5, MRR, and
+nDCG@1/3/5, and fails if any configured minimum is not met. It uses local
+standard-library provider doubles and deterministic embeddings, so it is safe
+for CI and does not measure production semantic quality.
 
 The app containers use the current host UID/GID when started through
 `make docker-up`, so their bind-mounted artifacts remain writable. Direct

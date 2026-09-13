@@ -9,7 +9,8 @@ workload, so this command does not need psutil or a running Compose stack.
 
 The default indexer mode is deterministic to keep CI reproducible. Set
 ``OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE`` to another configured mode when a
-local model-memory measurement is needed.
+local model-memory measurement is needed. Model-backed runs use the model
+cache from ``OHARA_RESOURCE_BENCHMARK_MODEL_CACHE`` or ``data/models``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -435,6 +437,24 @@ def seed_directories(data_dir: Path) -> None:
         (data_dir / relative).mkdir(parents=True, exist_ok=True)
 
 
+def seed_model_cache(data_dir: Path) -> None:
+    """Expose the configured local model cache to the isolated indexer run."""
+    source = Path(
+        os.environ.get("OHARA_RESOURCE_BENCHMARK_MODEL_CACHE", "data/models")
+    ).expanduser()
+    if not source.is_dir():
+        raise RuntimeError(
+            "model-backed resource benchmark requires a model cache directory at "
+            f"{source}; set OHARA_RESOURCE_BENCHMARK_MODEL_CACHE to an existing cache"
+        )
+    target = data_dir / "models"
+    target.rmdir()
+    try:
+        target.symlink_to(source.resolve(), target_is_directory=True)
+    except OSError:
+        shutil.copytree(source, target)
+
+
 def catalog_value(document: CorpusDocument) -> dict[str, Any]:
     return {
         "id": document.document_id,
@@ -541,6 +561,17 @@ def run_scraper(
         data_dir = Path(temporary) / "data"
         feed = BenchmarkFeedServer(fixture, documents)
         scraper_bind = f"127.0.0.1:{fixture.free_port()}"
+        scraper_config = Path(temporary) / "scraper-config.yaml"
+        scraper_config.write_text(
+            f"""bind: {scraper_bind}
+search:
+  provider: rss
+  url: http://127.0.0.1:{feed.server_port}/news
+fetch:
+  kind: http
+""",
+            encoding="utf-8",
+        )
         process = start_measured(
             fixture,
             "scraper",
@@ -549,8 +580,7 @@ def run_scraper(
                 data_dir, "http://127.0.0.1:1", "redis://127.0.0.1:1", "http://127.0.0.1:1"
             )
             | {
-                "OHARA_SCRAPER_BIND": scraper_bind,
-                "OHARA_SCRAPER_SEARCH_URL": f"http://127.0.0.1:{feed.server_port}/news",
+                "OHARA_SCRAPER_CONFIG": str(scraper_config),
             },
             log_dir,
         )
@@ -609,6 +639,11 @@ def run_indexer(
     with tempfile.TemporaryDirectory(prefix="ohara-resource-indexer-") as temporary:
         data_dir = Path(temporary) / "data"
         seed_indexer(data_dir, documents)
+        embedding_mode = os.environ.get(
+            "OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE", "deterministic"
+        )
+        if embedding_mode != "deterministic":
+            seed_model_cache(data_dir)
         qdrant = fixture.start_provider(fixture.QdrantHandler)
         process = start_measured(
             fixture,
@@ -674,6 +709,11 @@ def run_retrieval(
     with tempfile.TemporaryDirectory(prefix="ohara-resource-retrieval-") as temporary:
         data_dir = Path(temporary) / "data"
         seed_directories(data_dir)
+        embedding_mode = os.environ.get(
+            "OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE", "deterministic"
+        )
+        if embedding_mode != "deterministic":
+            seed_model_cache(data_dir)
         qdrant = fixture.start_provider(fixture.QdrantHandler)
         ollama = fixture.start_provider(fixture.OllamaHandler)
         falkordb = FakeRedisServer()

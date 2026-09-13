@@ -4,9 +4,7 @@
 //! artifact publication. It communicates with the cleaning process through a
 //! versioned JSON file handoff under the shared data directory.
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,23 +14,21 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use quick_xml::Reader;
-use quick_xml::escape::{resolve_predefined_entity, unescape};
-use quick_xml::events::Event;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
+mod config;
 mod metrics;
+mod providers;
 
 const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 10;
 const MAX_TOPIC_CHARS: usize = 200;
-const MAX_RSS_BYTES: usize = 2 * 1024 * 1024;
-const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
-const DEFAULT_SEARCH_URL: &str = "https://www.bing.com/news/search";
+pub(crate) const MAX_RSS_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARTIFACT_VERSION: u8 = 1;
 const PROCESS_AUTH_ENV: &str = "OHARA_PROCESS_AUTH_TOKEN";
 
@@ -60,7 +56,7 @@ pub enum ScraperError {
 struct AppState {
     data_dir: PathBuf,
     client: Client,
-    search_url: String,
+    config: config::Config,
     process_auth_token: Option<String>,
     metrics: Arc<metrics::Metrics>,
 }
@@ -110,9 +106,9 @@ pub struct QueuedDocument {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct TopicResult {
-    title: String,
-    url: String,
+pub(crate) struct TopicResult {
+    pub(crate) title: String,
+    pub(crate) url: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -131,7 +127,9 @@ struct RawArtifact {
 ///
 /// Returns an error when the HTTP client, artifact directories, or listener
 /// cannot be prepared.
-pub async fn run(bind: SocketAddr) -> Result<(), ScraperError> {
+pub async fn run() -> Result<(), ScraperError> {
+    let config = config::Config::load()?;
+    let bind = config.bind;
     let data_dir = data_dir();
     ensure_layout(&data_dir).await?;
     heartbeat(&data_dir).await?;
@@ -157,8 +155,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), ScraperError> {
     let state = Arc::new(AppState {
         data_dir,
         client,
-        search_url: std::env::var("OHARA_SCRAPER_SEARCH_URL")
-            .unwrap_or_else(|_| DEFAULT_SEARCH_URL.into()),
+        config,
         process_auth_token: process_auth_token(),
         metrics,
     });
@@ -207,7 +204,7 @@ async fn scrape(
         )));
     }
 
-    let results = search(&state.client, &state.search_url, &topic, limit)
+    let results = providers::search(&state.client, &state.config, &topic, limit)
         .await
         .map_err(ScraperHttpError::from)?;
     let discovered = results.len();
@@ -268,22 +265,9 @@ async fn queue_result(
             title: result.title,
         }));
     }
-    let response = state
-        .client
-        .get(&result.url)
-        .send()
-        .await
-        .map_err(|error| ScraperError::Network(error.to_string()))?;
-    if !response.status().is_success() {
+    let Some(body) = providers::fetch(&state.client, &state.config, &result.url).await? else {
         return Ok(None);
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| ScraperError::Network(error.to_string()))?;
-    if body.len() > MAX_DOCUMENT_BYTES {
-        return Ok(None);
-    }
+    };
     let raw_path = state
         .data_dir
         .join("raw")
@@ -378,173 +362,7 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     scheme.eq_ignore_ascii_case("Bearer") && bool::from(expected.as_bytes().ct_eq(token.as_bytes()))
 }
 
-async fn search(
-    client: &Client,
-    search_url: &str,
-    topic: &str,
-    limit: usize,
-) -> Result<Vec<TopicResult>, ScraperError> {
-    let mut endpoint = url::Url::parse(search_url)
-        .map_err(|error| ScraperError::Configuration(error.to_string()))?;
-    endpoint
-        .query_pairs_mut()
-        .append_pair("q", topic)
-        .append_pair("format", "rss");
-    let response = client
-        .get(endpoint)
-        .header(
-            reqwest::header::ACCEPT,
-            "application/rss+xml, application/xml",
-        )
-        .send()
-        .await
-        .map_err(|error| ScraperError::Network(error.to_string()))?;
-    if !response.status().is_success() {
-        return Err(ScraperError::Network(format!(
-            "search provider returned {}",
-            response.status()
-        )));
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| ScraperError::Network(error.to_string()))?;
-    if body.len() > MAX_RSS_BYTES {
-        return Err(ScraperError::InvalidResponse(
-            "RSS response is too large".into(),
-        ));
-    }
-    parse_rss(&body, limit)
-}
-
-fn parse_rss(body: &[u8], limit: usize) -> Result<Vec<TopicResult>, ScraperError> {
-    let mut reader = Reader::from_reader(body);
-    reader.config_mut().trim_text(true);
-    let mut buffer = Vec::new();
-    let mut in_item = false;
-    let mut field = None;
-    let mut title = String::new();
-    let mut link = String::new();
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(element)) => match element.name().as_ref() {
-                b"item" => {
-                    in_item = true;
-                    field = None;
-                    title.clear();
-                    link.clear();
-                }
-                b"title" if in_item => field = Some(Field::Title),
-                b"link" if in_item => field = Some(Field::Link),
-                _ => {}
-            },
-            Ok(Event::Text(text)) if in_item => {
-                let decoded = text
-                    .xml_content()
-                    .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
-                let value = unescape(decoded.as_ref())
-                    .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
-                append_field(&mut title, &mut link, field, &value);
-            }
-            Ok(Event::GeneralRef(reference)) if in_item => {
-                let name = reference
-                    .decode()
-                    .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
-                let value = if let Some(character) = reference
-                    .resolve_char_ref()
-                    .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?
-                {
-                    character.to_string()
-                } else {
-                    resolve_predefined_entity(name.as_ref())
-                        .ok_or_else(|| {
-                            ScraperError::InvalidResponse(format!("unsupported entity &{name};"))
-                        })?
-                        .to_string()
-                };
-                append_field(&mut title, &mut link, field, &value);
-            }
-            Ok(Event::CData(text)) if in_item => {
-                append_field(
-                    &mut title,
-                    &mut link,
-                    field,
-                    &String::from_utf8_lossy(text.as_ref()),
-                );
-            }
-            Ok(Event::End(element)) => match element.name().as_ref() {
-                b"title" | b"link" if in_item => field = None,
-                b"item" => {
-                    in_item = false;
-                    if let Some(result) = build_result(&title, &link)
-                        && seen.insert(result.url.clone())
-                    {
-                        results.push(result);
-                        if results.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Err(error) => return Err(ScraperError::InvalidResponse(error.to_string())),
-            Ok(_) => {}
-        }
-        buffer.clear();
-    }
-    Ok(results)
-}
-
-#[derive(Clone, Copy)]
-enum Field {
-    Title,
-    Link,
-}
-
-fn append_field(title: &mut String, link: &mut String, field: Option<Field>, value: &str) {
-    match field {
-        Some(Field::Title) => title.push_str(value),
-        Some(Field::Link) => link.push_str(value),
-        None => {}
-    }
-}
-
-fn build_result(title: &str, link: &str) -> Option<TopicResult> {
-    let title = title.trim();
-    let link = bing_destination(link.trim()).unwrap_or_else(|| link.trim().to_string());
-    let url = normalize_url(&link).ok()?;
-    (!title.is_empty()).then(|| TopicResult {
-        title: title.to_string(),
-        url,
-    })
-}
-
-fn bing_destination(link: &str) -> Option<String> {
-    let parsed = url::Url::parse(link).ok()?;
-    if let Some((_, value)) = parsed
-        .query_pairs()
-        .find(|(key, _)| key.eq_ignore_ascii_case("url"))
-    {
-        return Some(value.into_owned());
-    }
-    let lowercase = link.to_ascii_lowercase();
-    let marker = lowercase.find("url%3d")?;
-    let mut encoded = &link[marker + 6..];
-    if let Some(end) = encoded.to_ascii_lowercase().find("mkt%3d") {
-        encoded = &encoded[..end];
-    }
-    let helper = format!("https://example.invalid/?value={encoded}");
-    url::Url::parse(&helper)
-        .ok()?
-        .query_pairs()
-        .find(|(key, _)| key == "value")
-        .map(|(_, value)| value.into_owned())
-}
-
-fn normalize_url(raw: &str) -> Result<String, ScraperError> {
+pub(crate) fn normalize_url(raw: &str) -> Result<String, ScraperError> {
     let mut parsed =
         url::Url::parse(raw).map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {

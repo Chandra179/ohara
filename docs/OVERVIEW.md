@@ -6,7 +6,8 @@ base. Answers include the chunk ids used as evidence.
 
 ## Features
 
-- Bounded topic discovery through Bing News RSS.
+- Bounded topic discovery through configurable Bing News, Google News, Brave,
+  DuckDuckGo, or custom RSS providers.
 - Raw HTML fetching with URL normalization and response limits.
 - Main-article extraction and Markdown cleaning.
 - Canonical overlapping chunks and local `bge-small-en-v1.5` embeddings.
@@ -47,10 +48,11 @@ and rejects very short results. The indexer splits long text into overlapping
 pieces so a passage keeps enough neighboring context, then converts each piece
 into a 384-number embedding.
 
-Retrieval converts the question with the same embedding model and asks Qdrant
-for the nearest chunks. It sends the bounded evidence to Ollama and accepts the
-answer only when the model returns non-empty text. When synthesis is unavailable
-or produces no answer, the ranked evidence remains visible.
+Retrieval converts the question with the same embedding model and combines
+Qdrant similarity, local full-text overlap, and matching chunk-to-entity graph
+paths. It sends the bounded fused evidence to Ollama and accepts the answer
+only when the model returns non-empty text. When synthesis is unavailable or
+produces no answer, the ranked evidence remains visible.
 
 The graph baseline identifies bounded capitalized noun phrases and stores them
 as idempotent entity mentions. A structured entity extractor can replace this
@@ -59,9 +61,12 @@ implementation later without changing the artifact seam.
 ## Privacy and limitations
 
 Fetched content and models remain on the local machine by default. Ollama is
-local; no cloud model is configured. Bing News RSS and destination pages are
-external network inputs and are treated as untrusted data.
+local; no cloud model is configured. Search providers and destination pages are
+external network inputs and are treated as untrusted data. Brave requires an
+API key, and DuckDuckGo discovery requires the optional Obscura browser binary.
 
-The current vector search uses Qdrant's exact endpoint, the graph extractor is a
-lightweight baseline, and entity-resolution threshold measurement, HNSW
-benchmarking, richer evaluation, and lifecycle operations remain future work.
+The current vector search uses Qdrant's exact endpoint, and the graph extractor
+is a lightweight baseline. The repository includes a deterministic golden
+retrieval evaluation; production-scale relevance labeling, entity-resolution
+threshold measurement, HNSW benchmarking, richer graph extraction, and
+lifecycle operations remain future work.

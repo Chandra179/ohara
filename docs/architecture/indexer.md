@@ -20,3 +20,9 @@ HNSW remains a measured optimization rather than an implicit default.
 The process-boundary harness may set `OHARA_EMBEDDING_MODE=deterministic` to
 replace model inference with a stable local test vector. The default mode
 remains `fastembed` and uses the configured local embedding model.
+
+Resource planning must include model working memory, not only the model file
+size. Two model-backed benchmark runs measured 322.6–323.9 MiB peak RSS for
+the indexer on 2026-09-13 with eight representative documents and the cached
+`bge-small-en-v1.5` model. See [build and operations](operations.md) for the
+full process baseline and the repeatable command.

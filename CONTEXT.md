@@ -47,10 +47,14 @@ rules at a process seam.
 - Deterministic hashes make document and chunk replay idempotent.
 - Qdrant and FalkorDB are derived stores and can be rebuilt from artifacts.
 - The frontend talks only to retrieval.
+- Scraper discovery and fetch settings are loaded from `scraper/config.yaml`;
+  environment overrides are limited to deployment values and secrets.
 - Loopback binding is the default until authentication exists.
 
 ## Intentional limitations
 
 The current graph extractor is a lightweight capitalized-phrase baseline.
-HNSW, entity-resolution threshold measurement, richer failure queues, and
-multi-host durable messaging are future work.
+Retrieval combines Qdrant, local full-text overlap, and bounded graph-path
+signals; richer structured extraction, entity-resolution threshold
+measurement, HNSW evaluation, richer failure queues, and multi-host durable
+messaging are future work.

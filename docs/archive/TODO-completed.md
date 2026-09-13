@@ -35,3 +35,10 @@ Archived on 2026-09-13 after the five-process workspace migration.
 - [x] Measure peak RSS for every process with a representative corpus.
 - [x] Add authenticated retrieval-to-scraper HTTP with remote deployment
   guidance.
+- [x] Add graceful worker drain behavior for `SIGINT` and `SIGTERM`.
+- [x] Document model-backed resource usage based on measured indexer memory.
+- [x] Add a deterministic golden retrieval dataset with recall@k, MRR, and
+  nDCG measurements.
+- [x] Require non-empty grounded answers and valid citations in seeded live
+  query tests.
+- [x] Add full-text and graph-path signals to retrieval alongside Qdrant.

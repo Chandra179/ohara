@@ -47,9 +47,11 @@ services:
     environment:
       OHARA_DATA_DIR: /app/data
       OHARA_SCRAPER_BIND: 0.0.0.0:3010
+      OHARA_SCRAPER_BRAVE_API_KEY: ${OHARA_SCRAPER_BRAVE_API_KEY:-}
       OHARA_PROCESS_AUTH_TOKEN: ${OHARA_PROCESS_AUTH_TOKEN:-}
     volumes:
       - ./data:/app/data
+      - ./scraper/config.yaml:/app/scraper/config.yaml:ro
     user: "${OHARA_CONTAINER_USER:-1000:1000}"
     ports:
       - "127.0.0.1:${SCRAPER_PORT:-3010}:3010"

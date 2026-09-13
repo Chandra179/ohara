@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 
 mod metrics;
 
@@ -73,17 +74,28 @@ pub async fn run() -> Result<(), GraphError> {
             }
         }
     });
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
 
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
-            _ = interval.tick() => process_pending(&data_dir, &mut connection, &metrics).await?,
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    eprintln!("ohara-graph: shutdown signal failed: {error}");
+            _ = interval.tick() => {}
+            result = shutdown_rx.changed() => {
+                if result.is_ok() {
+                    eprintln!("ohara-graph: shutdown requested; stopping new work");
+                    eprintln!("ohara-graph: drain complete");
                 }
                 return Ok(());
             }
+        }
+        process_pending(&data_dir, &mut connection, &metrics, shutdown_rx.clone()).await?;
+        if *shutdown_rx.borrow() {
+            eprintln!("ohara-graph: drain complete");
+            return Ok(());
         }
     }
 }
@@ -92,12 +104,31 @@ async fn process_pending<C>(
     data_dir: &Path,
     connection: &mut C,
     metrics: &metrics::Metrics,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), GraphError>
 where
     C: redis::aio::ConnectionLike + Send + Sync,
 {
     let mut entries = tokio::fs::read_dir(data_dir.join("inbox/graph")).await?;
-    while let Some(entry) = entries.next_entry().await? {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let entry = tokio::select! {
+            result = entries.next_entry() => result?,
+            result = shutdown.changed() => {
+                if result.is_err() {
+                    return Ok(());
+                }
+                return Ok(());
+            }
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         if !entry.file_type().await?.is_file()
             || entry.path().extension().is_none_or(|ext| ext != "json")
         {
@@ -125,7 +156,6 @@ where
         }
         tokio::fs::remove_file(path).await?;
     }
-    Ok(())
 }
 
 async fn process_one<C>(path: &Path, connection: &mut C) -> Result<(), GraphError>
@@ -210,6 +240,42 @@ fn falkordb_url() -> String {
 }
 fn graph_name() -> String {
     std::env::var("OHARA_FALKORDB_GRAPH").unwrap_or_else(|_| "ohara".into())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut interrupt =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("ohara-graph: failed to install SIGINT handler: {error}");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        eprintln!("ohara-graph: shutdown signal failed: {error}");
+                    }
+                    return;
+                }
+            };
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("ohara-graph: failed to install SIGTERM handler: {error}");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        eprintln!("ohara-graph: shutdown signal failed: {error}");
+                    }
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("ohara-graph: shutdown signal failed: {error}");
+    }
 }
 
 async fn ensure_layout(data_dir: &Path) -> Result<(), std::io::Error> {

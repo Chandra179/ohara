@@ -5,8 +5,6 @@ TOOLCHAIN ?= 1.95.0
 DATA_DIR ?= $(CURDIR)/data
 RETRIEVAL_BIND ?= 127.0.0.1:3000
 RETRIEVAL_URL ?= http://$(RETRIEVAL_BIND)
-SCRAPER_BIND ?= 127.0.0.1:3010
-SCRAPER_URL ?= http://$(SCRAPER_BIND)
 FRONTEND_HOST ?= 127.0.0.1
 FRONTEND_PORT ?= 5173
 QDRANT_URL ?= http://127.0.0.1:6335
@@ -19,13 +17,13 @@ CONTAINER_USER ?= $(shell id -u):$(shell id -g)
 STAGE ?= cleaning
 LIMIT ?= 10
 
-CARGO = OHARA_DATA_DIR="$(DATA_DIR)" OHARA_QDRANT_URL="$(QDRANT_URL)" OHARA_FALKORDB_URL="$(FALKORDB_URL)" OHARA_FALKORDB_GRAPH="$(FALKORDB_GRAPH)" OHARA_LLM_URL="$(LLM_URL)" OHARA_LLM_MODEL="$(LLM_MODEL)" OHARA_PROCESS_AUTH_TOKEN="$(OHARA_PROCESS_AUTH_TOKEN)" OHARA_SCRAPER_BIND="$(SCRAPER_BIND)" OHARA_SCRAPER_URL="$(SCRAPER_URL)" OHARA_RETRIEVAL_BIND="$(RETRIEVAL_BIND)" $(RUSTUP) run $(TOOLCHAIN) cargo
+CARGO = OHARA_DATA_DIR="$(DATA_DIR)" OHARA_QDRANT_URL="$(QDRANT_URL)" OHARA_FALKORDB_URL="$(FALKORDB_URL)" OHARA_FALKORDB_GRAPH="$(FALKORDB_GRAPH)" OHARA_LLM_URL="$(LLM_URL)" OHARA_LLM_MODEL="$(LLM_MODEL)" OHARA_PROCESS_AUTH_TOKEN="$(OHARA_PROCESS_AUTH_TOKEN)" OHARA_RETRIEVAL_BIND="$(RETRIEVAL_BIND)" $(RUSTUP) run $(TOOLCHAIN) cargo
 
 .DEFAULT_GOAL := help
 .PHONY: help toolchain fmt fmt-check clippy test doc verify build \
         providers providers-down providers-logs docker-up docker-down docker-logs \
         scraper cleaning indexer graph retrieval frontend replay rebuild \
-        pipeline-fixture pipeline-benchmark pipeline-resource-benchmark dev clean
+        pipeline-fixture pipeline-benchmark pipeline-resource-benchmark retrieval-quality dev clean
 
 help:
 	@printf '%s\n' \
@@ -38,11 +36,14 @@ help:
 		'  make graph          Start FalkorDB graph extraction' \
 		'  make retrieval      Start the frontend-facing HTTP interface' \
 		'  make frontend       Start the local Vite frontend' \
+		'  edit scraper/config.yaml                          Configure discovery and fetching' \
+		'  OHARA_SCRAPER_BRAVE_API_KEY=... make scraper      Supply the Brave secret' \
 		'  make replay         Retry dead-letter artifacts (STAGE=cleaning LIMIT=10)' \
 		'  make rebuild        Recreate derived stores and replay durable artifacts' \
 		'  make pipeline-fixture Run the deterministic scrape-to-query harness' \
 		'  make pipeline-benchmark Measure cold/warm latency with p50/p95 gates' \
 		'  make pipeline-resource-benchmark Measure peak RSS for all processes' \
+		'  make retrieval-quality Evaluate golden retrieval metrics' \
 		'  make dev            Start providers and all local processes' \
 		'' \
 		'  make docker-up      Build and run Rust processes in Compose' \
@@ -198,6 +199,10 @@ pipeline-benchmark:
 pipeline-resource-benchmark:
 	$(CARGO) build --workspace
 	python3 scripts/pipeline_resource_benchmark.py
+
+retrieval-quality:
+	$(CARGO) build --workspace
+	python3 scripts/retrieval_quality_benchmark.py
 
 dev:
 	@set -eu; \

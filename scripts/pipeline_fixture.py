@@ -238,6 +238,20 @@ def wait_for_file(path: Path, processes: list["ManagedProcess"]) -> None:
     raise RuntimeError(f"timed out waiting for {path}")
 
 
+def wait_for_absence(path: Path, processes: list["ManagedProcess"]) -> None:
+    deadline = time.monotonic() + PIPELINE_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not path.exists():
+            return
+        for process in processes:
+            if process.process.poll() is not None:
+                raise RuntimeError(
+                    f"{process.name} exited with status {process.process.returncode}"
+                )
+        time.sleep(POLL_INTERVAL_SECONDS)
+    raise RuntimeError(f"timed out waiting for {path} to be removed")
+
+
 class ManagedProcess:
     def __init__(self, name: str, binary: str, environment: dict[str, str], log_dir: Path):
         self.name = name
@@ -280,6 +294,17 @@ def run_pipeline() -> None:
         try:
             scraper_port = free_port()
             retrieval_port = free_port()
+            scraper_config = Path(temporary) / "scraper-config.yaml"
+            scraper_config.write_text(
+                f"""bind: 127.0.0.1:{scraper_port}
+search:
+  provider: rss
+  url: http://127.0.0.1:{fixture_server.server_port}/news
+fetch:
+  kind: http
+""",
+                encoding="utf-8",
+            )
             base_environment = os.environ.copy()
             base_environment.update(
                 {
@@ -293,10 +318,7 @@ def run_pipeline() -> None:
             )
 
             scraper_environment = base_environment | {
-                "OHARA_SCRAPER_BIND": f"127.0.0.1:{scraper_port}",
-                "OHARA_SCRAPER_SEARCH_URL": (
-                    f"http://127.0.0.1:{fixture_server.server_port}/news"
-                ),
+                "OHARA_SCRAPER_CONFIG": str(scraper_config),
             }
             retrieval_environment = base_environment | {
                 "OHARA_RETRIEVAL_BIND": f"127.0.0.1:{retrieval_port}",
@@ -356,8 +378,8 @@ def run_pipeline() -> None:
                 "indexed artifact did not contain the fixture chunk",
             )
 
-            check(not (data_dir / "inbox/cleaning" / f"{document_id}.json").exists(), "cleaning inbox item remained")
-            check(not (data_dir / "inbox/indexer" / f"{document_id}.json").exists(), "indexer inbox item remained")
+            wait_for_absence(data_dir / "inbox/cleaning" / f"{document_id}.json", processes)
+            wait_for_absence(data_dir / "inbox/indexer" / f"{document_id}.json", processes)
             check((data_dir / "inbox/graph" / f"{document_id}.json").is_file(), "graph handoff was not published")
 
             status, query_payload = request_json(
@@ -375,8 +397,13 @@ def run_pipeline() -> None:
             )
             chunks = query_payload.get("chunks")
             citations = query_payload.get("citations")
+            signals = query_payload.get("signals")
             check(isinstance(chunks, list) and chunks, "query returned no chunks")
             check(isinstance(citations, list) and citations, "query returned no citations")
+            check(isinstance(signals, dict), "query returned no signal metadata")
+            check(signals.get("qdrant") is True, "qdrant signal was not available")
+            check(signals.get("fullText") is True, "full-text signal was not available")
+            check(isinstance(signals.get("graphPath"), bool), "graph signal metadata was invalid")
             check(citations[0] == chunks[0]["chunkId"], "citation did not reference evidence")
             print(f"pipeline fixture passed: {document_id}")
         finally:
@@ -390,6 +417,13 @@ def run_pipeline() -> None:
                     process.process.kill()
                     process.process.wait(timeout=5)
                 process.close()
+            for process in processes:
+                if process.name in {"cleaning", "indexer"}:
+                    output = process.log_path.read_text(encoding="utf-8")
+                    check(
+                        "drain complete" in output,
+                        f"{process.name} did not complete its graceful drain",
+                    )
             fixture_server.shutdown()
             qdrant_server.shutdown()
             ollama_server.shutdown()

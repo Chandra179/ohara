@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 mod metrics;
+mod signals;
 
 const DEFAULT_TOP_K: usize = 5;
 const MAX_TOP_K: usize = 20;
@@ -59,6 +60,7 @@ struct AppState {
     client: Client,
     qdrant_url: String,
     falkordb_url: String,
+    falkordb_graph: String,
     scraper_url: String,
     process_auth_token: Option<String>,
     llm_url: String,
@@ -134,9 +136,10 @@ struct QueryResponse {
     citations: Vec<String>,
     chunks: Vec<QueryChunk>,
     grounding: &'static str,
+    signals: signals::Availability,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QueryChunk {
     chunk_id: String,
@@ -194,6 +197,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
         client,
         qdrant_url: std::env::var("OHARA_QDRANT_URL").unwrap_or_else(|_| QDRANT_URL.into()),
         falkordb_url: std::env::var("OHARA_FALKORDB_URL").unwrap_or_else(|_| FALKORDB_URL.into()),
+        falkordb_graph: std::env::var("OHARA_FALKORDB_GRAPH").unwrap_or_else(|_| "ohara".into()),
         scraper_url: std::env::var("OHARA_SCRAPER_URL").unwrap_or_else(|_| SCRAPER_URL.into()),
         process_auth_token: process_auth_token(),
         llm_url: std::env::var("OHARA_LLM_URL").unwrap_or_else(|_| LLM_URL.into()),
@@ -519,7 +523,16 @@ async fn query(
     let top_k = request.top_k.unwrap_or(DEFAULT_TOP_K).clamp(1, MAX_TOP_K);
     let vector = embed(&state, question)?;
     let points = search_qdrant(&state, &vector, top_k).await?;
-    let chunks: Vec<QueryChunk> = points.iter().filter_map(point_to_chunk).collect();
+    let result = signals::combine(
+        &state.data_dir,
+        &state.falkordb_url,
+        &state.falkordb_graph,
+        &points,
+        question,
+        top_k,
+    )
+    .await?;
+    let chunks = result.chunks;
     if chunks.is_empty() {
         return Ok(Json(QueryResponse {
             answer: None,
@@ -527,6 +540,7 @@ async fn query(
             citations: Vec::new(),
             chunks,
             grounding: "ungrounded",
+            signals: result.availability,
         }));
     }
     let prompt = render_prompt(question, &chunks);
@@ -547,6 +561,7 @@ async fn query(
         citations,
         chunks,
         grounding,
+        signals: result.availability,
     }))
 }
 

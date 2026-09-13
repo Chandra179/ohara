@@ -14,8 +14,9 @@ scraper → cleaning → indexer → graph
 ```
 
 The processes exchange atomic JSON artifacts in `data/`. Indexer owns Qdrant
-vectors, graph owns FalkorDB relationships, and retrieval owns the browser HTTP
-interface. The frontend is React + TypeScript + Vite and runs locally with npm.
+vectors, graph owns FalkorDB relationships, and retrieval owns hybrid search
+and the browser HTTP interface. The frontend is React + TypeScript + Vite and
+runs locally with npm.
 
 The active workspace has no root Rust package. Every Rust package has its own
 `Cargo.toml`, `src/`, and Dockerfile. The root `Cargo.toml` is workspace-only;
@@ -30,6 +31,8 @@ for the process Interfaces and artifact shapes.
 - Node.js and npm for the frontend
 - Docker Compose for Qdrant and FalkorDB
 - Ollama with `phi4-mini:latest` for local answer synthesis
+- Optional Obscura binary for DuckDuckGo discovery or JavaScript-rendered page
+  fetching
 
 ## Local development
 
@@ -59,6 +62,31 @@ same high-entropy `OHARA_PROCESS_AUTH_TOKEN` for both processes. Retrieval
 then sends a bearer token to scraper, which rejects missing or invalid tokens.
 Protect that connection with HTTPS or a private network. The token is unset by
 default for local development.
+
+### Scraper configuration
+
+All scraper settings are in
+[`scraper/config.yaml`](scraper/config.yaml). Edit that file to select
+`bing-news`, `google-news`, `brave`, `duckduckgo`, or `rss`, configure locale,
+and choose the `http` or `obscura` page fetcher. The process loads the file at
+startup, so `make scraper` needs no scraper-specific Makefile variables.
+
+The file supports `${ENV_VAR:-default}` overrides for deployment-specific
+values. Keep secrets out of the file; provide the Brave key only when needed:
+
+```sh
+OHARA_SCRAPER_BRAVE_API_KEY="$BRAVE_SEARCH_API_KEY" make scraper
+```
+
+`OHARA_SCRAPER_CONFIG` can point to another YAML file for isolated tests or a
+deployment-specific configuration. Obscura is optional and is not bundled in
+the default lightweight scraper image.
+
+Brave Search uses its official API and requires an API key. DuckDuckGo does not
+offer an official full web-results API, so Ohara uses Obscura's documented
+headless-browser `fetch --eval` interface for that adapter. See the
+[scraper module contract](docs/architecture/scraper.md) for the full
+configuration reference.
 
 The Compose stack can build and run all Rust processes:
 
@@ -121,9 +149,23 @@ make pipeline-resource-benchmark
 
 The measurement runs each process in isolation with local test doubles and
 samples Linux process high-water RSS. It uses deterministic embeddings by
-default; set `OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE` when measuring a local
-embedding model. Set `OHARA_RESOURCE_BENCHMARK_OUTPUT=path.json` to save the
-per-process result for capacity planning.
+default; set `OHARA_RESOURCE_BENCHMARK_EMBEDDING_MODE=fastembed` to measure the
+cached `bge-small-en-v1.5` model. The model cache defaults to `data/models` and
+can be changed with `OHARA_RESOURCE_BENCHMARK_MODEL_CACHE`. Set
+`OHARA_RESOURCE_BENCHMARK_OUTPUT=path.json` to save the per-process result for
+capacity planning. The model-backed baseline and current Compose limits are
+documented in [build and operations](docs/architecture/operations.md).
+
+Run the deterministic golden retrieval evaluation:
+
+```sh
+make retrieval-quality
+```
+
+It runs the real retrieval process against local Qdrant and Ollama test doubles
+and reports recall@k, MRR, and nDCG. The fixture is a ranking and contract
+regression gate; production semantic quality should be measured again with a
+labeled corpus and the configured embedding model.
 
 To rebuild the derived Qdrant collection and FalkorDB graph from durable
 artifacts, stop the five Rust processes and run:
@@ -143,6 +185,7 @@ make verify
 cd frontend && npm run lint && npm test -- --run && npm run build && npm run e2e
 cd .. && make pipeline-fixture && make pipeline-benchmark
 cd .. && make pipeline-resource-benchmark
+cd .. && make retrieval-quality
 ```
 
 Runtime data under `data/` is local and ignored by git. The bounded replay

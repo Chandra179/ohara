@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 mod metrics;
 
@@ -68,23 +69,56 @@ pub async fn run() -> Result<(), CleaningError> {
         }
     });
 
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
-            _ = interval.tick() => process_pending(&data_dir, &metrics).await?,
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    eprintln!("ohara-cleaning: shutdown signal failed: {error}");
+            _ = interval.tick() => {}
+            result = shutdown_rx.changed() => {
+                if result.is_ok() {
+                    eprintln!("ohara-cleaning: shutdown requested; stopping new work");
+                    eprintln!("ohara-cleaning: drain complete");
                 }
                 return Ok(());
             }
         }
+        process_pending(&data_dir, &metrics, shutdown_rx.clone()).await?;
+        if *shutdown_rx.borrow() {
+            eprintln!("ohara-cleaning: drain complete");
+            return Ok(());
+        }
     }
 }
 
-async fn process_pending(data_dir: &Path, metrics: &metrics::Metrics) -> Result<(), CleaningError> {
+async fn process_pending(
+    data_dir: &Path,
+    metrics: &metrics::Metrics,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), CleaningError> {
     let mut entries = tokio::fs::read_dir(data_dir.join("inbox/cleaning")).await?;
-    while let Some(entry) = entries.next_entry().await? {
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let entry = tokio::select! {
+            result = entries.next_entry() => result?,
+            result = shutdown.changed() => {
+                if result.is_err() {
+                    return Ok(());
+                }
+                return Ok(());
+            }
+        };
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         if entry.file_type().await?.is_file()
             && entry.path().extension().is_some_and(|ext| ext == "json")
         {
@@ -115,7 +149,6 @@ async fn process_pending(data_dir: &Path, metrics: &metrics::Metrics) -> Result<
             tokio::fs::remove_file(path).await?;
         }
     }
-    Ok(())
 }
 
 async fn process_one(data_dir: &Path, queue_path: &Path) -> Result<(), CleaningError> {
@@ -268,6 +301,42 @@ async fn heartbeat(data_dir: &Path) -> Result<(), std::io::Error> {
         timestamp().as_bytes(),
     )
     .await
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut interrupt =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("ohara-cleaning: failed to install SIGINT handler: {error}");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        eprintln!("ohara-cleaning: shutdown signal failed: {error}");
+                    }
+                    return;
+                }
+            };
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    eprintln!("ohara-cleaning: failed to install SIGTERM handler: {error}");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        eprintln!("ohara-cleaning: shutdown signal failed: {error}");
+                    }
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = interrupt.recv() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("ohara-cleaning: shutdown signal failed: {error}");
+    }
 }
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, CleaningError> {

@@ -1,0 +1,20 @@
+# Scraper process configuration.
+#
+# Values may be overridden at runtime with ${ENV_VAR:-default}. Keep secrets
+# out of this file; the Brave API key is supplied through the environment.
+
+bind: "${OHARA_SCRAPER_BIND:-127.0.0.1:3010}"
+
+search:
+  # bing-news, google-news, brave, duckduckgo, or rss
+  provider: "${OHARA_SCRAPER_SEARCH_PROVIDER:-google-news}"
+  # Required for provider: rss. Leave empty for the built-in endpoints.
+  url: "${OHARA_SCRAPER_SEARCH_URL:-}"
+  country: "${OHARA_SCRAPER_SEARCH_COUNTRY:-us}"
+  language: "${OHARA_SCRAPER_SEARCH_LANGUAGE:-en}"
+  brave_api_key: "${OHARA_SCRAPER_BRAVE_API_KEY:-}"
+
+fetch:
+  # http for ordinary HTML; obscura for JavaScript-rendered pages.
+  kind: "${OHARA_SCRAPER_FETCHER:-http}"
+  obscura_binary: "${OHARA_SCRAPER_OBSCURA_BIN:-obscura}"

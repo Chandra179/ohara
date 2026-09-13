@@ -28,7 +28,7 @@ linking another process as a Rust dependency.
 | `cleaning` | main-content extraction and quality normalization | clean Markdown and indexing work |
 | `indexer` | canonical chunking, embeddings, Qdrant writes | indexed chunks and graph work |
 | `graph` | entity/mention extraction and FalkorDB writes | graph relationships |
-| `retrieval` | frontend HTTP, document projections, vector search, synthesis | answers, citations, health, and metrics |
+| `retrieval` | frontend HTTP, document projections, hybrid search, synthesis | answers, citations, health, and metrics |
 
 Qdrant and FalkorDB are external derived stores. The shared artifact directory
 is the handoff medium and local source for document metadata. There is no
@@ -71,6 +71,8 @@ shape explicit and reviewable.
 8. The retrieval-to-scraper process seam supports a shared bearer token through
    `OHARA_PROCESS_AUTH_TOKEN`. Configure the same non-empty token on both
    processes for remote deployment and use HTTPS or a private network.
+9. Cleaning, indexer, and graph workers finish the current artifact after
+   `SIGINT` or `SIGTERM`, then stop claiming inbox items before exiting.
 
 ## Deployment
 

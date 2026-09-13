@@ -22,7 +22,7 @@ The handoff sequence is:
 scraper:  RawArtifact → inbox/cleaning
 cleaning: CleanArtifact → inbox/indexer
 indexer:  IndexedArtifact → inbox/graph
-retrieval: catalog + Qdrant results → browser response
+retrieval: catalog/indexed artifacts + Qdrant + FalkorDB → browser response
 ```
 
 The shared layout includes `inbox/cleaning`, `inbox/indexer`, and `inbox/graph`

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "cutoffs": [1, 3, 5],
+  "documents": [
+    {
+      "chunkId": "golden-rust-ownership",
+      "text": "Rust ownership prevents invalid memory access without a garbage collector."
+    },
+    {
+      "chunkId": "golden-qdrant-search",
+      "text": "Qdrant nearest-neighbor search ranks vector embeddings by similarity."
+    },
+    {
+      "chunkId": "golden-falkordb-graph",
+      "text": "FalkorDB stores entity relationships in a graph."
+    },
+    {
+      "chunkId": "golden-scraper-fetch",
+      "text": "The scraper fetches source pages and publishes raw artifacts."
+    },
+    {
+      "chunkId": "golden-cleaning-extract",
+      "text": "Cleaning extracts the main article body and normalizes its text."
+    },
+    {
+      "chunkId": "golden-indexer-chunk",
+      "text": "The indexer creates bounded chunks and publishes embeddings."
+    }
+  ],
+  "queries": [
+    {
+      "id": "rust-memory",
+      "query": "Rust ownership prevents invalid memory access without a garbage collector.",
+      "relevance": {
+        "golden-rust-ownership": 3
+      }
+    },
+    {
+      "id": "vector-search",
+      "query": "Qdrant nearest-neighbor search ranks vector embeddings by similarity.",
+      "relevance": {
+        "golden-qdrant-search": 3
+      }
+    },
+    {
+      "id": "graph-storage",
+      "query": "FalkorDB stores entity relationships in a graph.",
+      "relevance": {
+        "golden-falkordb-graph": 3
+      }
+    }
+  ]
+}
