@@ -68,6 +68,9 @@ shape explicit and reviewable.
 6. Each process persists input/output/failure counters and latency snapshots
    under `state/`; retrieval exposes them for operations tooling.
 7. The frontend-facing process binds to loopback by default.
+8. The retrieval-to-scraper process seam supports a shared bearer token through
+   `OHARA_PROCESS_AUTH_TOKEN`. Configure the same non-empty token on both
+   processes for remote deployment and use HTTPS or a private network.
 
 ## Deployment
 

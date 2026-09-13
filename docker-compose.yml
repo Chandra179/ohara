@@ -47,6 +47,7 @@ services:
     environment:
       OHARA_DATA_DIR: /app/data
       OHARA_SCRAPER_BIND: 0.0.0.0:3010
+      OHARA_PROCESS_AUTH_TOKEN: ${OHARA_PROCESS_AUTH_TOKEN:-}
     volumes:
       - ./data:/app/data
     user: "${OHARA_CONTAINER_USER:-1000:1000}"
@@ -114,6 +115,7 @@ services:
       OHARA_QDRANT_URL: http://qdrant:6333
       OHARA_FALKORDB_URL: redis://falkordb:6379
       OHARA_SCRAPER_URL: http://scraper:3010
+      OHARA_PROCESS_AUTH_TOKEN: ${OHARA_PROCESS_AUTH_TOKEN:-}
       OHARA_LLM_URL: ${OHARA_LLM_URL:-http://host.docker.internal:11434}
       OHARA_LLM_MODEL: ${OHARA_LLM_MODEL:-phi4-mini:latest}
     volumes:

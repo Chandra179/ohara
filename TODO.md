@@ -9,8 +9,8 @@ archived under `docs/archive/`; unchecked items are intentionally open.
   → query.
 - [x] Add cold and warm latency benchmarks with p50 and p95 thresholds.
 - [x] Measure peak RSS for every process with a representative corpus.
-- [ ] Add authenticated process-to-process HTTP when stages are deployed on
-  different hosts instead of a shared volume.
+- [x] Add authenticated process-to-process HTTP for the retrieval-to-scraper
+  seam, with deployment guidance for different hosts.
 - [ ] Add graceful drain behavior so a process stops claiming new inbox items
   before shutdown.
 - [ ] Add resource-usage documentation based on measured indexer model memory.

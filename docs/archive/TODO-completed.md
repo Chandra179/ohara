@@ -33,3 +33,5 @@ Archived on 2026-09-13 after the five-process workspace migration.
 - [x] Add deterministic cold and warm latency benchmarks with p50 and p95
   thresholds.
 - [x] Measure peak RSS for every process with a representative corpus.
+- [x] Add authenticated retrieval-to-scraper HTTP with remote deployment
+  guidance.

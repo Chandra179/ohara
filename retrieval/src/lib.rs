@@ -34,6 +34,7 @@ const FALKORDB_URL: &str = "redis://127.0.0.1:6380";
 const LLM_URL: &str = "http://127.0.0.1:11434";
 const LLM_MODEL: &str = "phi4-mini:latest";
 const EMBEDDING_DIMENSION: usize = 384;
+const PROCESS_AUTH_ENV: &str = "OHARA_PROCESS_AUTH_TOKEN";
 
 /// Errors raised while starting the retrieval process.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +60,7 @@ struct AppState {
     qdrant_url: String,
     falkordb_url: String,
     scraper_url: String,
+    process_auth_token: Option<String>,
     llm_url: String,
     llm_model: String,
     embedder: Arc<Mutex<Option<EmbeddingBackend>>>,
@@ -193,6 +195,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
         qdrant_url: std::env::var("OHARA_QDRANT_URL").unwrap_or_else(|_| QDRANT_URL.into()),
         falkordb_url: std::env::var("OHARA_FALKORDB_URL").unwrap_or_else(|_| FALKORDB_URL.into()),
         scraper_url: std::env::var("OHARA_SCRAPER_URL").unwrap_or_else(|_| SCRAPER_URL.into()),
+        process_auth_token: process_auth_token(),
         llm_url: std::env::var("OHARA_LLM_URL").unwrap_or_else(|_| LLM_URL.into()),
         llm_model: std::env::var("OHARA_LLM_MODEL").unwrap_or_else(|_| LLM_MODEL.into()),
         embedder: Arc::new(Mutex::new(None)),
@@ -476,13 +479,17 @@ async fn scrape_topic(
     State(state): State<Arc<AppState>>,
     Json(request): Json<TopicRequest>,
 ) -> Result<Json<TopicResponse>, RetrievalHttpError> {
-    let response = state
+    let mut request_builder = state
         .client
         .post(format!(
             "{}/scrape",
             state.scraper_url.trim_end_matches('/')
         ))
-        .json(&request)
+        .json(&request);
+    if let Some(token) = state.process_auth_token.as_deref() {
+        request_builder = request_builder.bearer_auth(token);
+    }
+    let response = request_builder
         .send()
         .await
         .map_err(|error| RetrievalHttpError::BadGateway(error.to_string()))?;
@@ -861,6 +868,12 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
 }
 fn data_dir() -> PathBuf {
     std::env::var_os("OHARA_DATA_DIR").map_or_else(|| PathBuf::from("data"), PathBuf::from)
+}
+
+fn process_auth_token() -> Option<String> {
+    std::env::var(PROCESS_AUTH_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
 }
 fn timestamp() -> String {
     SystemTime::now()

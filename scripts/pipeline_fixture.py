@@ -180,16 +180,22 @@ def start_provider(handler: type[BaseHTTPRequestHandler]) -> ProviderServer:
 
 
 def request_json(
-    method: str, url: str, payload: dict[str, Any] | None = None
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[int, Any]:
     body = None if payload is None else json.dumps(payload).encode()
+    request_headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
     request = Request(
         url,
         data=body,
-        headers={
-            "accept": "application/json",
-            "content-type": "application/json",
-        },
+        headers=request_headers,
         method=method,
     )
     try:
@@ -282,6 +288,7 @@ def run_pipeline() -> None:
                     "OHARA_LLM_URL": f"http://127.0.0.1:{ollama_server.server_port}",
                     "OHARA_LLM_MODEL": "fixture",
                     "OHARA_EMBEDDING_MODE": "deterministic",
+                    "OHARA_PROCESS_AUTH_TOKEN": "fixture-process-token",
                 }
             )
 
@@ -308,9 +315,18 @@ def run_pipeline() -> None:
 
             wait_for_http(f"http://127.0.0.1:{scraper_port}/health", expected_status=204)
             wait_for_http(f"http://127.0.0.1:{retrieval_port}/api/health")
-            status, scrape_payload = request_json(
+            status, auth_payload = request_json(
                 "POST",
                 f"http://127.0.0.1:{scraper_port}/scrape",
+                {"topic": "deterministic fixture topic", "limit": 1},
+            )
+            check(
+                status == 401,
+                f"unauthenticated scrape returned HTTP {status}: {auth_payload}",
+            )
+            status, scrape_payload = request_json(
+                "POST",
+                f"http://127.0.0.1:{retrieval_port}/api/topics/scrape",
                 {"topic": "deterministic fixture topic", "limit": 1},
             )
             check(status == 200, f"scrape returned HTTP {status}: {scrape_payload}")

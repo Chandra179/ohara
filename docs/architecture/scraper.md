@@ -9,7 +9,10 @@ the cleaning inbox. The raw handoff is schema version `1`. URL hashes are
 document identities; an existing catalog entry is reported as a duplicate.
 
 The discovery endpoint defaults to Bing News and can be overridden with
-`OHARA_SCRAPER_SEARCH_URL` for deterministic local fixture tests.
+`OHARA_SCRAPER_SEARCH_URL` for deterministic local fixture tests. When
+`OHARA_PROCESS_AUTH_TOKEN` is non-empty, `POST /scrape` requires an exact
+`Authorization: Bearer <token>` header and returns `401` otherwise. `/health`
+remains unauthenticated so readiness checks do not need the secret.
 
 The scraper does not clean HTML, call Qdrant, call FalkorDB, or answer user
 queries. Its Adapter is replaceable without changing the cleaning Interface.

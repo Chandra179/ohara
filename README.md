@@ -54,6 +54,12 @@ make dev
 The retrieval HTTP process listens on `127.0.0.1:3000`, the scraper listens on
 `127.0.0.1:3010`, and the frontend listens on `127.0.0.1:5173`.
 
+For a deployment that places retrieval and scraper on different hosts, set the
+same high-entropy `OHARA_PROCESS_AUTH_TOKEN` for both processes. Retrieval
+then sends a bearer token to scraper, which rejects missing or invalid tokens.
+Protect that connection with HTTPS or a private network. The token is unset by
+default for local development.
+
 The Compose stack can build and run all Rust processes:
 
 ```sh

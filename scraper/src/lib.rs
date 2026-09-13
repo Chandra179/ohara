@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,6 +22,7 @@ use quick_xml::events::Event;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
 mod metrics;
@@ -33,6 +34,7 @@ const MAX_RSS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_SEARCH_URL: &str = "https://www.bing.com/news/search";
 const ARTIFACT_VERSION: u8 = 1;
+const PROCESS_AUTH_ENV: &str = "OHARA_PROCESS_AUTH_TOKEN";
 
 /// Errors raised by the scraper process.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +61,7 @@ struct AppState {
     data_dir: PathBuf,
     client: Client,
     search_url: String,
+    process_auth_token: Option<String>,
     metrics: Arc<metrics::Metrics>,
 }
 
@@ -156,6 +159,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), ScraperError> {
         client,
         search_url: std::env::var("OHARA_SCRAPER_SEARCH_URL")
             .unwrap_or_else(|_| DEFAULT_SEARCH_URL.into()),
+        process_auth_token: process_auth_token(),
         metrics,
     });
     let app = Router::new()
@@ -176,8 +180,14 @@ async fn health() -> StatusCode {
 
 async fn scrape(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ScraperHttpError> {
+    if let Some(expected) = state.process_auth_token.as_deref()
+        && !authorized(&headers, expected)
+    {
+        return Err(ScraperHttpError::Unauthorized);
+    }
     let started = Instant::now();
     let topic = request.topic.trim().to_string();
     if topic.is_empty() {
@@ -326,6 +336,8 @@ async fn queue_result(
 
 #[derive(Debug, thiserror::Error)]
 enum ScraperHttpError {
+    #[error("process authentication failed")]
+    Unauthorized,
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
@@ -338,11 +350,32 @@ impl IntoResponse for ScraperHttpError {
     fn into_response(self) -> axum::response::Response {
         let message = self.to_string();
         let status = match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Scraper(_) | Self::Storage(_) => StatusCode::BAD_GATEWAY,
         };
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let mut response = (status, Json(serde_json::json!({ "error": message }))).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer"),
+            );
+        }
+        response
     }
+}
+
+fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return false;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some((scheme, token)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("Bearer") && bool::from(expected.as_bytes().ct_eq(token.as_bytes()))
 }
 
 async fn search(
@@ -547,6 +580,12 @@ fn data_dir() -> PathBuf {
     std::env::var_os("OHARA_DATA_DIR").map_or_else(|| PathBuf::from("data"), PathBuf::from)
 }
 
+fn process_auth_token() -> Option<String> {
+    std::env::var(PROCESS_AUTH_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+}
+
 async fn ensure_layout(data_dir: &Path) -> Result<(), std::io::Error> {
     for relative in [
         "raw",
@@ -597,5 +636,36 @@ fn timestamp() -> String {
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         eprintln!("ohara-scraper: failed to install shutdown handler: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::authorized;
+
+    #[test]
+    fn authorization_accepts_only_a_matching_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        assert!(authorized(&headers, "secret"));
+        assert!(!authorized(&headers, "different"));
+    }
+
+    #[test]
+    fn authorization_rejects_missing_or_malformed_headers() {
+        let headers = HeaderMap::new();
+        assert!(!authorized(&headers, "secret"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic secret"),
+        );
+        assert!(!authorized(&headers, "secret"));
     }
 }

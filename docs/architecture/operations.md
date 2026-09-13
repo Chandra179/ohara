@@ -67,6 +67,14 @@ The app containers use the current host UID/GID when started through
 `make docker-up`, so their bind-mounted artifacts remain writable. Direct
 Compose users can set `OHARA_CONTAINER_USER=uid:gid` for their account.
 
+For a deployment where retrieval and scraper communicate across hosts, set the
+same high-entropy `OHARA_PROCESS_AUTH_TOKEN` on both processes. Retrieval sends
+the token as a bearer credential and scraper rejects missing or mismatched
+credentials with HTTP `401`; `/health` stays public for readiness probes. Put
+the HTTP seam behind TLS or an equivalent private network because bearer
+tokens must not cross an untrusted plaintext network. The local Makefile and
+Compose defaults leave the token unset for loopback development.
+
 Starting resource budgets are defined in Compose, not Dockerfiles: scraper and
 cleaning 256 MB, graph 256 MB, retrieval 512 MB, and indexer 1 GB. Qdrant uses
 2 GB and FalkorDB 512 MB. These are initial limits; embedding memory and query
