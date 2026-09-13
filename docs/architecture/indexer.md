@@ -16,3 +16,7 @@ Qdrant work begins.
 Qdrant is a derived store. If its volume is removed, the indexer can replay the
 clean artifacts. The current collection uses 384-dimensional cosine vectors;
 HNSW remains a measured optimization rather than an implicit default.
+
+The process-boundary harness may set `OHARA_EMBEDDING_MODE=deterministic` to
+replace model inference with a stable local test vector. The default mode
+remains `fastembed` and uses the configured local embedding model.

@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -24,12 +24,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
+mod metrics;
+
 const DEFAULT_LIMIT: usize = 5;
 const MAX_LIMIT: usize = 10;
 const MAX_TOPIC_CHARS: usize = 200;
 const MAX_RSS_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
-const BING_NEWS_URL: &str = "https://www.bing.com/news/search";
+const DEFAULT_SEARCH_URL: &str = "https://www.bing.com/news/search";
 const ARTIFACT_VERSION: u8 = 1;
 
 /// Errors raised by the scraper process.
@@ -56,6 +58,8 @@ pub enum ScraperError {
 struct AppState {
     data_dir: PathBuf,
     client: Client,
+    search_url: String,
+    metrics: Arc<metrics::Metrics>,
 }
 
 /// A topic request accepted by the scraper process.
@@ -146,7 +150,14 @@ pub async fn run(bind: SocketAddr) -> Result<(), ScraperError> {
         .user_agent(format!("ohara-scraper/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| ScraperError::Configuration(error.to_string()))?;
-    let state = Arc::new(AppState { data_dir, client });
+    let metrics = Arc::new(metrics::Metrics::open(&data_dir, "scraper").await?);
+    let state = Arc::new(AppState {
+        data_dir,
+        client,
+        search_url: std::env::var("OHARA_SCRAPER_SEARCH_URL")
+            .unwrap_or_else(|_| DEFAULT_SEARCH_URL.into()),
+        metrics,
+    });
     let app = Router::new()
         .route("/health", get(health))
         .route("/scrape", post(scrape))
@@ -167,6 +178,7 @@ async fn scrape(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ScrapeRequest>,
 ) -> Result<Json<ScrapeResponse>, ScraperHttpError> {
+    let started = Instant::now();
     let topic = request.topic.trim().to_string();
     if topic.is_empty() {
         return Err(ScraperHttpError::BadRequest(
@@ -185,13 +197,14 @@ async fn scrape(
         )));
     }
 
-    let results = search(&state.client, &topic, limit)
+    let results = search(&state.client, &state.search_url, &topic, limit)
         .await
         .map_err(ScraperHttpError::from)?;
     let discovered = results.len();
     let mut documents = Vec::with_capacity(discovered);
     let mut enqueued = 0;
     let mut duplicates = 0;
+    let mut skipped = 0_usize;
     for result in results {
         match queue_result(&state, result).await? {
             Some(document) if document.status == "duplicate" => {
@@ -202,8 +215,20 @@ async fn scrape(
                 enqueued += 1;
                 documents.push(document);
             }
-            None => {}
+            None => skipped += 1,
         }
+    }
+    if let Err(error) = state
+        .metrics
+        .record(
+            u64::try_from(discovered).unwrap_or(u64::MAX),
+            u64::try_from(enqueued).unwrap_or(u64::MAX),
+            u64::try_from(skipped).unwrap_or(u64::MAX),
+            started.elapsed(),
+        )
+        .await
+    {
+        eprintln!("ohara-scraper: metrics write failed: {error}");
     }
     Ok(Json(ScrapeResponse {
         topic,
@@ -322,10 +347,11 @@ impl IntoResponse for ScraperHttpError {
 
 async fn search(
     client: &Client,
+    search_url: &str,
     topic: &str,
     limit: usize,
 ) -> Result<Vec<TopicResult>, ScraperError> {
-    let mut endpoint = url::Url::parse(BING_NEWS_URL)
+    let mut endpoint = url::Url::parse(search_url)
         .map_err(|error| ScraperError::Configuration(error.to_string()))?;
     endpoint
         .query_pairs_mut()

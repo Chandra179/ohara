@@ -65,7 +65,9 @@ shape explicit and reviewable.
    completed `.json` files.
 4. Derived Qdrant and FalkorDB data can be rebuilt from the artifact directory.
 5. Provider failures remain visible in process logs and document catalog state.
-6. The frontend-facing process binds to loopback by default.
+6. Each process persists input/output/failure counters and latency snapshots
+   under `state/`; retrieval exposes them for operations tooling.
+7. The frontend-facing process binds to loopback by default.
 
 ## Deployment
 

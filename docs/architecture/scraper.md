@@ -8,5 +8,8 @@ parameters, fetches accepted pages, and writes raw HTML plus a JSON handoff to
 the cleaning inbox. The raw handoff is schema version `1`. URL hashes are
 document identities; an existing catalog entry is reported as a duplicate.
 
+The discovery endpoint defaults to Bing News and can be overridden with
+`OHARA_SCRAPER_SEARCH_URL` for deterministic local fixture tests.
+
 The scraper does not clean HTML, call Qdrant, call FalkorDB, or answer user
 queries. Its Adapter is replaceable without changing the cleaning Interface.

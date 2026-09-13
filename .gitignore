@@ -22,3 +22,6 @@ target
 
 # ohara runtime payloads (system of record, never committed)
 /data
+
+# Python test-harness bytecode
+__pycache__/

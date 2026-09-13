@@ -73,5 +73,8 @@ cargo test --workspace
 cargo doc --workspace --no-deps
 ```
 
-Use `make verify` for the same Rust gates. Frontend changes must also pass
-`npm run lint`, `npm test -- --run`, and `npm run build` from `frontend/`.
+Use `make verify` for the same Rust gates. The deterministic process-boundary
+harness is run with `make pipeline-fixture`. Frontend changes must also pass
+`npm run lint`, `npm test -- --run`, `npm run build`, and the mock browser suite
+with `npm run e2e` from `frontend/`. The live browser suite is opt-in and uses
+`npm run e2e:live` against a running stack.

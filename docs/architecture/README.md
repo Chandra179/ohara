@@ -9,4 +9,5 @@ five process modules and the seams between them:
 - [Graph](graph.md) — entity/mention extraction and FalkorDB.
 - [Retrieval](retrieval.md) — frontend HTTP, search, and cited synthesis.
 - [Artifact contracts](artifacts.md) — the JSON handoff shapes and retry rules.
+- [Process metrics](metrics.md) — durable counters and latency snapshots.
 - [Build and operations](operations.md) — Compose, resource budgets, and checks.

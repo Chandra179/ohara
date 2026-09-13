@@ -1,34 +1,14 @@
 # TODO
 
-Prioritized work for the five-process Rust workspace. Completed items describe
-the new architecture; unchecked items are intentionally open.
-
-## P0 — correctness and operability
-
-- [x] Split the monolithic Rust crate into `scraper`, `cleaning`, `indexer`,
-  `graph`, and `retrieval` packages.
-- [x] Give every Rust package its own source tree and Dockerfile.
-- [x] Define atomic JSON artifact handoffs and deterministic document/chunk ids.
-- [x] Replace the old SQLite/Ladybug runtime with Qdrant, FalkorDB, and the
-  shared artifact directory.
-- [x] Keep the frontend-facing HTTP interface in retrieval and keep frontend
-  execution local with npm.
-- [x] Add Compose builds, local commands, and small per-process CPU/RAM limits.
-- [x] Keep the Makefile aligned with the five-process workspace and remove
-  monolith-only run, worker, and port-management targets.
-- [x] Remove the legacy root implementation.
-- [x] Remove legacy root migrations and tests.
-- [x] Add durable per-stage dead-letter directories for failed artifacts.
-- [x] Add an explicit, stage-scoped replay command with a per-run item limit.
-- [ ] Add a rebuild command that clears derived Qdrant/FalkorDB data and replays
-  clean or indexed artifacts safely.
+Prioritized work for the five-process Rust workspace. Completed root items are
+archived under `docs/archive/`; unchecked items are intentionally open.
 
 ## P1 — stage contracts and production readiness
 
-- [x] Add contract fixtures for every artifact version and reject incompatible
-  versions before processing.
-- [x] Add per-document processing state and failure reason to catalog updates.
-- [ ] Add input/output counters and latency metrics for each process.
+- [x] Add a deterministic pipeline fixture harness for scrape → clean → index
+  → query.
+- [ ] Add cold and warm latency benchmarks with p50 and p95 thresholds.
+- [ ] Measure peak RSS for every process with a representative corpus.
 - [ ] Add authenticated process-to-process HTTP when stages are deployed on
   different hosts instead of a shared volume.
 - [ ] Add graceful drain behavior so a process stops claiming new inbox items
@@ -37,6 +17,9 @@ the new architecture; unchecked items are intentionally open.
 
 ## P2 — retrieval quality
 
+- [ ] Add a golden retrieval dataset with recall@k, MRR, and nDCG measurements.
+- [ ] Require non-empty grounded answers and valid citations in seeded live
+  query tests.
 - [ ] Add full-text and graph-path signals to retrieval alongside Qdrant.
 - [ ] Replace the graph capitalized-phrase baseline with structured extraction
   and typed entity resolution.

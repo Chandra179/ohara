@@ -84,13 +84,35 @@ Retry a bounded number of failures with `make replay STAGE=cleaning LIMIT=10`
 grounded answer is returned only when synthesis produces non-empty output;
 otherwise the response explicitly reports unavailable or ungrounded state.
 
+Run the deterministic process-boundary harness with local test doubles using:
+
+```sh
+make pipeline-fixture
+```
+
+It starts the real scraper, cleaning, indexer, and retrieval binaries against
+fixture RSS/HTML, Qdrant, and Ollama endpoints. It does not use external
+network services or download an embedding model.
+
+To rebuild the derived Qdrant collection and FalkorDB graph from durable
+artifacts, stop the five Rust processes and run:
+
+```sh
+make rebuild
+```
+
+The command recreates both derived stores, requeues clean artifacts for the
+indexer, and requeues indexed artifacts for graph publication. It never removes
+raw, clean, indexed, or catalog artifacts.
+
 ## Verification
 
 ```sh
 make verify
-cd frontend && npm run lint && npm test -- --run && npm run build
+cd frontend && npm run lint && npm test -- --run && npm run build && npm run e2e
+cd .. && make pipeline-fixture
 ```
 
-Runtime data under `data/` is local and ignored by git. A full derived-store
-rebuild command remains tracked as P0 work; the current bounded replay command
-is for failed inbox artifacts.
+Runtime data under `data/` is local and ignored by git. The bounded replay
+command is for failed inbox artifacts; `make rebuild` reconstructs the derived
+stores from durable artifacts.

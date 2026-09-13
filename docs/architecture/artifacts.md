@@ -11,6 +11,11 @@ Operators can replay failed inputs with a bounded command such as
 of JSON files back into the owning inbox; it does not bypass validation or
 provider error handling.
 
+Operators can rebuild derived stores with `make rebuild` after stopping the
+five Rust processes. The command recreates Qdrant and FalkorDB, then requeues
+durable clean and indexed artifacts through their normal inboxes. It preserves
+the source artifacts so the rebuild remains repeatable.
+
 The handoff sequence is:
 
 ```text
@@ -44,3 +49,7 @@ updating the producer, consumer, and this document together.
 Version-one fixtures for the three handoffs live beside this contract. Each
 consumer parses its fixture in its package tests, so a contract edit fails a
 focused test before it reaches another process.
+
+`make pipeline-fixture` additionally runs the real scraper, cleaning, indexer,
+and retrieval processes against local deterministic test doubles and verifies
+the complete scrape-to-query handoff.

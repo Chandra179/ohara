@@ -7,10 +7,12 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+mod metrics;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const ARTIFACT_VERSION: u8 = 1;
@@ -60,6 +62,7 @@ pub async fn run() -> Result<(), GraphError> {
         .get_multiplexed_async_connection()
         .await
         .map_err(|error| GraphError::Falkor(error.to_string()))?;
+    let metrics = metrics::Metrics::open(&data_dir, "graph").await?;
     let heartbeat_dir = data_dir.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -74,7 +77,7 @@ pub async fn run() -> Result<(), GraphError> {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
-            _ = interval.tick() => process_pending(&data_dir, &mut connection).await?,
+            _ = interval.tick() => process_pending(&data_dir, &mut connection, &metrics).await?,
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
                     eprintln!("ohara-graph: shutdown signal failed: {error}");
@@ -85,7 +88,11 @@ pub async fn run() -> Result<(), GraphError> {
     }
 }
 
-async fn process_pending<C>(data_dir: &Path, connection: &mut C) -> Result<(), GraphError>
+async fn process_pending<C>(
+    data_dir: &Path,
+    connection: &mut C,
+    metrics: &metrics::Metrics,
+) -> Result<(), GraphError>
 where
     C: redis::aio::ConnectionLike + Send + Sync,
 {
@@ -97,7 +104,20 @@ where
             continue;
         }
         let path = entry.path();
+        let started = Instant::now();
         let result = process_one(&path, connection).await;
+        let succeeded = result.is_ok();
+        if let Err(error) = metrics
+            .record(
+                1,
+                u64::from(succeeded),
+                u64::from(!succeeded),
+                started.elapsed(),
+            )
+            .await
+        {
+            eprintln!("ohara-graph: metrics write failed: {error}");
+        }
         if let Err(error) = &result {
             eprintln!("ohara-graph: {}: {error}", path.display());
             dead_letter(data_dir, &path).await?;

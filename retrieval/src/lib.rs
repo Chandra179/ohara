@@ -9,18 +9,22 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use redis::AsyncCommands;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
+
+mod metrics;
 
 const DEFAULT_TOP_K: usize = 5;
 const MAX_TOP_K: usize = 20;
@@ -29,6 +33,7 @@ const QDRANT_URL: &str = "http://127.0.0.1:6335";
 const FALKORDB_URL: &str = "redis://127.0.0.1:6380";
 const LLM_URL: &str = "http://127.0.0.1:11434";
 const LLM_MODEL: &str = "phi4-mini:latest";
+const EMBEDDING_DIMENSION: usize = 384;
 
 /// Errors raised while starting the retrieval process.
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +61,13 @@ struct AppState {
     scraper_url: String,
     llm_url: String,
     llm_model: String,
-    embedder: Arc<Mutex<Option<TextEmbedding>>>,
+    embedder: Arc<Mutex<Option<EmbeddingBackend>>>,
+    metrics: Arc<metrics::Metrics>,
+}
+
+enum EmbeddingBackend {
+    FastEmbed(Box<TextEmbedding>),
+    Deterministic,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -175,6 +186,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
         .timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| RetrievalError::Provider(error.to_string()))?;
+    let metrics = Arc::new(metrics::Metrics::open(&data_dir, "retrieval").await?);
     let state = Arc::new(AppState {
         data_dir,
         client,
@@ -184,6 +196,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
         llm_url: std::env::var("OHARA_LLM_URL").unwrap_or_else(|_| LLM_URL.into()),
         llm_model: std::env::var("OHARA_LLM_MODEL").unwrap_or_else(|_| LLM_MODEL.into()),
         embedder: Arc::new(Mutex::new(None)),
+        metrics,
     });
     let heartbeat_dir = state.data_dir.clone();
     tokio::spawn(async move {
@@ -210,7 +223,7 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
         .route("/api/health", get(health))
         .route("/api/overview", get(overview))
         .route("/api/documents", get(documents))
-        .route("/api/metrics", get(metrics))
+        .route("/api/metrics", get(metrics_endpoint))
         .route("/api/query", post(query))
         .route("/api/topics/scrape", post(scrape_topic))
         .route("/api/entities/reviews", get(entity_reviews))
@@ -218,6 +231,10 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
             "/api/entities/reviews/{review_id}/preview",
             get(entity_preview),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_metrics,
+        ))
         .with_state(state);
     let listener = TcpListener::bind(bind).await?;
     eprintln!("ohara-retrieval: listening on http://{bind}");
@@ -234,7 +251,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let qdrant = qdrant_ready(&state).await;
     let falkordb = falkordb_ready(&state).await;
     let ollama = llm_ready(&state).await;
-    let embedding_model = model_cached(&state.data_dir);
+    let embedding_model = embedding_model_available(&state.data_dir);
     let scraper = process_ready(&state.data_dir, "scraper").await;
     let cleaning = process_ready(&state.data_dir, "cleaning").await;
     let indexer = process_ready(&state.data_dir, "indexer").await;
@@ -396,7 +413,7 @@ impl From<CatalogDocument> for DocumentResponse {
     }
 }
 
-async fn metrics(
+async fn metrics_endpoint(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, RetrievalHttpError> {
     let catalog = read_catalog(&state.data_dir).await?;
@@ -407,6 +424,14 @@ async fn metrics(
             .or_default() += 1;
     }
     let (raw_files, raw_bytes) = raw_usage(&state.data_dir).await?;
+    let mut stages = BTreeMap::new();
+    for process in ["scraper", "cleaning", "indexer", "graph"] {
+        stages.insert(
+            process,
+            metrics::read_or_default(&state.data_dir, process).await?,
+        );
+    }
+    stages.insert("retrieval", state.metrics.snapshot().await);
     Ok(Json(serde_json::json!({
         "capturedAt": timestamp(),
         "documentsByStatus": documents_by_status,
@@ -419,8 +444,32 @@ async fn metrics(
         "rawBytes": raw_bytes,
         "rawFiles": raw_files,
         "rawMaxAgeDays": serde_json::Value::Null,
-        "rawMaxBytes": serde_json::Value::Null
+        "rawMaxBytes": serde_json::Value::Null,
+        "stages": stages
     })))
+}
+
+async fn record_metrics(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let succeeded = response.status().is_success();
+    if let Err(error) = state
+        .metrics
+        .record(
+            1,
+            u64::from(succeeded),
+            u64::from(!succeeded),
+            started.elapsed(),
+        )
+        .await
+    {
+        eprintln!("ohara-retrieval: metrics write failed: {error}");
+    }
+    response
 }
 
 async fn scrape_topic(
@@ -510,27 +559,52 @@ fn embed(state: &AppState, text: &str) -> Result<Vec<f32>, RetrievalHttpError> {
         .lock()
         .map_err(|_| RetrievalHttpError::Internal("embedder mutex poisoned".into()))?;
     if guard.is_none() {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::BGESmallENV15)
-                .with_cache_dir(state.data_dir.join("models"))
-                .with_max_length(512)
-                .with_show_download_progress(false),
-        )
-        .map_err(|error| {
-            RetrievalHttpError::ServiceUnavailable(format!("embedding model unavailable: {error}"))
-        })?;
-        *guard = Some(model);
+        *guard = Some(
+            if std::env::var("OHARA_EMBEDDING_MODE").as_deref() == Ok("deterministic") {
+                EmbeddingBackend::Deterministic
+            } else {
+                let model = TextEmbedding::try_new(
+                    InitOptions::new(EmbeddingModel::BGESmallENV15)
+                        .with_cache_dir(state.data_dir.join("models"))
+                        .with_max_length(512)
+                        .with_show_download_progress(false),
+                )
+                .map_err(|error| {
+                    RetrievalHttpError::ServiceUnavailable(format!(
+                        "embedding model unavailable: {error}"
+                    ))
+                })?;
+                EmbeddingBackend::FastEmbed(Box::new(model))
+            },
+        );
     }
-    guard
+    let backend = guard
         .as_mut()
-        .ok_or_else(|| RetrievalHttpError::Internal("embedder was not initialized".into()))?
-        .embed(vec![text], None)
-        .map_err(|error| {
-            RetrievalHttpError::ServiceUnavailable(format!("embedding failed: {error}"))
-        })?
-        .into_iter()
-        .next()
-        .ok_or_else(|| RetrievalHttpError::Internal("embedder returned no vector".into()))
+        .ok_or_else(|| RetrievalHttpError::Internal("embedder was not initialized".into()))?;
+    match backend {
+        EmbeddingBackend::Deterministic => Ok(deterministic_embedding(text)),
+        EmbeddingBackend::FastEmbed(model) => model
+            .embed(vec![text], None)
+            .map_err(|error| {
+                RetrievalHttpError::ServiceUnavailable(format!("embedding failed: {error}"))
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RetrievalHttpError::Internal("embedder returned no vector".into())),
+    }
+}
+
+fn deterministic_embedding(text: &str) -> Vec<f32> {
+    (0..EMBEDDING_DIMENSION)
+        .map(|index| {
+            let mut digest = Sha256::new();
+            digest.update(text.as_bytes());
+            digest.update(index.to_le_bytes());
+            let bytes = digest.finalize();
+            let value = u16::from_le_bytes([bytes[0], bytes[1]]);
+            (f32::from(value) / f32::from(u16::MAX)) * 2.0 - 1.0
+        })
+        .collect()
 }
 
 async fn search_qdrant(
@@ -702,7 +776,10 @@ async fn llm_ready(state: &AppState) -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
-fn model_cached(data_dir: &Path) -> bool {
+fn embedding_model_available(data_dir: &Path) -> bool {
+    if std::env::var("OHARA_EMBEDDING_MODE").as_deref() == Ok("deterministic") {
+        return true;
+    }
     let root = data_dir.join("models/models--Xenova--bge-small-en-v1.5");
     root.join("refs/main").is_file() && root.join("snapshots").is_dir()
 }

@@ -18,4 +18,9 @@ explicit unavailable or ungrounded result.
 
 The retrieval process does not run ingestion. Topic requests are forwarded to
 the scraper process, which makes the process seam visible and independently
-operable.
+operable. Its metrics route also exposes the durable counters and latency
+snapshots written by every process.
+
+For deterministic process-boundary tests, retrieval accepts the same
+`OHARA_EMBEDDING_MODE=deterministic` setting as the indexer. This setting is
+test-only; normal operation uses the cached `bge-small-en-v1.5` model.

@@ -7,12 +7,14 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod metrics;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const EMBEDDING_DIMENSION: usize = 384;
@@ -79,12 +81,16 @@ struct IndexedArtifact {
     pub indexed_at: String,
 }
 
-struct Embedder {
-    model: Mutex<TextEmbedding>,
+enum Embedder {
+    FastEmbed(Box<Mutex<TextEmbedding>>),
+    Deterministic,
 }
 
 impl Embedder {
     fn load(cache_dir: &Path) -> Result<Self, IndexerError> {
+        if std::env::var("OHARA_EMBEDDING_MODE").as_deref() == Ok("deterministic") {
+            return Ok(Self::Deterministic);
+        }
         std::fs::create_dir_all(cache_dir)?;
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::BGESmallENV15)
@@ -93,19 +99,41 @@ impl Embedder {
                 .with_show_download_progress(false),
         )
         .map_err(|error| IndexerError::Embedder(error.to_string()))?;
-        Ok(Self {
-            model: Mutex::new(model),
-        })
+        Ok(Self::FastEmbed(Box::new(Mutex::new(model))))
     }
 
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, IndexerError> {
+        if matches!(self, Self::Deterministic) {
+            return Ok(texts
+                .iter()
+                .map(|text| deterministic_embedding(text))
+                .collect());
+        }
         let references: Vec<&str> = texts.iter().map(String::as_str).collect();
-        self.model
+        let Self::FastEmbed(model) = self else {
+            return Err(IndexerError::Embedder(
+                "embedder was not initialized".into(),
+            ));
+        };
+        model
             .lock()
             .map_err(|_| IndexerError::Embedder("embedder mutex poisoned".into()))?
             .embed(references, None)
             .map_err(|error| IndexerError::Embedder(error.to_string()))
     }
+}
+
+fn deterministic_embedding(text: &str) -> Vec<f32> {
+    (0..EMBEDDING_DIMENSION)
+        .map(|index| {
+            let mut digest = Sha256::new();
+            digest.update(text.as_bytes());
+            digest.update(index.to_le_bytes());
+            let bytes = digest.finalize();
+            let value = u16::from_le_bytes([bytes[0], bytes[1]]);
+            (f32::from(value) / f32::from(u16::MAX)) * 2.0 - 1.0
+        })
+        .collect()
 }
 
 /// Runs the indexer worker until interrupted.
@@ -121,6 +149,7 @@ pub async fn run() -> Result<(), IndexerError> {
     let embedder = Embedder::load(&data_dir.join("models"))?;
     let qdrant = Qdrant::new(qdrant_url())?;
     qdrant.ensure_collection().await?;
+    let metrics = metrics::Metrics::open(&data_dir, "indexer").await?;
     let heartbeat_dir = data_dir.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -134,7 +163,7 @@ pub async fn run() -> Result<(), IndexerError> {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
-            _ = interval.tick() => process_pending(&data_dir, &embedder, &qdrant).await?,
+            _ = interval.tick() => process_pending(&data_dir, &embedder, &qdrant, &metrics).await?,
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
                     eprintln!("ohara-indexer: shutdown signal failed: {error}");
@@ -149,6 +178,7 @@ async fn process_pending(
     data_dir: &Path,
     embedder: &Embedder,
     qdrant: &Qdrant,
+    metrics: &metrics::Metrics,
 ) -> Result<(), IndexerError> {
     let mut entries = tokio::fs::read_dir(data_dir.join("inbox/indexer")).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -158,7 +188,20 @@ async fn process_pending(
             continue;
         }
         let path = entry.path();
+        let started = Instant::now();
         let result = process_one(data_dir, &path, embedder, qdrant).await;
+        let succeeded = result.is_ok();
+        if let Err(error) = metrics
+            .record(
+                1,
+                u64::from(succeeded),
+                u64::from(!succeeded),
+                started.elapsed(),
+            )
+            .await
+        {
+            eprintln!("ohara-indexer: metrics write failed: {error}");
+        }
         if let Err(error) = &result {
             eprintln!("ohara-indexer: {}: {error}", path.display());
             if let Some(id) = path.file_stem().and_then(|value| value.to_str()) {

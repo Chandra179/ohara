@@ -5,9 +5,11 @@
 //! to `inbox/indexer`.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+mod metrics;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MIN_WORDS: usize = 20;
@@ -54,6 +56,7 @@ pub async fn run() -> Result<(), CleaningError> {
     let data_dir = data_dir();
     ensure_layout(&data_dir).await?;
     heartbeat(&data_dir).await?;
+    let metrics = metrics::Metrics::open(&data_dir, "cleaning").await?;
     let heartbeat_dir = data_dir.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -68,7 +71,7 @@ pub async fn run() -> Result<(), CleaningError> {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
-            _ = interval.tick() => process_pending(&data_dir).await?,
+            _ = interval.tick() => process_pending(&data_dir, &metrics).await?,
             result = tokio::signal::ctrl_c() => {
                 if let Err(error) = result {
                     eprintln!("ohara-cleaning: shutdown signal failed: {error}");
@@ -79,14 +82,27 @@ pub async fn run() -> Result<(), CleaningError> {
     }
 }
 
-async fn process_pending(data_dir: &Path) -> Result<(), CleaningError> {
+async fn process_pending(data_dir: &Path, metrics: &metrics::Metrics) -> Result<(), CleaningError> {
     let mut entries = tokio::fs::read_dir(data_dir.join("inbox/cleaning")).await?;
     while let Some(entry) = entries.next_entry().await? {
         if entry.file_type().await?.is_file()
             && entry.path().extension().is_some_and(|ext| ext == "json")
         {
             let path = entry.path();
+            let started = Instant::now();
             let result = process_one(data_dir, &path).await;
+            let succeeded = result.is_ok();
+            if let Err(error) = metrics
+                .record(
+                    1,
+                    u64::from(succeeded),
+                    u64::from(!succeeded),
+                    started.elapsed(),
+                )
+                .await
+            {
+                eprintln!("ohara-cleaning: metrics write failed: {error}");
+            }
             if let Err(error) = &result {
                 eprintln!("ohara-cleaning: {}: {error}", path.display());
                 if let Some(document_id) = path.file_stem().and_then(|value| value.to_str()) {

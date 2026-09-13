@@ -30,6 +30,24 @@ bounded number of items with `make replay STAGE=cleaning LIMIT=10` (or
 `indexer`/`graph`). The command only moves files back to that stage's inbox;
 the owning process performs the retry and records the next result.
 
+For a full derived-store rebuild, stop the five Rust processes and run
+`make rebuild`. The command deletes and recreates the configured Qdrant
+collection, deletes the configured FalkorDB graph, then atomically requeues
+every clean artifact for the indexer and every indexed artifact for graph
+publication. Raw, clean, indexed, and catalog artifacts are preserved. The
+processes must be stopped during the command so they cannot consume or replace
+the rebuild inbox while it is being populated.
+
+Each process also writes cumulative input, output, failure, and latency
+measurements under `data/state/`. Retrieval returns those snapshots from
+`GET /api/metrics` under `stages`; a missing snapshot means that process has
+not started yet.
+
+Run `make pipeline-fixture` to exercise the real scraper, cleaning, indexer,
+and retrieval binaries against deterministic local RSS/HTML, Qdrant, and
+Ollama test doubles. The harness uses `OHARA_EMBEDDING_MODE=deterministic` so
+it does not download a model and is suitable for CI.
+
 The app containers use the current host UID/GID when started through
 `make docker-up`, so their bind-mounted artifacts remain writable. Direct
 Compose users can set `OHARA_CONTAINER_USER=uid:gid` for their account.
