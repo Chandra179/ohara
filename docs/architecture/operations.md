@@ -62,6 +62,12 @@ and retrieval binaries against deterministic local RSS/HTML, Qdrant, and
 Ollama test doubles. The harness uses `OHARA_EMBEDDING_MODE=deterministic` so
 it does not download a model and is suitable for CI.
 
+Verification tooling is isolated in the non-production `tools` workspace
+package. Its five Rust binaries share focused provider doubles, process
+lifecycle, artifact, workload, and metric modules. They exercise the real
+process boundaries without becoming a deployable sixth process or a runtime
+dependency of any production package.
+
 Run `make pipeline-benchmark` to measure retrieval cold and warm latency with
 the same local test doubles. Cold latency includes process startup through the
 first successful query; warm latency measures repeated queries after startup.
@@ -70,7 +76,7 @@ prints the startup and first-query components for diagnosis.
 
 Run `make pipeline-resource-benchmark` to measure peak RSS for scraper,
 cleaning, indexer, graph, and retrieval. It runs each process separately with
-eight representative documents, local standard-library provider doubles, and
+eight representative documents, local deterministic provider doubles, and
 deterministic embeddings. The Linux `/proc/<pid>/status` `VmHWM` value is
 sampled while the workload runs. This is a process-memory measurement, not a
 container-limit check; model-backed indexer memory should be measured by
@@ -90,7 +96,7 @@ Two model-backed runs measured on 2026-09-13 produced this baseline range:
 | retrieval | ranked query, embedding, and synthesis | 213.4–214.8 MiB |
 
 This baseline used eight representative documents, the local cached model, and
-the standard-library provider doubles. It is a sizing reference, not a
+the deterministic provider doubles. It is a sizing reference, not a
 production capacity guarantee. The current Compose limits remain 1 GiB for
 the indexer and 512 MiB for retrieval, leaving room for larger batches,
 allocator variance, and provider-client buffers. Repeat the benchmark on the
@@ -99,8 +105,25 @@ deployment host before tightening either limit.
 Run `make retrieval-quality` to evaluate the real retrieval HTTP process against
 the versioned golden fixture. The command reports macro recall@1/3/5, MRR, and
 nDCG@1/3/5, and fails if any configured minimum is not met. It uses local
-standard-library provider doubles and deterministic embeddings, so it is safe
+deterministic provider doubles and deterministic embeddings, so it is safe
 for CI and does not measure production semantic quality.
+
+Run `make entity-resolution-quality` to sweep the versioned graph resolution
+fixture. It reports precision, recall, F1, false merges, and missed merges for
+each threshold and fails if the documented operating threshold is not optimal.
+The benchmark is local and deterministic; it does not contact FalkorDB or
+modify runtime data.
+
+Run `make qdrant-hnsw-benchmark` with Qdrant running to compare exact search
+and HNSW on the same 384-dimensional corpus, vectors, query set, and top-k.
+The command creates isolated benchmark collections, reports recall@1/3/5/10,
+build time, query p50/p95, and observed Qdrant container memory, then removes
+only those collections. Set `QDRANT_SEARCH_MODE=hnsw` when starting the
+indexer and retrieval processes only after the benchmark recommends HNSW. The
+default remains exact when the recall@10 or p95 latency gate is not met.
+Use `OHARA_HNSW_BENCHMARK_OUTPUT=path.json` for machine-readable results and
+`OHARA_HNSW_BENCHMARK_CONTAINER` when the Qdrant container is not managed by
+this Compose project.
 
 The app containers use the current host UID/GID when started through
 `make docker-up`, so their bind-mounted artifacts remain writable. Direct

@@ -54,9 +54,10 @@ paths. It sends the bounded fused evidence to Ollama and accepts the answer
 only when the model returns non-empty text. When synthesis is unavailable or
 produces no answer, the ranked evidence remains visible.
 
-The graph baseline identifies bounded capitalized noun phrases and stores them
-as idempotent entity mentions. A structured entity extractor can replace this
-implementation later without changing the artifact seam.
+The graph extractor recognizes typed fields and typed lexical cues for people,
+organizations, locations, events, concepts, and products. It normalizes names,
+resolves explicit aliases, and stores idempotent typed mentions. Untyped
+capitalized phrases are not treated as entities.
 
 ## Privacy and limitations
 
@@ -65,8 +66,11 @@ local; no cloud model is configured. Search providers and destination pages are
 external network inputs and are treated as untrusted data. Brave requires an
 API key, and DuckDuckGo discovery requires the optional Obscura browser binary.
 
-The current vector search uses Qdrant's exact endpoint, and the graph extractor
-is a lightweight baseline. The repository includes a deterministic golden
-retrieval evaluation; production-scale relevance labeling, entity-resolution
-threshold measurement, HNSW benchmarking, richer graph extraction, and
-lifecycle operations remain future work.
+The current vector search defaults to Qdrant exact search. An explicit HNSW
+mode is available after benchmarking; the benchmark compares both modes on
+the same workload and keeps exact search unless HNSW retains at least 98% of
+exact recall@10 and improves p95 latency. The repository includes deterministic
+golden retrieval and entity-resolution evaluations; the selected entity
+candidate threshold is `0.98`, while approximate graph merges remain disabled
+until deliberately adopted. Production-scale relevance labeling, richer
+failure queues, and lifecycle operations remain future work.

@@ -6,6 +6,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,9 @@ const EMBEDDING_DIMENSION: usize = 384;
 const MAX_CHUNK_CHARS: usize = 2_400;
 const OVERLAP_CHARS: usize = 240;
 const ARTIFACT_VERSION: u8 = 1;
+const DEFAULT_QDRANT_COLLECTION: &str = "ohara_chunks";
+const HNSW_M: usize = 16;
+const HNSW_EF_CONSTRUCT: usize = 100;
 
 /// Errors raised by the indexer process.
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +91,26 @@ enum Embedder {
     Deterministic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QdrantSearchMode {
+    Exact,
+    Hnsw,
+}
+
+impl FromStr for QdrantSearchMode {
+    type Err = IndexerError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "exact" => Ok(Self::Exact),
+            "hnsw" => Ok(Self::Hnsw),
+            other => Err(IndexerError::Qdrant(format!(
+                "unsupported search mode {other:?}; expected exact or hnsw"
+            ))),
+        }
+    }
+}
+
 impl Embedder {
     fn load(cache_dir: &Path) -> Result<Self, IndexerError> {
         if std::env::var("OHARA_EMBEDDING_MODE").as_deref() == Ok("deterministic") {
@@ -148,7 +172,7 @@ pub async fn run() -> Result<(), IndexerError> {
     ensure_layout(&data_dir).await?;
     heartbeat(&data_dir).await?;
     let embedder = Embedder::load(&data_dir.join("models"))?;
-    let qdrant = Qdrant::new(qdrant_url())?;
+    let qdrant = Qdrant::new(qdrant_url(), qdrant_collection(), qdrant_search_mode()?)?;
     qdrant.ensure_collection().await?;
     let metrics = metrics::Metrics::open(&data_dir, "indexer").await?;
     let heartbeat_dir = data_dir.clone();
@@ -340,21 +364,50 @@ fn chunk_id(document_id: &str, sequence: usize) -> String {
 struct Qdrant {
     client: Client,
     base_url: String,
+    collection: String,
+    search_mode: QdrantSearchMode,
 }
 
 impl Qdrant {
-    fn new(base_url: String) -> Result<Self, IndexerError> {
+    fn new(
+        base_url: String,
+        collection: String,
+        search_mode: QdrantSearchMode,
+    ) -> Result<Self, IndexerError> {
+        validate_collection_name(&collection)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| IndexerError::Qdrant(error.to_string()))?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            collection,
+            search_mode,
+        })
     }
 
     async fn ensure_collection(&self) -> Result<(), IndexerError> {
-        let response = self.client.put(format!("{}/collections/ohara_chunks", self.base_url)).json(&serde_json::json!({"vectors": {"size": EMBEDDING_DIMENSION, "distance": "Cosine"}})).send().await.map_err(|error| IndexerError::Qdrant(error.to_string()))?;
+        let full_scan_threshold = match self.search_mode {
+            QdrantSearchMode::Exact => 1_000_000_000,
+            QdrantSearchMode::Hnsw => 10,
+        };
+        let response = self
+            .client
+            .put(self.collection_url())
+            .json(&serde_json::json!({
+                "vectors": {"size": EMBEDDING_DIMENSION, "distance": "Cosine"},
+                "hnsw_config": {
+                    "m": HNSW_M,
+                    "ef_construct": HNSW_EF_CONSTRUCT,
+                    "full_scan_threshold": full_scan_threshold
+                }
+            }))
+            .send()
+            .await
+            .map_err(|error| IndexerError::Qdrant(error.to_string()))?;
         if response.status().is_success() || response.status() == reqwest::StatusCode::CONFLICT {
-            Ok(())
+            self.validate_collection().await
         } else {
             Err(IndexerError::Qdrant(format!(
                 "collection creation returned {}",
@@ -374,7 +427,7 @@ impl Qdrant {
         })).collect();
         let response = self
             .client
-            .put(format!("{}/collections/ohara_chunks/points", self.base_url))
+            .put(format!("{}/points", self.collection_url()))
             .query(&[("wait", "true")])
             .json(&serde_json::json!({"points": points}))
             .send()
@@ -388,6 +441,47 @@ impl Qdrant {
                 response.status()
             )))
         }
+    }
+
+    fn collection_url(&self) -> String {
+        format!("{}/collections/{}", self.base_url, self.collection)
+    }
+
+    async fn validate_collection(&self) -> Result<(), IndexerError> {
+        let response = self
+            .client
+            .get(self.collection_url())
+            .send()
+            .await
+            .map_err(|error| IndexerError::Qdrant(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(IndexerError::Qdrant(format!(
+                "collection validation returned {}",
+                response.status()
+            )));
+        }
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| {
+                IndexerError::Qdrant(format!("invalid collection response: {error}"))
+            })?;
+        let dimension = payload
+            .pointer("/result/config/params/vectors/size")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                IndexerError::Qdrant(format!(
+                    "collection {} has no single-vector dimension",
+                    self.collection
+                ))
+            })?;
+        if dimension != EMBEDDING_DIMENSION as u64 {
+            return Err(IndexerError::Qdrant(format!(
+                "collection {} uses {dimension}-dimensional vectors; expected {EMBEDDING_DIMENSION}",
+                self.collection
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -429,6 +523,30 @@ fn data_dir() -> PathBuf {
 }
 fn qdrant_url() -> String {
     std::env::var("OHARA_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6335".into())
+}
+
+fn qdrant_collection() -> String {
+    std::env::var("OHARA_QDRANT_COLLECTION").unwrap_or_else(|_| DEFAULT_QDRANT_COLLECTION.into())
+}
+
+fn qdrant_search_mode() -> Result<QdrantSearchMode, IndexerError> {
+    std::env::var("OHARA_QDRANT_SEARCH_MODE")
+        .unwrap_or_else(|_| "exact".into())
+        .parse()
+}
+
+fn validate_collection_name(collection: &str) -> Result<(), IndexerError> {
+    if collection.is_empty()
+        || collection.len() > 64
+        || !collection
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(IndexerError::Qdrant(format!(
+            "invalid collection name {collection:?}; use 1-64 ASCII letters, digits, hyphens, or underscores"
+        )));
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -526,7 +644,10 @@ fn timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ARTIFACT_VERSION, CleanArtifact, IndexerError, chunk, validate_version};
+    use super::{
+        ARTIFACT_VERSION, CleanArtifact, IndexerError, QdrantSearchMode, chunk,
+        validate_collection_name, validate_version,
+    };
 
     #[test]
     fn clean_v1_fixture_matches_the_input_contract() {
@@ -561,5 +682,25 @@ mod tests {
             validate_version(ARTIFACT_VERSION + 1),
             Err(IndexerError::Artifact(message)) if message.contains("schema version")
         ));
+    }
+
+    #[test]
+    fn qdrant_search_mode_is_explicit_and_restricted() {
+        assert!(matches!(
+            "exact".parse::<QdrantSearchMode>(),
+            Ok(QdrantSearchMode::Exact)
+        ));
+        assert!(matches!(
+            "hnsw".parse::<QdrantSearchMode>(),
+            Ok(QdrantSearchMode::Hnsw)
+        ));
+        assert!("approximate".parse::<QdrantSearchMode>().is_err());
+    }
+
+    #[test]
+    fn qdrant_collection_names_cannot_change_the_request_path() {
+        assert!(validate_collection_name("ohara_chunks").is_ok());
+        assert!(validate_collection_name("other/collection").is_err());
+        assert!(validate_collection_name("").is_err());
     }
 }

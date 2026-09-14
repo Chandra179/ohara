@@ -8,6 +8,9 @@ RETRIEVAL_URL ?= http://$(RETRIEVAL_BIND)
 FRONTEND_HOST ?= 127.0.0.1
 FRONTEND_PORT ?= 5173
 QDRANT_URL ?= http://127.0.0.1:6335
+QDRANT_COLLECTION ?= ohara_chunks
+QDRANT_SEARCH_MODE ?= exact
+QDRANT_HNSW_EF ?= 64
 FALKORDB_URL ?= redis://127.0.0.1:6380
 FALKORDB_GRAPH ?= ohara
 LLM_URL ?= http://127.0.0.1:11434
@@ -17,13 +20,14 @@ CONTAINER_USER ?= $(shell id -u):$(shell id -g)
 STAGE ?= cleaning
 LIMIT ?= 10
 
-CARGO = OHARA_DATA_DIR="$(DATA_DIR)" OHARA_QDRANT_URL="$(QDRANT_URL)" OHARA_FALKORDB_URL="$(FALKORDB_URL)" OHARA_FALKORDB_GRAPH="$(FALKORDB_GRAPH)" OHARA_LLM_URL="$(LLM_URL)" OHARA_LLM_MODEL="$(LLM_MODEL)" OHARA_PROCESS_AUTH_TOKEN="$(OHARA_PROCESS_AUTH_TOKEN)" OHARA_RETRIEVAL_BIND="$(RETRIEVAL_BIND)" $(RUSTUP) run $(TOOLCHAIN) cargo
+CARGO = OHARA_DATA_DIR="$(DATA_DIR)" OHARA_QDRANT_URL="$(QDRANT_URL)" OHARA_QDRANT_COLLECTION="$(QDRANT_COLLECTION)" OHARA_QDRANT_SEARCH_MODE="$(QDRANT_SEARCH_MODE)" OHARA_QDRANT_HNSW_EF="$(QDRANT_HNSW_EF)" OHARA_FALKORDB_URL="$(FALKORDB_URL)" OHARA_FALKORDB_GRAPH="$(FALKORDB_GRAPH)" OHARA_LLM_URL="$(LLM_URL)" OHARA_LLM_MODEL="$(LLM_MODEL)" OHARA_PROCESS_AUTH_TOKEN="$(OHARA_PROCESS_AUTH_TOKEN)" OHARA_RETRIEVAL_BIND="$(RETRIEVAL_BIND)" $(RUSTUP) run $(TOOLCHAIN) cargo
 
 .DEFAULT_GOAL := help
 .PHONY: help toolchain fmt fmt-check clippy test doc verify build \
         providers providers-down providers-logs docker-up docker-down docker-logs \
         scraper cleaning indexer graph retrieval frontend replay rebuild \
-        pipeline-fixture pipeline-benchmark pipeline-resource-benchmark retrieval-quality dev clean
+        pipeline-fixture pipeline-benchmark pipeline-resource-benchmark retrieval-quality \
+        entity-resolution-quality qdrant-hnsw-benchmark dev clean
 
 help:
 	@printf '%s\n' \
@@ -44,6 +48,8 @@ help:
 		'  make pipeline-benchmark Measure cold/warm latency with p50/p95 gates' \
 		'  make pipeline-resource-benchmark Measure peak RSS for all processes' \
 		'  make retrieval-quality Evaluate golden retrieval metrics' \
+		'  make entity-resolution-quality Measure entity merge thresholds' \
+		'  make qdrant-hnsw-benchmark Compare exact and HNSW Qdrant search' \
 		'  make dev            Start providers and all local processes' \
 		'' \
 		'  make docker-up      Build and run Rust processes in Compose' \
@@ -72,7 +78,7 @@ test:
 doc:
 	$(CARGO) doc --workspace --no-deps
 
-verify: fmt-check clippy test doc
+verify: fmt-check clippy test doc entity-resolution-quality
 
 build:
 	$(CARGO) build --workspace
@@ -150,12 +156,12 @@ rebuild:
 			name="$$(basename "$$path")"; \
 			[ ! -e "$(DATA_DIR)/inbox/graph/$$name" ] || { echo "rebuild refused: pending graph inbox artifact exists: $$name" >&2; exit 2; }; \
 		done; \
-		printf '%s\n' 'Rebuilding Qdrant collection ohara_chunks...'; \
-		delete_status="$$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request DELETE "$$qdrant_url/collections/ohara_chunks")"; \
+		printf '%s\n' 'Rebuilding Qdrant collection $(QDRANT_COLLECTION)...'; \
+		delete_status="$$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --request DELETE "$$qdrant_url/collections/$(QDRANT_COLLECTION)")"; \
 		case "$$delete_status" in 200|404) ;; *) echo "Qdrant collection delete returned HTTP $$delete_status" >&2; exit 1 ;; esac; \
-		curl --fail --silent --show-error --request PUT "$$qdrant_url/collections/ohara_chunks" \
+		curl --fail --silent --show-error --request PUT "$$qdrant_url/collections/$(QDRANT_COLLECTION)" \
 			--header 'content-type: application/json' \
-			--data '{"vectors":{"size":384,"distance":"Cosine"}}' >/dev/null; \
+			--data '{"vectors":{"size":384,"distance":"Cosine"},"hnsw_config":{"m":16,"ef_construct":100,"full_scan_threshold":$(if $(filter hnsw,$(QDRANT_SEARCH_MODE)),10,1000000000)}}' >/dev/null; \
 		printf '%s\n' 'Rebuilding FalkorDB graph $(FALKORDB_GRAPH)...'; \
 		if [ "$(FALKORDB_URL)" = 'redis://127.0.0.1:6380' ]; then \
 			graph_delete="$$(docker compose exec -T falkordb redis-cli --raw GRAPH.DELETE "$(FALKORDB_GRAPH)" 2>&1)" || true; \
@@ -190,19 +196,25 @@ rebuild:
 
 pipeline-fixture:
 	$(CARGO) build --workspace
-	python3 scripts/pipeline_fixture.py
+	OHARA_PIPELINE_QDRANT_SEARCH_MODE="$(QDRANT_SEARCH_MODE)" $(CARGO) run -p ohara-tools --bin pipeline_fixture
 
 pipeline-benchmark:
 	$(CARGO) build --workspace
-	python3 scripts/pipeline_benchmark.py
+	$(CARGO) run -p ohara-tools --bin pipeline_benchmark
 
 pipeline-resource-benchmark:
 	$(CARGO) build --workspace
-	python3 scripts/pipeline_resource_benchmark.py
+	$(CARGO) run -p ohara-tools --bin pipeline_resource_benchmark
 
 retrieval-quality:
 	$(CARGO) build --workspace
-	python3 scripts/retrieval_quality_benchmark.py
+	$(CARGO) run -p ohara-tools --bin retrieval_quality_benchmark
+
+entity-resolution-quality:
+	$(CARGO) run -p ohara-graph -- --entity-resolution-benchmark
+
+qdrant-hnsw-benchmark: providers
+	$(CARGO) run -p ohara-tools --bin qdrant_hnsw_benchmark
 
 dev:
 	@set -eu; \

@@ -14,6 +14,8 @@ architecture source of truth is [ARCHITECTURE.md](ARCHITECTURE.md).
   documented JSON artifact Interface under `docs/architecture/artifacts.md`.
 - A module should have one responsibility, a small Interface, and high
   locality. Keep provider-specific code behind the process that owns it.
+- Verification harnesses and benchmarks belong in the non-production `tools`
+  workspace package. Production packages must not depend on `tools`.
 - The frontend has no filesystem, database, Docker, or provider knowledge.
 
 ## Style and API

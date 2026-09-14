@@ -5,15 +5,16 @@ frontend. A checked item is complete only when its implementation, tests, and
 documentation are updated. Completed work remains here for traceability;
 details are archived under `docs/archive/`.
 
-## Current state audit — 2026-09-13
+## Current state audit — 2026-09-14
 
 - P1 is complete: the process seams, JSON artifact contracts, provider
   adapters, process authentication, graceful drain, metrics, benchmarks, and
   scraper configuration are implemented and verified.
 - P2 is partially complete: the golden retrieval evaluation, non-empty answer
-  checks, Qdrant retrieval, full-text signal, and graph-path signal exist. The
-  graph still uses a capitalized-phrase heuristic, Qdrant still uses exact
-  search, and the quality experiments and regression fixtures are incomplete.
+  checks, Qdrant retrieval, full-text signal, graph-path signal, grounded
+  response contract fixtures, structured typed graph extraction, the labeled
+  entity-resolution threshold benchmark, and the exact-vs-HNSW Qdrant
+  benchmark are implemented. SymSpell and HyDE evaluation remain open.
 - P3 is partially complete: backend metrics and per-process snapshots exist,
   but the frontend does not yet present stage-level progress and throughput
   charts. The frontend CI and live-stack checks are also incomplete.
@@ -40,13 +41,15 @@ repeated.
   DuckDuckGo-through-Obscura, and custom RSS adapters.
 - [x] Load scraper bind, provider, endpoint, locale, and fetcher settings from
   one validated `scraper/config.yaml` configuration seam.
+- [x] Move verification harnesses and benchmarks into focused Rust binaries in
+  the non-production `tools` package, preserve Makefile commands, verify
+  parity at every process seam, and remove the Python implementations.
 
 ## P2 — retrieval quality
 
-Execute the open work in this order: answer-contract fixtures, structured
-entity extraction, entity-resolution measurement, HNSW benchmarking, then
-independent SymSpell and HyDE evaluation. HNSW and answer-fixture work can be
-developed independently once their test inputs are fixed.
+Execute the open work in this order: HNSW benchmarking, then independent
+SymSpell and HyDE evaluation. The answer-contract and entity-resolution
+fixtures below are complete and protect the remaining work.
 
 - [x] Add a versioned golden retrieval dataset with recall@k, MRR, and nDCG
   measurements.
@@ -55,7 +58,7 @@ developed independently once their test inputs are fixed.
 - [x] Add Qdrant, full-text, and bounded graph-path signals to retrieval with
   availability metadata and deterministic score ordering.
 
-- [ ] Expand grounded-answer regression fixtures for the complete query
+- [x] Expand grounded-answer regression fixtures for the complete query
   response contract.
 
   Exit criteria:
@@ -68,7 +71,7 @@ developed independently once their test inputs are fixed.
   - Run the cases through the retrieval Interface and the frontend response
     parser; include them in the normal verification command.
 
-- [ ] Replace the graph capitalized-phrase baseline with structured extraction
+- [x] Replace the graph capitalized-phrase baseline with structured extraction
   and typed entity resolution.
 
   Exit criteria:
@@ -85,7 +88,7 @@ developed independently once their test inputs are fixed.
   - Prove that the production path no longer relies on capitalized phrases as
     its only entity detector.
 
-- [ ] Measure entity-resolution thresholds on ambiguous and cross-document
+- [x] Measure entity-resolution thresholds on ambiguous and cross-document
   cases.
 
   Exit criteria:
@@ -100,7 +103,12 @@ developed independently once their test inputs are fixed.
   - Add a repeatable benchmark command and a regression test for the selected
     threshold.
 
-- [ ] Benchmark Qdrant HNSW against exact search and gate adoption on recall.
+  Result: the version-one fixture selects `0.98` (precision 1.000, recall
+  1.000, F1 1.000). Approximate candidates below that threshold remain
+  unresolved; exact normalized identities and explicit aliases retain the
+  deterministic production merge behavior. Run `make entity-resolution-quality`.
+
+- [x] Benchmark Qdrant HNSW against exact search and gate adoption on recall.
 
   Exit criteria:
 
@@ -113,6 +121,15 @@ developed independently once their test inputs are fixed.
     representative corpus; otherwise keep exact search and record why.
   - Make the selected mode explicit in process configuration and verify that
     changing it cannot mix incompatible vector dimensions or collections.
+
+  Result: the latest local Qdrant `v1.19.1` run on the version-one 512-point,
+  384-dimensional fixture measured exact at recall@10 `1.000`, p95 `4.98 ms`,
+  and peak `48.51 MiB`; HNSW measured recall@10 `1.000`, p95 `5.63 ms`, and
+  peak `53.24 MiB`. Recall passed but HNSW did not improve p95 in this run,
+  so exact search remains the explicit production default. Provider load can
+  affect latency, so adoption requires a repeated decision on the
+  representative production corpus. Both modes validate the configured
+  384-dimensional collection before use.
 
 - [ ] Evaluate SymSpell and HyDE independently for quality, latency, and
   resource cost.

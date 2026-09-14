@@ -43,6 +43,12 @@ jobs:
       - name: Run deterministic resource benchmark
         run: make pipeline-resource-benchmark
 
+      - name: Run deterministic retrieval-quality benchmark
+        run: make retrieval-quality
+
+      - name: Run live Qdrant exact/HNSW benchmark
+        run: make qdrant-hnsw-benchmark
+
   frontend:
     name: Frontend quality gates
     runs-on: ubuntu-latest

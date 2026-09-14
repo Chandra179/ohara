@@ -17,8 +17,9 @@ use Qdrant, FalkorDB, and Ollama as local providers.
 **Indexed artifact** — a document's chunks and evidence metadata produced by
 indexer and consumed by graph and retrieval.
 
-**Entity** — a named person, organization, place, event, concept, or product
-recognized in indexed evidence.
+**Entity** — a typed person, organization, place, event, concept, or product
+recognized in indexed evidence. Identity is the normalized name plus entity
+type; aliases resolve to that identity.
 
 **Mention** — a graph relationship connecting a chunk to an entity.
 
@@ -46,15 +47,20 @@ rules at a process seam.
 - Producers own their artifact shape and consumers validate required fields.
 - Deterministic hashes make document and chunk replay idempotent.
 - Qdrant and FalkorDB are derived stores and can be rebuilt from artifacts.
+- Graph extraction is deterministic and typed. It uses explicit type fields
+  and typed lexical cues, not an untyped capitalized-phrase fallback.
 - The frontend talks only to retrieval.
 - Scraper discovery and fetch settings are loaded from `scraper/config.yaml`;
   environment overrides are limited to deployment values and secrets.
+- Verification harnesses and benchmarks live in a separate non-production
+  Rust package; production processes do not depend on the tooling package.
 - Loopback binding is the default until authentication exists.
 
 ## Intentional limitations
 
-The current graph extractor is a lightweight capitalized-phrase baseline.
 Retrieval combines Qdrant, local full-text overlap, and bounded graph-path
-signals; richer structured extraction, entity-resolution threshold
-measurement, HNSW evaluation, richer failure queues, and multi-host durable
-messaging are future work.
+signals. Qdrant search defaults to exact mode; HNSW is explicit and must pass
+the recall and p95 benchmark gates before adoption. The graph process measures
+a `0.98` candidate threshold but keeps approximate merges disabled until
+separately adopted. Richer failure queues and multi-host durable messaging are
+future work.

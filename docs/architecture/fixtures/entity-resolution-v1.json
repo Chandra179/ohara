@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "selected_threshold": 0.98,
+  "thresholds": [0.80, 0.85, 0.90, 0.95, 0.98, 1.0],
+  "cases": [
+    {
+      "id": "case-variant",
+      "reason": "case variants are the same normalized identity",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "PERSON",
+        "name": "Ada Lovelace"
+      },
+      "right": {
+        "document_id": "doc-b",
+        "entity_type": "PERSON",
+        "name": "ada lovelace"
+      },
+      "expected_same": true
+    },
+    {
+      "id": "punctuation-and-diacritics",
+      "reason": "punctuation and diacritics normalize consistently",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "LOCATION",
+        "name": "São Paulo"
+      },
+      "right": {
+        "document_id": "doc-b",
+        "entity_type": "LOCATION",
+        "name": "sao-paulo"
+      },
+      "expected_same": true
+    },
+    {
+      "id": "acronym-alias",
+      "reason": "an explicit acronym alias is authoritative",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "ORGANIZATION",
+        "name": "National Aeronautics and Space Administration",
+        "aliases": ["NASA"]
+      },
+      "right": {
+        "document_id": "doc-c",
+        "entity_type": "ORGANIZATION",
+        "name": "NASA"
+      },
+      "expected_same": true
+    },
+    {
+      "id": "cross-document-alias",
+      "reason": "an explicit alias resolves mentions across documents",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "PRODUCT",
+        "name": "Ohara",
+        "aliases": ["Ohara Knowledge Base"]
+      },
+      "right": {
+        "document_id": "doc-d",
+        "entity_type": "PRODUCT",
+        "name": "Ohara Knowledge Base"
+      },
+      "expected_same": true
+    },
+    {
+      "id": "near-duplicate-organization",
+      "reason": "small organization spelling variation should be mergeable",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "ORGANIZATION",
+        "name": "Acme Corporation"
+      },
+      "right": {
+        "document_id": "doc-e",
+        "entity_type": "ORGANIZATION",
+        "name": "Acme Corporatio"
+      },
+      "expected_same": true
+    },
+    {
+      "id": "ambiguous-person-name",
+      "reason": "same surface form can refer to different people without evidence",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "PERSON",
+        "name": "John Smith"
+      },
+      "right": {
+        "document_id": "doc-f",
+        "entity_type": "PERSON",
+        "name": "John Smyth"
+      },
+      "expected_same": false
+    },
+    {
+      "id": "same-name-different-type",
+      "reason": "same surface form with different types must stay separate",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "PRODUCT",
+        "name": "Mercury"
+      },
+      "right": {
+        "document_id": "doc-g",
+        "entity_type": "LOCATION",
+        "name": "Mercury"
+      },
+      "expected_same": false
+    },
+    {
+      "id": "unrelated-organization",
+      "reason": "similar prefix is not enough to merge unrelated entities",
+      "left": {
+        "document_id": "doc-a",
+        "entity_type": "ORGANIZATION",
+        "name": "OpenAI"
+      },
+      "right": {
+        "document_id": "doc-h",
+        "entity_type": "ORGANIZATION",
+        "name": "OpenAir"
+      },
+      "expected_same": false
+    }
+  ]
+}

@@ -268,6 +268,77 @@ describe("HTTP API boundary", () => {
     });
   });
 
+  it.each([
+    {
+      name: "a grounded answer with an unknown citation",
+      payload: {
+        answer: "A grounded answer.",
+        availability: "available",
+        citations: ["unknown-chunk"],
+        chunks: [{ chunkId: "chunk-1", score: 0.9, text: "Evidence" }],
+        grounding: "grounded",
+      },
+    },
+    {
+      name: "a grounded answer without citations",
+      payload: {
+        answer: "A grounded answer.",
+        availability: "available",
+        citations: [],
+        chunks: [{ chunkId: "chunk-1", score: 0.9, text: "Evidence" }],
+        grounding: "grounded",
+      },
+    },
+    {
+      name: "a grounded answer with duplicate citations",
+      payload: {
+        answer: "A grounded answer.",
+        availability: "available",
+        citations: ["chunk-1", "chunk-1"],
+        chunks: [{ chunkId: "chunk-1", score: 0.9, text: "Evidence" }],
+        grounding: "grounded",
+      },
+    },
+    {
+      name: "an ungrounded response containing answer text",
+      payload: {
+        answer: "This answer has no verified evidence.",
+        availability: "available",
+        citations: [],
+        chunks: [{ chunkId: "chunk-1", score: 0.9, text: "Evidence" }],
+        grounding: "ungrounded",
+      },
+    },
+  ])("rejects $name", async ({ payload }) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(payload), { status: 200 }),
+    );
+    const api = createHttpApi({ fetcher });
+
+    await expect(api.queryKnowledgeBase("question")).rejects.toThrow("invalid query response");
+  });
+
+  it("rejects duplicate chunk identities in a query response", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          answer: "A grounded answer.",
+          availability: "available",
+          citations: ["chunk-1"],
+          chunks: [
+            { chunkId: "chunk-1", score: 0.9, text: "Evidence one" },
+            { chunkId: "chunk-1", score: 0.8, text: "Evidence duplicate" },
+          ],
+          grounding: "grounded",
+        }),
+        { status: 200 },
+      ),
+    );
+    const api = createHttpApi({ fetcher });
+
+    await expect(api.queryKnowledgeBase("question")).rejects.toThrow("invalid query response");
+  });
+
   it("rejects malformed metrics before the Operations view can crash", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ capturedAt: "now", llmUsage: { successful_calls: 1 } }), {

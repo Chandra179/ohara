@@ -79,6 +79,9 @@ services:
     environment:
       OHARA_DATA_DIR: /app/data
       OHARA_QDRANT_URL: http://qdrant:6333
+      OHARA_QDRANT_COLLECTION: ${OHARA_QDRANT_COLLECTION:-ohara_chunks}
+      OHARA_QDRANT_SEARCH_MODE: ${OHARA_QDRANT_SEARCH_MODE:-exact}
+      OHARA_QDRANT_HNSW_EF: ${OHARA_QDRANT_HNSW_EF:-64}
     volumes:
       - ./data:/app/data
     user: "${OHARA_CONTAINER_USER:-1000:1000}"
@@ -115,6 +118,9 @@ services:
       OHARA_DATA_DIR: /app/data
       OHARA_RETRIEVAL_BIND: 0.0.0.0:3000
       OHARA_QDRANT_URL: http://qdrant:6333
+      OHARA_QDRANT_COLLECTION: ${OHARA_QDRANT_COLLECTION:-ohara_chunks}
+      OHARA_QDRANT_SEARCH_MODE: ${OHARA_QDRANT_SEARCH_MODE:-exact}
+      OHARA_QDRANT_HNSW_EF: ${OHARA_QDRANT_HNSW_EF:-64}
       OHARA_FALKORDB_URL: redis://falkordb:6379
       OHARA_SCRAPER_URL: http://scraper:3010
       OHARA_PROCESS_AUTH_TOKEN: ${OHARA_PROCESS_AUTH_TOKEN:-}

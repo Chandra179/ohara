@@ -25,6 +25,11 @@ the legacy root implementation has been removed.
 Read [system architecture](docs/ARCHITECTURE.md) and the [architecture index](docs/architecture/README.md)
 for the process Interfaces and artifact shapes.
 
+Verification and benchmark commands are implemented in the non-production
+`tools` workspace package. It contains five Rust binaries and shared test
+support; it is not a sixth deployable Ohara process, and production packages
+do not depend on it.
+
 ## Requirements
 
 - Rust 1.95.0 through rustup
@@ -124,6 +129,10 @@ Run the deterministic process-boundary harness with local test doubles using:
 make pipeline-fixture
 ```
 
+The same Rust tooling powers the latency, resource, retrieval-quality, and
+Qdrant HNSW commands below. The Makefile keeps the stable command names while
+Cargo owns compilation and execution; no Python runtime is required.
+
 It starts the real scraper, cleaning, indexer, and retrieval binaries against
 fixture RSS/HTML, Qdrant, and Ollama endpoints. It does not use external
 network services or download an embedding model.
@@ -167,6 +176,30 @@ and reports recall@k, MRR, and nDCG. The fixture is a ranking and contract
 regression gate; production semantic quality should be measured again with a
 labeled corpus and the configured embedding model.
 
+Measure the graph entity-resolution threshold against its labeled fixture:
+
+```sh
+make entity-resolution-quality
+```
+
+The command reports precision, recall, F1, false merges, and missed merges for
+each threshold. It selects `0.98` for the current fixture; approximate merges
+below that threshold remain unresolved, and the benchmark does not modify
+runtime graph data.
+
+Compare Qdrant exact search with HNSW on the same workload:
+
+```sh
+make qdrant-hnsw-benchmark
+```
+
+This requires the Qdrant provider (`make providers`). It reports recall@1/3/5/10,
+index-build time, query p50/p95, and observed Qdrant container memory. HNSW is
+recommended only when recall@10 retains at least 98% of exact search and p95
+latency improves; otherwise exact search remains the default. Set
+`QDRANT_SEARCH_MODE=hnsw` for the local processes only after that decision.
+Use `OHARA_HNSW_BENCHMARK_OUTPUT=path.json` to save machine-readable results.
+
 To rebuild the derived Qdrant collection and FalkorDB graph from durable
 artifacts, stop the five Rust processes and run:
 
@@ -186,6 +219,8 @@ cd frontend && npm run lint && npm test -- --run && npm run build && npm run e2e
 cd .. && make pipeline-fixture && make pipeline-benchmark
 cd .. && make pipeline-resource-benchmark
 cd .. && make retrieval-quality
+cd .. && make entity-resolution-quality
+cd .. && make qdrant-hnsw-benchmark
 ```
 
 Runtime data under `data/` is local and ignored by git. The bounded replay

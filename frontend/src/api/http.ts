@@ -435,15 +435,35 @@ function parseQueryResponse(payload: unknown): QueryResponsePayload {
   const chunks = payload.chunks;
   const availability = parseQueryAvailability(payload.availability);
   const grounding = parseQueryGrounding(payload.grounding);
+  const chunkIds = Array.isArray(chunks)
+    ? new Set(chunks.filter(isChunkPayload).map((chunk) => chunk.chunkId))
+    : new Set<string>();
+  const stringCitations = Array.isArray(citations)
+    ? citations.filter((citation): citation is string => typeof citation === "string")
+    : [];
+  const citationsAreUnique =
+    Array.isArray(citations) && new Set(stringCitations).size === citations.length;
+  const citationsMatchEvidence =
+    Array.isArray(citations) && citations.every((citation) => chunkIds.has(String(citation)));
+  const answerIsNonEmpty = typeof answer === "string" && answer.trim().length > 0;
   if (
     (answer !== null && typeof answer !== "string") ||
     !Array.isArray(citations) ||
-    !citations.every((citation) => typeof citation === "string") ||
+    !citations.every((citation) => typeof citation === "string" && citation.length > 0) ||
     !Array.isArray(chunks) ||
     !chunks.every(isChunkPayload) ||
+    (Array.isArray(chunks) && chunkIds.size !== chunks.length) ||
     availability === undefined ||
     grounding === undefined ||
-    (grounding === "grounded" && (answer === null || citations.length === 0))
+    (grounding === "grounded" &&
+      (!answerIsNonEmpty ||
+        citations.length === 0 ||
+        !citationsAreUnique ||
+        !citationsMatchEvidence)) ||
+    (grounding === "ungrounded" &&
+      (answer !== null || citations.length > 0 || !citationsAreUnique)) ||
+    (availability === "unavailable" &&
+      (answerIsNonEmpty || citations.length > 0 || grounding !== "ungrounded"))
   ) {
     throw invalidResponse("query");
   }

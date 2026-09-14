@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "vectorDimension": 384,
+  "corpusSize": 512,
+  "queryCount": 16,
+  "relevantPerQuery": 3,
+  "topK": 10,
+  "hnsw": {
+    "m": 16,
+    "efConstruct": 100,
+    "efSearch": 64
+  }
+}

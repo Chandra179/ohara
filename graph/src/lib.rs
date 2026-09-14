@@ -1,18 +1,18 @@
 //! Graph process.
 //!
 //! This process consumes the canonical indexed artifact and publishes a small,
-//! idempotent entity/mention graph to `FalkorDB`. Entity extraction is deliberately
-//! bounded and local; replacing it with an LLM adapter does not change the
+//! idempotent typed entity/mention graph to `FalkorDB`. Extraction and identity
+//! resolution are deterministic, bounded, and local; neither changes the
 //! artifact seam.
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
+mod entities;
+mod entity_resolution;
 mod metrics;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -100,6 +100,22 @@ pub async fn run() -> Result<(), GraphError> {
     }
 }
 
+/// Runs the deterministic entity-resolution threshold benchmark.
+///
+/// The benchmark reads the versioned labeled fixture from the repository and
+/// reports precision, recall, F1, false merges, and missed merges for every
+/// configured candidate threshold. It does not contact `FalkorDB` or mutate
+/// runtime data.
+///
+/// # Errors
+///
+/// Returns an error when the fixture is missing, invalid, or fails its
+/// documented operating-threshold regression gate.
+pub fn run_entity_resolution_benchmark() -> Result<(), GraphError> {
+    entity_resolution::run("docs/architecture/fixtures/entity-resolution-v1.json")
+        .map_err(GraphError::Artifact)
+}
+
 async fn process_pending<C>(
     data_dir: &Path,
     connection: &mut C,
@@ -165,13 +181,16 @@ where
     let artifact: IndexedArtifact = decode(&tokio::fs::read(path).await?)?;
     validate_version(artifact.schema_version)?;
     for chunk in &artifact.chunks {
-        for entity in entities(&chunk.text) {
+        for entity in entities::extract(&chunk.text) {
             let query = format!(
-                "MERGE (c:Chunk {{id:'{}', doc_id:'{}'}}) MERGE (e:Entity {{id:'{}', name:'{}'}}) MERGE (c)-[:MENTIONS]->(e)",
+                "MERGE (c:Chunk {{id:'{}', doc_id:'{}'}}) MERGE (e:Entity {{id:'{}'}}) SET e.name='{}', e.type='{}', e.normalized='{}', e.aliases='{}' MERGE (c)-[:MENTIONS]->(e)",
                 escape(&chunk.chunk_id),
                 escape(&artifact.document_id),
-                escape(&entity_id(&entity)),
-                escape(&entity),
+                escape(&entity.id()),
+                escape(&entity.name),
+                entity.kind.as_str(),
+                escape(&entity.normalized),
+                escape(&entity.aliases.join("|")),
             );
             let _: redis::Value = redis::cmd("GRAPH.QUERY")
                 .arg(graph_name())
@@ -191,42 +210,6 @@ fn validate_version(version: u8) -> Result<(), GraphError> {
             "unsupported indexed artifact schema version {version}; expected {ARTIFACT_VERSION}"
         ))
     })
-}
-
-fn entities(text: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut current = Vec::new();
-    for word in text.split_whitespace() {
-        let clean = word.trim_matches(|character: char| !character.is_alphanumeric());
-        let starts_uppercase = clean.chars().next().is_some_and(char::is_uppercase);
-        if starts_uppercase && clean.chars().count() > 2 {
-            current.push(clean.to_string());
-        } else if !current.is_empty() {
-            result.push(current.join(" "));
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        result.push(current.join(" "));
-    }
-    result.sort_unstable();
-    result.dedup();
-    result.truncate(32);
-    result
-}
-
-fn entity_id(name: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(name.to_ascii_lowercase().as_bytes());
-    format!("entity-{}", hex(&digest.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(&mut output, "{byte:02x}");
-    }
-    output
 }
 
 fn escape(value: &str) -> String {

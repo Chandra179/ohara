@@ -14,8 +14,11 @@ artifact schema version `1`. An incompatible input is rejected before model or
 Qdrant work begins.
 
 Qdrant is a derived store. If its volume is removed, the indexer can replay the
-clean artifacts. The current collection uses 384-dimensional cosine vectors;
-HNSW remains a measured optimization rather than an implicit default.
+clean artifacts. The current collection uses 384-dimensional cosine vectors.
+`OHARA_QDRANT_SEARCH_MODE` is explicit and defaults to `exact`; `hnsw` enables
+Qdrant's HNSW search parameters. The indexer validates the configured
+collection dimension before publishing vectors, so a collection from another
+embedding model cannot be mixed into this process.
 
 The process-boundary harness may set `OHARA_EMBEDDING_MODE=deterministic` to
 replace model inference with a stable local test vector. The default mode

@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +37,8 @@ const LLM_URL: &str = "http://127.0.0.1:11434";
 const LLM_MODEL: &str = "phi4-mini:latest";
 const EMBEDDING_DIMENSION: usize = 384;
 const PROCESS_AUTH_ENV: &str = "OHARA_PROCESS_AUTH_TOKEN";
+const DEFAULT_QDRANT_COLLECTION: &str = "ohara_chunks";
+const DEFAULT_HNSW_EF: usize = 64;
 
 /// Errors raised while starting the retrieval process.
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +62,9 @@ struct AppState {
     data_dir: PathBuf,
     client: Client,
     qdrant_url: String,
+    qdrant_collection: String,
+    qdrant_search_mode: QdrantSearchMode,
+    qdrant_hnsw_ef: usize,
     falkordb_url: String,
     falkordb_graph: String,
     scraper_url: String,
@@ -67,6 +73,26 @@ struct AppState {
     llm_model: String,
     embedder: Arc<Mutex<Option<EmbeddingBackend>>>,
     metrics: Arc<metrics::Metrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QdrantSearchMode {
+    Exact,
+    Hnsw,
+}
+
+impl FromStr for QdrantSearchMode {
+    type Err = RetrievalError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "exact" => Ok(Self::Exact),
+            "hnsw" => Ok(Self::Hnsw),
+            other => Err(RetrievalError::Configuration(format!(
+                "unsupported Qdrant search mode {other:?}; expected exact or hnsw"
+            ))),
+        }
+    }
 }
 
 enum EmbeddingBackend {
@@ -187,6 +213,9 @@ struct DocumentQuery {
 pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
     let data_dir = data_dir();
     ensure_layout(&data_dir).await?;
+    let qdrant_collection = qdrant_collection()?;
+    let qdrant_search_mode = qdrant_search_mode()?;
+    let qdrant_hnsw_ef = qdrant_hnsw_ef()?;
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -196,6 +225,9 @@ pub async fn run(bind: SocketAddr) -> Result<(), RetrievalError> {
         data_dir,
         client,
         qdrant_url: std::env::var("OHARA_QDRANT_URL").unwrap_or_else(|_| QDRANT_URL.into()),
+        qdrant_collection,
+        qdrant_search_mode,
+        qdrant_hnsw_ef,
         falkordb_url: std::env::var("OHARA_FALKORDB_URL").unwrap_or_else(|_| FALKORDB_URL.into()),
         falkordb_graph: std::env::var("OHARA_FALKORDB_GRAPH").unwrap_or_else(|_| "ohara".into()),
         scraper_url: std::env::var("OHARA_SCRAPER_URL").unwrap_or_else(|_| SCRAPER_URL.into()),
@@ -544,25 +576,48 @@ async fn query(
         }));
     }
     let prompt = render_prompt(question, &chunks);
-    let answer = call_llm(&state, &prompt).await;
-    let (answer, availability, grounding, citations) = match answer {
-        Ok(Some(value)) if !value.trim().is_empty() => (
-            Some(value),
-            "available",
-            "grounded",
-            chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect(),
-        ),
-        Ok(_) => (None, "available", "ungrounded", Vec::new()),
-        Err(_) => (None, "unavailable", "ungrounded", Vec::new()),
-    };
+    let outcome = classify_answer(call_llm(&state, &prompt).await, &chunks);
     Ok(Json(QueryResponse {
-        answer,
-        availability,
-        citations,
+        answer: outcome.answer,
+        availability: outcome.availability,
+        citations: outcome.citations,
         chunks,
-        grounding,
+        grounding: outcome.grounding,
         signals: result.availability,
     }))
+}
+
+struct AnswerOutcome {
+    answer: Option<String>,
+    availability: &'static str,
+    grounding: &'static str,
+    citations: Vec<String>,
+}
+
+fn classify_answer(
+    result: Result<Option<String>, RetrievalError>,
+    chunks: &[QueryChunk],
+) -> AnswerOutcome {
+    match result {
+        Ok(Some(value)) if !value.trim().is_empty() => AnswerOutcome {
+            answer: Some(value),
+            availability: "available",
+            grounding: "grounded",
+            citations: chunks.iter().map(|chunk| chunk.chunk_id.clone()).collect(),
+        },
+        Ok(_) => AnswerOutcome {
+            answer: None,
+            availability: "available",
+            grounding: "ungrounded",
+            citations: Vec::new(),
+        },
+        Err(_) => AnswerOutcome {
+            answer: None,
+            availability: "unavailable",
+            grounding: "ungrounded",
+            citations: Vec::new(),
+        },
+    }
 }
 
 async fn entity_reviews() -> Json<Vec<serde_json::Value>> {
@@ -637,10 +692,16 @@ async fn search_qdrant(
     let response = state
         .client
         .post(format!(
-            "{}/collections/ohara_chunks/points/search",
-            state.qdrant_url.trim_end_matches('/')
+            "{}/collections/{}/points/search",
+            state.qdrant_url.trim_end_matches('/'),
+            state.qdrant_collection
         ))
-        .json(&serde_json::json!({"vector": vector, "limit": limit, "with_payload": true}))
+        .json(&serde_json::json!({
+            "vector": vector,
+            "limit": limit,
+            "with_payload": true,
+            "params": search_params(state.qdrant_search_mode, state.qdrant_hnsw_ef)
+        }))
         .send()
         .await
         .map_err(|error| {
@@ -768,15 +829,31 @@ async fn raw_usage(data_dir: &Path) -> Result<(usize, u64), RetrievalHttpError> 
 }
 
 async fn qdrant_ready(state: &AppState) -> bool {
-    state
+    let Ok(response) = state
         .client
         .get(format!(
-            "{}/collections",
-            state.qdrant_url.trim_end_matches('/')
+            "{}/collections/{}",
+            state.qdrant_url.trim_end_matches('/'),
+            state.qdrant_collection
         ))
         .send()
         .await
-        .is_ok_and(|response| response.status().is_success())
+    else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|payload| {
+            payload
+                .pointer("/result/config/params/vectors/size")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .is_some_and(|dimension| dimension == EMBEDDING_DIMENSION as u64)
 }
 
 async fn falkordb_ready(state: &AppState) -> bool {
@@ -804,6 +881,55 @@ fn embedding_model_available(data_dir: &Path) -> bool {
     }
     let root = data_dir.join("models/models--Xenova--bge-small-en-v1.5");
     root.join("refs/main").is_file() && root.join("snapshots").is_dir()
+}
+
+fn qdrant_collection() -> Result<String, RetrievalError> {
+    let collection = std::env::var("OHARA_QDRANT_COLLECTION")
+        .unwrap_or_else(|_| DEFAULT_QDRANT_COLLECTION.into());
+    if collection.is_empty()
+        || collection.len() > 64
+        || !collection
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(RetrievalError::Configuration(format!(
+            "invalid Qdrant collection name {collection:?}; use 1-64 ASCII letters, digits, hyphens, or underscores"
+        )));
+    }
+    Ok(collection)
+}
+
+fn qdrant_search_mode() -> Result<QdrantSearchMode, RetrievalError> {
+    std::env::var("OHARA_QDRANT_SEARCH_MODE")
+        .unwrap_or_else(|_| "exact".into())
+        .parse()
+}
+
+fn qdrant_hnsw_ef() -> Result<usize, RetrievalError> {
+    let value =
+        std::env::var("OHARA_QDRANT_HNSW_EF").unwrap_or_else(|_| DEFAULT_HNSW_EF.to_string());
+    let parsed = value.parse::<usize>().map_err(|_| {
+        RetrievalError::Configuration(format!(
+            "OHARA_QDRANT_HNSW_EF must be a positive integer, got {value:?}"
+        ))
+    })?;
+    (parsed > 0 && parsed <= 65_535)
+        .then_some(parsed)
+        .ok_or_else(|| {
+            RetrievalError::Configuration(format!(
+                "OHARA_QDRANT_HNSW_EF must be between 1 and 65535, got {parsed}"
+            ))
+        })
+}
+
+fn search_params(mode: QdrantSearchMode, hnsw_ef: usize) -> serde_json::Value {
+    match mode {
+        QdrantSearchMode::Exact => serde_json::json!({"exact": true}),
+        QdrantSearchMode::Hnsw => serde_json::json!({
+            "exact": false,
+            "hnsw_ef": hnsw_ef
+        }),
+    }
 }
 
 async fn process_ready(data_dir: &Path, name: &str) -> bool {
@@ -873,6 +999,7 @@ async fn ensure_layout(data_dir: &Path) -> Result<(), std::io::Error> {
     }
     Ok(())
 }
+
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -898,5 +1025,76 @@ fn timestamp() -> String {
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         eprintln!("ohara-retrieval: shutdown signal failed: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AnswerOutcome, QdrantSearchMode, QueryChunk, RetrievalError, classify_answer, search_params,
+    };
+
+    fn chunks() -> Vec<QueryChunk> {
+        vec![
+            QueryChunk {
+                chunk_id: "chunk-1".into(),
+                score: 0.9,
+                text: "Evidence one".into(),
+            },
+            QueryChunk {
+                chunk_id: "chunk-2".into(),
+                score: 0.8,
+                text: "Evidence two".into(),
+            },
+        ]
+    }
+
+    fn assert_grounded(outcome: &AnswerOutcome) {
+        assert_eq!(outcome.availability, "available");
+        assert_eq!(outcome.grounding, "grounded");
+        assert_eq!(outcome.answer.as_deref(), Some("A grounded answer."));
+        assert_eq!(
+            outcome.citations,
+            vec!["chunk-1".to_owned(), "chunk-2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn non_empty_answer_is_grounded_with_exact_evidence_citations() {
+        let outcome = classify_answer(Ok(Some("A grounded answer.".into())), &chunks());
+        assert_grounded(&outcome);
+    }
+
+    #[test]
+    fn empty_answer_is_available_but_ungrounded() {
+        let outcome = classify_answer(Ok(Some("  ".into())), &chunks());
+        assert_eq!(outcome.availability, "available");
+        assert_eq!(outcome.grounding, "ungrounded");
+        assert!(outcome.answer.is_none());
+        assert!(outcome.citations.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_unavailable_model_response_is_unavailable() {
+        let outcome = classify_answer(
+            Err(RetrievalError::Provider("invalid Ollama response".into())),
+            &chunks(),
+        );
+        assert_eq!(outcome.availability, "unavailable");
+        assert_eq!(outcome.grounding, "ungrounded");
+        assert!(outcome.answer.is_none());
+        assert!(outcome.citations.is_empty());
+    }
+
+    #[test]
+    fn qdrant_search_mode_changes_only_the_explicit_search_parameters() {
+        assert_eq!(
+            search_params(QdrantSearchMode::Exact, 64),
+            serde_json::json!({"exact": true})
+        );
+        assert_eq!(
+            search_params(QdrantSearchMode::Hnsw, 96),
+            serde_json::json!({"exact": false, "hnsw_ef": 96})
+        );
     }
 }
